@@ -1,15 +1,24 @@
 # metal-graph — Metal-native graph analytics for Apple Silicon.
 # SPDX-License-Identifier: Apache-2.0
 cmake_minimum_required(VERSION 3.24)
+
+# This must be set before project(): CMake initializes compiler and linker
+# deployment flags while enabling languages.
+if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+  set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING
+      "macOS floor (Metal 3)" FORCE)
+endif()
+
 project(metal_graph VERSION 0.1.0 LANGUAGES C CXX)
 
 if(NOT APPLE)
   message(FATAL_ERROR "metal-graph targets macOS (Apple Silicon) only.")
 endif()
 
+include(GNUInstallDirs)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "macOS floor (Metal 3)")
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
@@ -21,6 +30,7 @@ option(MG_BUILD_TESTS "Build C++ smoke tests" ON)
 # Metal kernels -> default.metallib -> embedded C array
 # ---------------------------------------------------------------------------
 find_program(XCRUN xcrun REQUIRED)
+find_program(STRINGS strings REQUIRED)
 
 set(MG_METAL_SOURCES
   src/kernels/spmv.metal
@@ -42,6 +52,7 @@ foreach(_src ${MG_METAL_SOURCES})
   add_custom_command(
     OUTPUT ${_air}
     COMMAND ${XCRUN} -sdk macosx metal -std=metal3.1 -O2
+            -mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}
             -c ${CMAKE_CURRENT_SOURCE_DIR}/${_src} -o ${_air}
     DEPENDS ${_src} ${MG_METAL_HEADERS}
     COMMENT "Compiling ${_src}"
@@ -91,8 +102,13 @@ target_include_directories(mgcore PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/metal-cpp
 )
+target_compile_definitions(mgcore PRIVATE METALCPP_SYMBOL_VISIBILITY_HIDDEN)
 target_compile_options(mgcore PRIVATE -Wall -Wextra)
-set_target_properties(mgcore PROPERTIES POSITION_INDEPENDENT_CODE ON)
+set_target_properties(mgcore PROPERTIES
+  POSITION_INDEPENDENT_CODE ON
+  C_VISIBILITY_PRESET hidden
+  CXX_VISIBILITY_PRESET hidden
+  VISIBILITY_INLINES_HIDDEN YES)
 target_link_libraries(mgcore PUBLIC
   "-framework Metal" "-framework Foundation")
 
@@ -104,7 +120,22 @@ target_link_libraries(metalgraph PRIVATE mgcore)
 set_target_properties(metalgraph PROPERTIES
   OUTPUT_NAME "metalgraph"
   VERSION ${PROJECT_VERSION}
-  SOVERSION 0)
+  SOVERSION 0
+  C_VISIBILITY_PRESET hidden
+  CXX_VISIBILITY_PRESET hidden
+  VISIBILITY_INLINES_HIDDEN YES)
+
+# scikit-build-core packages only the Python extension below. A normal CMake
+# install additionally provides the stable C ABI library, header, and notices.
+if(NOT SKBUILD)
+  install(TARGETS metalgraph
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(FILES include/mg.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+  install(FILES LICENSE third_party/metal-cpp/LICENSE.txt
+                THIRD_PARTY_NOTICES.md
+          DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/metal-graph)
+endif()
 
 # ---------------------------------------------------------------------------
 # Python module (nanobind)
@@ -123,6 +154,7 @@ if(MG_BUILD_PYTHON)
     COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:_core>
             ${CMAKE_CURRENT_SOURCE_DIR}/python/metal_graph/
     COMMENT "Copying _core into python/metal_graph/")
+  install(TARGETS _core LIBRARY DESTINATION metal_graph)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -130,8 +162,24 @@ endif()
 # ---------------------------------------------------------------------------
 if(MG_BUILD_TESTS)
   enable_testing()
-  add_executable(mg_smoke tests/cpp/smoke.cpp)
+  add_executable(mg_smoke tests/c/smoke.c)
+  set_target_properties(mg_smoke PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED ON)
   target_include_directories(mg_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(mg_smoke PRIVATE metalgraph)
   add_test(NAME mg_smoke COMMAND mg_smoke)
+  add_test(
+    NAME mg_exports
+    COMMAND ${CMAKE_COMMAND}
+      -DMG_NM=${CMAKE_NM}
+      -DMG_LIBRARY=$<TARGET_FILE:metalgraph>
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/check_exports.cmake)
+  add_test(
+    NAME mg_metallib_target
+    COMMAND ${CMAKE_COMMAND}
+      -DMG_STRINGS=${STRINGS}
+      -DMG_METALLIB=${MG_METALLIB}
+      -DMG_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/check_metallib_target.cmake)
 endif()

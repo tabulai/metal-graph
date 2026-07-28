@@ -163,6 +163,8 @@ std::shared_ptr<Graph> Graph::build(const uint32_t* src, const uint32_t* dst,
                                     uint32_t n_vertices, bool directed) {
   if (n_vertices > k_max_vertices)
     throw_invalid("num_vertices exceeds 2^31-1 (v0.1 int32 id limit)");
+  if (n_edges > k_max_stored_edges)
+    throw_invalid("input edge count exceeds 2^31-1 (v0.1 int32 id limit)");
   // Validation (parallel; flags, not throws, from worker threads).
   std::atomic<bool> bad_index{false}, bad_weight{false};
   parallel_for(n_edges, [&](std::size_t b, std::size_t e) {

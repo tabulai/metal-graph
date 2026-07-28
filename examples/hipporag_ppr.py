@@ -121,11 +121,11 @@ def main():
     nx_ms, n_sub_edges = nx_baseline(src, dst, w, queries, K)
 
     rows = [
-        ("metal-graph ppr_topk batch (cold)", f"V=100k E=2.0M", B,
+        ("metal-graph ppr_topk batch (cold)", "V=100k E=2.0M", B,
          cold_ms, cold_ms / B),
-        ("metal-graph ppr_topk batch (warm)", f"V=100k E=2.0M", B,
+        ("metal-graph ppr_topk batch (warm)", "V=100k E=2.0M", B,
          warm_ms, warm_ms / B),
-        (f"networkx per-query loop (SUBSAMPLED)",
+        ("networkx per-query loop (SUBSAMPLED)",
          f"V={NX_SUB_V // 1000}k E={n_sub_edges / 1e3:.0f}k", B,
          nx_ms, nx_ms / B),
     ]

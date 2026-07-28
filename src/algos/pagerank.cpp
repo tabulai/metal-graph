@@ -483,7 +483,8 @@ int ppr_topk_select(Graph& g, const uint32_t* seeds_canon, const float* seed_w,
 int pagerank(Graph& g, const PagerankOpts& o, float* out_rank) {
   if (!(o.alpha > 0.0 && o.alpha < 1.0))
     throw_invalid("pagerank: alpha must be in (0, 1)");
-  if (!(o.tol > 0.0)) throw_invalid("pagerank: tol must be > 0");
+  if (!(o.tol > 0.0) || !std::isfinite(o.tol))
+    throw_invalid("pagerank: tol must be finite and > 0");
   if (o.max_iter < 1) throw_invalid("pagerank: max_iter must be >= 1");
 
   const auto t0 = std::chrono::steady_clock::now();
@@ -528,7 +529,8 @@ int ppr_topk(Graph& g, const uint32_t* seeds, const float* seed_weights,
              const PprTopkOpts& o, int32_t* out_ids, float* out_scores) {
   if (!(o.alpha > 0.0 && o.alpha < 1.0))
     throw_invalid("ppr_topk: alpha must be in (0, 1)");
-  if (!(o.tol > 0.0)) throw_invalid("ppr_topk: tol must be > 0");
+  if (!(o.tol > 0.0) || !std::isfinite(o.tol))
+    throw_invalid("ppr_topk: tol must be finite and > 0");
   if (o.max_iter < 1) throw_invalid("ppr_topk: max_iter must be >= 1");
   if (o.k < 1) throw_invalid("ppr_topk: k must be >= 1");
 

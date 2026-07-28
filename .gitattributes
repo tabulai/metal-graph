@@ -1,0 +1,3 @@
+third_party/metal-cpp/** linguist-vendored
+bench/results/*.json linguist-generated
+bench/results/bench-*.md linguist-generated

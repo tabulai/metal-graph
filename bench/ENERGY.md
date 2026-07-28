@@ -6,16 +6,21 @@ dependency" argument, never a ship gate.
 
 ## Tooling
 
-`powermetrics` at 100 ms sampling, CPU + GPU power samplers:
+`powermetrics` at 100 ms sampling, CPU + GPU power samplers. Refresh the
+sudo credential first, then run the Python harness as the normal user:
 
 ```bash
-sudo PYTHONPATH=python python3 bench/run.py --suite smoke --energy
+sudo -v
+PYTHONPATH=python python3 bench/run.py --suite smoke --energy
 ```
 
-`powermetrics` requires root; `run.py --energy` refuses politely without
-it (it will not invoke sudo for you). The raw sample stream is written to
-`bench/results/powermetrics-<stamp>.txt` and its path recorded in the
-result JSON.
+Only a minimal control wrapper and `powermetrics` are elevated; the
+benchmark, Python environment, and repository code never run as root. The
+wrapper listens on a user-owned one-shot control channel, so cleanup does
+not depend on the sudo timestamp still being valid after a long run. The
+raw sample stream is written to
+`bench/results/powermetrics-<stamp>.txt` and its path recorded in the result
+JSON.
 
 ## What run.py records
 
