@@ -1,0 +1,11 @@
+build/
+__pycache__/
+*.so
+*.dylib
+*.metallib
+*.air
+.DS_Store
+bench/data/
+bench/results/
+dist/
+*.egg-info/

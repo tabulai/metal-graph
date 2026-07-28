@@ -1,0 +1,35 @@
+# metal-graph — v0.1 development builds use CMake directly:
+#   cmake -S . -B build && cmake --build build -j
+#   PYTHONPATH=python python -c "import metal_graph as mg; print(mg.__version__)"
+# This file is a scikit-build-core skeleton for the M3 wheel work; the
+# project is NOT expected to be pip-installable in v0.1 dev.
+
+[build-system]
+requires = ["scikit-build-core>=0.9", "nanobind>=2.13"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "metal-graph"
+version = "0.1.0"
+description = "Metal-native graph analytics for Apple Silicon"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+keywords = ["graph", "analytics", "metal", "apple-silicon", "pagerank", "bfs"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering",
+]
+
+[tool.scikit-build]
+cmake.version = ">=3.24"
+wheel.packages = ["python/metal_graph"]
+build-dir = "build/{wheel_tag}"
