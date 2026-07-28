@@ -26,7 +26,7 @@ inline std::vector<uint32_t> to_canon(const Graph& g, const uint32_t* user,
 }
 
 // Dense personalization (USER order, may be null => uniform) -> normalized
-// canonical fp64 vector. Rejects negatives/NaN and all-zero vectors.
+// canonical fp64 vector. Rejects non-finite/negative and all-zero vectors.
 inline std::vector<double> pvec_to_canon(const Graph& g, const float* p_user) {
   std::vector<double> p(g.V);
   if (!p_user) {

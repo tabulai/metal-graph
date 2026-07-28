@@ -57,7 +57,8 @@ mg_status mg_set_execution(mg_exec_mode mode);
 mg_status mg_last_run(int* out_path, int* out_iterations, double* out_ms);
 
 /* Build an immutable snapshot from COO. weights may be NULL (unweighted).
- * Duplicate edges and self-loops are kept; NaN/negative weights rejected. */
+ * Duplicate edges and self-loops are kept; non-finite/negative weights
+ * rejected. */
 mg_status mg_graph_create_from_coo(const uint32_t* src, const uint32_t* dst,
                                    const float* weights, uint64_t num_edges,
                                    uint32_t num_vertices, int directed,
@@ -67,7 +68,8 @@ void mg_graph_destroy(mg_graph* g);
 mg_status mg_graph_num_vertices(const mg_graph* g, uint32_t* out);
 mg_status mg_graph_num_edges(const mg_graph* g, uint64_t* out);
 
-/* Full-vector PageRank. personalization: NULL or float[V] (>=0, sum>0).
+/* Full-vector PageRank. personalization: NULL or finite float[V] (>=0,
+ * finite sum>0).
  * out_rank: caller-allocated float[V]. */
 mg_status mg_pagerank(mg_graph* g, double alpha, double tol, int max_iter,
                       const float* personalization, float* out_rank,
@@ -75,7 +77,8 @@ mg_status mg_pagerank(mg_graph* g, double alpha, double tol, int max_iter,
 
 /* Batched personalized PageRank with top-k. Queries packed CSR-style:
  * query q owns seeds[offsets[q]..offsets[q+1]). out_ids: int32[B*k]
- * (row-major, -1 padded), out_scores: float[B*k]. */
+ * (row-major, -1 padded), out_scores: float[B*k]. Seed weights must be
+ * finite and >=0 with a positive sum per query. */
 mg_status mg_ppr_topk(mg_graph* g, const uint32_t* seeds,
                       const float* seed_weights, const uint64_t* offsets,
                       uint32_t num_queries, uint32_t k, double alpha,

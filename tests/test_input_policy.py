@@ -11,10 +11,25 @@ SRC = np.array([0, 1, 2], dtype=np.uint32)
 DST = np.array([1, 2, 0], dtype=np.uint32)
 
 
-def test_nan_weight_rejected():
-    w = np.array([1.0, np.nan, 1.0], dtype=np.float32)
-    with pytest.raises(ValueError):
+@pytest.mark.parametrize(
+    "bad_weight",
+    [np.nan, np.inf, -np.inf],
+    ids=["nan", "positive_infinity", "negative_infinity"],
+)
+def test_non_finite_weight_rejected(bad_weight):
+    w = np.array([1.0, bad_weight, 1.0], dtype=np.float32)
+    with pytest.raises(ValueError, match="finite"):
         mg.Graph.from_edges(SRC, DST, weights=w, directed=True,
+                            num_vertices=3)
+
+
+def test_non_finite_outgoing_weight_sum_rejected():
+    max_float = np.finfo(np.float32).max
+    src = np.array([0, 0], dtype=np.uint32)
+    dst = np.array([1, 2], dtype=np.uint32)
+    w = np.array([max_float, max_float], dtype=np.float32)
+    with pytest.raises(ValueError, match="finite float32 sum"):
+        mg.Graph.from_edges(src, dst, weights=w, directed=True,
                             num_vertices=3)
 
 

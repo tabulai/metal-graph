@@ -141,12 +141,13 @@ int ppr(Graph& g, const uint32_t* seeds_canon, const float* seed_w,
   for (uint32_t q = 0; q < n_queries; ++q) {
     for (uint64_t i = offsets[q]; i < offsets[q + 1]; ++i) {
       const double w = static_cast<double>(seed_w[i]);
-      if (std::isnan(w) || w < 0.0)
-        throw_invalid("ppr: seed weights must be >= 0 and not NaN");
+      if (!std::isfinite(w) || w < 0.0)
+        throw_invalid("ppr: seed weights must be finite and >= 0");
       wsum[q] += w;
     }
-    if (!(wsum[q] > 0.0))
-      throw_invalid("ppr: seed weights must sum > 0 per query");
+    if (!(wsum[q] > 0.0) || !std::isfinite(wsum[q]))
+      throw_invalid(
+          "ppr: seed weights must have a finite positive sum per query");
   }
 
   std::vector<int> iters(n_queries, 0);

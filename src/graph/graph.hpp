@@ -10,8 +10,8 @@
 //     (stable), for gather locality. Kernels and CPU algos run in canonical
 //     space; algo entry points translate at the boundary via perm/inv_perm.
 //
-// Input policy (plan §2): duplicate edges kept; self-loops kept; NaN or
-// negative weights rejected at build; num_vertices >= max_id+1 for isolated
+// Input policy (plan §2): duplicate edges kept; self-loops kept; non-finite
+// or negative weights rejected at build; num_vertices >= max_id+1 for isolated
 // vertices. Undirected graphs are symmetrized at build (each u!=v edge
 // stored both ways; self-loops stored once); E_input remains the caller's
 // edge count.
@@ -58,7 +58,7 @@ struct Orientation {
 class Graph {
  public:
   // src/dst are USER indices in [0, V). weights nullable. Throws mg::Error
-  // on NaN/negative weights or out-of-range indices.
+  // on non-finite/negative weights or out-of-range indices.
   static std::shared_ptr<Graph> build(const uint32_t* src, const uint32_t* dst,
                                       const float* weights, uint64_t n_edges,
                                       uint32_t n_vertices, bool directed);

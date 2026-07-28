@@ -159,6 +159,27 @@ def test_ppr_topk_duplicate_seeds_summed(exec_path, assert_path):
     assert np.array_equal(scores_dup, scores_pre)
 
 
+@pytest.mark.parametrize(
+    "bad_weight",
+    [np.nan, np.inf, -np.inf],
+    ids=["nan", "positive_infinity", "negative_infinity"],
+)
+def test_ppr_topk_non_finite_seed_weight_rejected(bad_weight):
+    case = ALL_CASES["gnp_dir"]
+    g = build_mg(case)
+    with pytest.raises(ValueError, match="finite"):
+        mg.ppr_topk(
+            g,
+            np.array([1, 2], np.uint32),
+            np.array([1.0, bad_weight], np.float32),
+            np.array([0, 2], np.uint64),
+            k=4,
+            alpha=0.85,
+            tol=1e-6,
+            max_iter=10,
+        )
+
+
 def test_ppr_topk_invalid_inputs_raise():
     case = ALL_CASES["gnp_dir"]
     g = build_mg(case)

@@ -19,8 +19,8 @@
 //   Vertices with all-zero outgoing weight but nonzero degree are treated
 //   as dangling (documented).
 //
-// ppr_topk: B queries, each a set of (seed, weight>=0) with sum > 0
-//   (normalized per query; duplicate seeds within a query are summed).
+// ppr_topk: B queries, each a set of (seed, finite weight>=0) with a finite
+//   sum > 0 (normalized per query; duplicate seeds within a query are summed).
 //   Runs tiles of MG_PPR_TILE lanes; per-lane convergence masking freezes
 //   converged lanes at audit boundaries. Selection: top-k by score, ties
 //   broken by ascending USER index; if k > V, rows are padded with
@@ -61,8 +61,8 @@ struct PagerankOpts {
   double alpha = 0.85;
   double tol = 1e-6;
   int max_iter = 100;
-  // Optional dense personalization, USER order, length V, entries >= 0,
-  // sum > 0 (normalized internally). Empty => uniform.
+  // Optional dense personalization, USER order, length V, finite entries
+  // >= 0, finite sum > 0 (normalized internally). Empty => uniform.
   const float* personalization = nullptr;
 };
 
@@ -78,6 +78,7 @@ struct PprTopkOpts {
 };
 
 // seeds/seed_weights packed CSR-style: query q owns [offsets[q], offsets[q+1]).
+// Seed weights must be finite and >= 0 with a positive sum per query.
 // B = n_queries. out_ids: int32[B*k] (USER indices, -1 padding), out_scores:
 // float[B*k]. Returns max iterations executed over all queries.
 int ppr_topk(Graph& g, const uint32_t* seeds, const float* seed_weights,

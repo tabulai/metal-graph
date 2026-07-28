@@ -173,7 +173,7 @@ std::shared_ptr<Graph> Graph::build(const uint32_t* src, const uint32_t* dst,
       }
       if (weights) {
         const float w = weights[i];
-        if (std::isnan(w) || w < 0.0f) {
+        if (!std::isfinite(w) || w < 0.0f) {
           bad_weight.store(true, std::memory_order_relaxed);
           return;
         }
@@ -183,7 +183,7 @@ std::shared_ptr<Graph> Graph::build(const uint32_t* src, const uint32_t* dst,
   if (bad_index.load())
     throw_invalid("edge endpoint index out of range (>= num_vertices)");
   if (bad_weight.load())
-    throw_invalid("edge weights must be >= 0 and not NaN");
+    throw_invalid("edge weights must be finite and >= 0");
 
   auto g = std::make_shared<Graph>();
   g->V = n_vertices;
@@ -272,10 +272,16 @@ std::shared_ptr<Graph> Graph::build(const uint32_t* src, const uint32_t* dst,
   const uint32_t* row = g->out_.row_offsets->as<uint32_t>();
   if (g->weighted) {
     const float* wp = g->out_.weights->as<float>();
+    std::atomic<bool> bad_weight_sum{false};
     parallel_for(V, [&](std::size_t b, std::size_t e) {
       for (std::size_t c = b; c < e; ++c) {
         float s = 0.0f;
         for (uint32_t k = row[c]; k < row[c + 1]; ++k) s += wp[k];
+        if (!std::isfinite(s)) {
+          bad_weight_sum.store(true, std::memory_order_relaxed);
+          ows[c] = 0.0f;
+          continue;
+        }
         // Flush subnormal sums to zero: GPU fp32 runs flush-to-zero, so a
         // subnormal ows would make kernels drop the vertex's contribution
         // while the host skips it in dangling_list — silent mass loss.
@@ -283,6 +289,9 @@ std::shared_ptr<Graph> Graph::build(const uint32_t* src, const uint32_t* dst,
         ows[c] = (s < FLT_MIN) ? 0.0f : s;
       }
     });
+    if (bad_weight_sum.load(std::memory_order_relaxed))
+      throw_invalid(
+          "outgoing edge weights must have a finite float32 sum per vertex");
   } else {
     parallel_for(V, [&](std::size_t b, std::size_t e) {
       for (std::size_t c = b; c < e; ++c)

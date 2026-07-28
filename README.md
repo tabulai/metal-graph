@@ -57,7 +57,7 @@ mg.last_run_info()              # {"op", "path": "gpu"|"cpu", "iterations", "ms"
 ## Semantics (v0.1, tested)
 
 * **Input policy**: duplicate edges kept (parallel edges; PageRank counts
-  them), self-loops kept, NaN/negative weights rejected at build,
+  them), self-loops kept, non-finite/negative weights rejected at build,
   `num_vertices=` accepted for isolated vertices. Undirected graphs are
   symmetrized internally; `num_edges` reports your input count.
 * **PageRank**: NetworkX-compatible iteration; weighted graphs normalize by

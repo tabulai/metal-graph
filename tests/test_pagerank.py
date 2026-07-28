@@ -73,6 +73,20 @@ def test_pagerank_personalization_sparse_dict(exec_path, assert_path):
     np.testing.assert_allclose(pr, expected, **pr_tolerance(exec_path))
 
 
+@pytest.mark.parametrize(
+    "bad_weight",
+    [np.nan, np.inf, -np.inf],
+    ids=["nan", "positive_infinity", "negative_infinity"],
+)
+def test_pagerank_non_finite_personalization_rejected(bad_weight):
+    case = ALL_CASES["gnp_dir"]
+    g = build_mg(case)
+    personalization = np.ones(case.num_vertices, dtype=np.float32)
+    personalization[0] = bad_weight
+    with pytest.raises(ValueError, match="finite"):
+        mg.pagerank(g, personalization=personalization, **PR_KW)
+
+
 @pytest.mark.parametrize("case_name", ["gnp_dir", "adversarial", "dangling"])
 def test_pagerank_deterministic_per_path(case_name, exec_path, assert_path):
     case = ALL_CASES[case_name]
