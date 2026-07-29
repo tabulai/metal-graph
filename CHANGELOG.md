@@ -12,16 +12,20 @@ All notable changes to metal-graph are documented here.
   POST_BUILD copy is now dev-loop only, guarded by `if(NOT SKBUILD)`).
 - Raised the Python upper bound to `<3.15` and added the 3.14 classifier
   and CI lane.
-- Made the GPU BFS command-batch size adaptive (8 doubling to 64 levels;
-  `MG_BFS_LEVELS_PER_BATCH` pins a fixed size): keeps shallow-graph latency
-  while restoring deep-diameter sync counts that the fixed 8-level default
-  had doubled versus the original 16. Added a 4096-level chain regression
-  test.
+- Made the GPU BFS command-batch size adaptive (8, 8, 16, 32, then 64
+  levels) to reduce command-buffer completions on deep-diameter traversals
+  while preserving cumulative checks at depths 8, 16, 32, and 64.
+  `MG_BFS_LEVELS_PER_BATCH` pins a fixed size clamped to 1–256; malformed
+  values retain the adaptive default. The scheduler and its termination
+  guard now use overflow-safe accounting; direct schedule, bounded k-hop,
+  and 4096-level chain regressions cover the behavior.
 - Restored golden-matrix coverage of the threaded CPU BFS oracle: the BFS
   matrix now also runs with the sparse preflight disabled.
 - Annotated the retroactive edits to the dated v0.1 plan record (rev C
   changelog) and flagged that the canonical benchmark table's rustworkx BFS
-  baseline predates the equivalent-work harness semantics.
+  baseline predates the equivalent-work harness semantics. Removed
+  unpublished candidate timings and clarified that documentation performance
+  claims require a matched, checked-in JSON and rendered report.
 
 ## 0.1.0 — 2026-07-28
 

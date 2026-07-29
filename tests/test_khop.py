@@ -55,6 +55,37 @@ def test_khop_k0_seeds_only(exec_path):
     assert len(ref_es) > 0  # fixture guarantees edges among these seeds
 
 
+@pytest.mark.gpu
+def test_khop_gpu_depth_bound_truncates_large_bfs_batch(monkeypatch):
+    """A fixed BFS batch override must never overrun k-hop's depth budget."""
+    from conftest import has_gpu
+
+    if not has_gpu():
+        pytest.skip("no Metal device")
+    monkeypatch.setenv("MG_BFS_LEVELS_PER_BATCH", "999999999")
+    v = 32
+    src = np.arange(v - 1, dtype=np.uint32)
+    dst = src + 1
+    g = mg.Graph.from_edges(src, dst, directed=True, num_vertices=v)
+    mg.set_execution("gpu")
+    try:
+        vertices, edges = mg.k_hop(
+            g, np.asarray([0], np.uint32), k=5, direction="out"
+        )
+        info = mg.last_run_info()
+    finally:
+        mg.set_execution("auto")
+
+    assert info["path"] == "gpu"
+    assert info["iterations"] == 5
+    np.testing.assert_array_equal(
+        np.asarray(vertices), np.arange(6, dtype=np.uint32)
+    )
+    np.testing.assert_array_equal(
+        np.asarray(edges), np.arange(5, dtype=np.uint32)
+    )
+
+
 @pytest.mark.parametrize("max_vertices", [5, 10, 25])
 def test_khop_max_vertices_deterministic_admission(max_vertices):
     # Cap-bounded runs are documented to execute on the (deterministic) CPU

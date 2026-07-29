@@ -1,4 +1,4 @@
-# metal-graph — v0.1 Implementation Plan (rev B)
+# metal-graph — v0.1 Implementation Plan (rev C; rev B design record)
 
 **A Metal-native graph-analytics engine for Apple Silicon. First release scoped to the few algorithms that accelerate the most.**
 
@@ -17,9 +17,10 @@ companion assessment (`apple-gpu-graph-acceleration.md`, `cuGraph_assessment`
 checkout) were scrubbed; the §5 M2 milestone, §10 benchmark-reporting, and
 §11 bottom-up-risk passages were amended to describe the bounded
 output-direct CPU BFS latency path and equivalent-work baseline rules that
-shipped AFTER rev B was frozen. The rev-B wording is preserved in git
-history; treat rev B as the design-time record and rev C as descriptive of
-the implementation.
+were introduced after rev B was frozen. The §2 packaging row now records
+the implemented Python 3.10–3.14 support range. The rev-B wording is
+preserved in git history; treat rev B as the design-time record and this
+rev-C document as the post-implementation record.
 
 ---
 
@@ -48,7 +49,7 @@ Deliberately **out** of v0.1: Louvain/Leiden (v0.3 centerpiece), similarity/tria
 | CPU↔GPU handoff | Shared storage removes copies, **not** ordering: CPU reads results only after command-buffer completion (`waitUntilCompleted`/shared events); handoffs occur only at defined operation boundaries | Per Apple's shared-storage semantics; no "free access" language |
 | Vertex identity | One **canonical internal uint32 ID space**; external IDs may be int32/int64/str (host-side map); segmentation never re-permutes IDs per orientation | Review item 3 |
 | Python bindings | **nanobind**; NumPy zero-copy views + DLPack; results synchronous in v0.1 (async/device-resident path reserved for MLX interop in v0.2) | Honest about the sync point NumPy implies |
-| Build / packaging | CMake; `.metal` → `.metallib` at build (runtime JIT fallback for dev); cibuildwheel macOS-arm64 wheels, Python 3.10–3.13 | Standard |
+| Build / packaging | CMake; `.metal` → `.metallib` at build (runtime JIT fallback for dev); cibuildwheel macOS-arm64 wheels, Python 3.10–3.14 | Implemented support range (rev C) |
 | License | Apache-2.0 | Ecosystem norm |
 | Input policy (defined, tested) | duplicate edges kept (parallel edges; PageRank counts them), self-loops kept (documented per-algorithm semantics), NaN/negative-where-invalid weights rejected at build, `num_vertices=` accepted for isolated vertices | Review "define behavior" item |
 
@@ -205,6 +206,15 @@ Host-side patterns (rev B):
 
 **GPU-resident iteration, CPU at boundaries only.** PageRank encodes K iterations (default 8) into one command buffer; *every* per-iteration dependency — dangling-mass reduction, zero-in-degree fill, residual partials — is a GPU dispatch inside the batch, so iteration N+1 consumes iteration N's scalars from device buffers with no CPU involvement. Between batches the CPU (a) sums the residual partials in fp64 as the *convergence audit* and decides continue/stop, and (b) optionally re-audits dangling mass. BFS runs whole levels GPU-side: `mg_frontier_bin` writes per-bin indirect dispatch arguments and the next-level flag; the host encodes K levels of `dispatchThreadgroups(indirectBuffer:)` blindly and checks the done-flag after the batch completes. No indirect *command buffers* needed in v0.1 — indirect dispatch args cover it.
 
+**Adaptive BFS batching (rev C).** The implemented default uses 8-, 8-, 16-,
+32-, then 64-level command batches, so the first completion checks land at
+cumulative depths 8, 16, 32, 64, and 128 before continuing in 64-level
+batches. This reduces CPU/GPU synchronization on deep-diameter traversals
+without skipping the latency-sensitive power-of-two boundaries. It is not a
+universal latency optimization: the final command buffer can still encode
+levels that are not needed. `MG_BFS_LEVELS_PER_BATCH` pins a fixed size,
+clamped to 1–256, for controlled tuning.
+
 **Per-operation planner (not per-level).** `mode="auto"` chooses CPU or GPU **once per operation**, from graph size, batch size, and orientation residency (initial rule: `E < E_gpu_min` → CPU path; `E_gpu_min` measured in M4, seeded ~1M). The per-*level* BFS CPU/GPU flip from rev A conflicted with batched encoding (review item 4) and is demoted to an experiment (`MG_EXPERIMENTAL_LEVEL_HYBRID=1`) gated on measured sync cost; the direction-optimizing top-down/bottom-up switch remains GPU-side, driven by GPU-computed frontier-edge counts and standard α/β heuristics (β=24 as the seed constant).
 
 **Synchronization protocol.** v0.1: tracked `MTLBuffer`s + one `MTLCommandQueue`; results surface to Python only after `waitUntilCompleted` at operation end; no CPU touches buffers mid-flight except designated readback buffers after completion. Heaps/fences and finer-grained overlap are v0.2 optimizations behind the allocator interface.
@@ -245,7 +255,7 @@ CI (review item — **no silent CPU fallback**): all GPU tests run with `MG_REQU
 
 ## 10. Benchmarks shipped in-repo
 
-`bench/run.py --suite v01` fetches soc-LiveJournal1 (69M) and com-orkut (117M), generates RMAT-22/24 and the HippoRAG-shape KG, and runs metal-graph vs igraph, rustworkx, SciPy (`sparse.csgraph`), and NetworkX (context only) per algorithm. Per review, reporting is decomposed and honest: **build, transpose, pipeline compile, warm kernel execution, convergence iteration/cadence metadata, top-k selection, and aggregate Python-boundary overhead are separate line items**; the fp64 audit is not separately timed. BFS rows record source degree, reached vertices, scanned reachable edges, depth/frontier sizes, and the executed path/variant; the rustworkx gate produces equivalent dense distance and parent arrays, while its no-output visitor and sparse layers are separate context rows. Every cell reports **median and p95 over ≥20 runs, cold and warm**, peak memory (RSS + `recommendedMaxWorkingSetSize` headroom), achieved GB/s (traffic model ÷ warm kernel time), and energy (`powermetrics` at 100 ms sampling, idle-subtracted, methodology in `bench/ENERGY.md`); chip model, core counts, macOS, compiler, and metal-graph versions recorded in the JSON. The **contention scenario** runs the PPR batch benchmark while `mlx_lm` decodes a fixed prompt stream, reporting graph-latency inflation *and* tokens/s impact — because an isolated GPU speedup that starves the LLM is a net loss for an agent, and nobody else publishes this number. The README table is regenerated only from physical-hardware runs.
+`bench/run.py --suite v01` fetches soc-LiveJournal1 (69M) and com-orkut (117M), generates RMAT-22/24 and the HippoRAG-shape KG, and runs metal-graph vs igraph, rustworkx, SciPy (`sparse.csgraph`), and NetworkX (context only) per algorithm. Per review, reporting is decomposed and honest: **build, transpose, pipeline compile, warm kernel execution, convergence iteration/cadence metadata, top-k selection, and aggregate Python-boundary overhead are separate line items**; the fp64 audit is not separately timed. BFS rows record source degree, reached vertices, scanned reachable edges, depth/frontier sizes, and the executed path/variant; the rustworkx gate produces equivalent dense distance and parent arrays, while its no-output visitor and sparse layers are separate context rows. Every cell reports **median and p95 over ≥20 runs, cold and warm**, peak memory (RSS + `recommendedMaxWorkingSetSize` headroom), achieved GB/s (traffic model ÷ warm kernel time), and energy (`powermetrics` at 100 ms sampling, idle-subtracted, methodology in `bench/ENERGY.md`); chip model, core counts, macOS, compiler, and metal-graph versions recorded in the JSON. The **contention scenario** runs the PPR batch benchmark while `mlx_lm` decodes a fixed prompt stream, reporting graph-latency inflation *and* tokens/s impact — because an isolated GPU speedup that starves the LLM is a net loss for an agent, and nobody else publishes this number. The README table is regenerated only from physical-hardware runs. Every numeric or comparative performance claim in project documentation must link to a matched, checked-in raw JSON and rendered Markdown report produced by the same harness run; candidate and exploratory observations remain unpublished until that pair exists.
 
 ## 11. Risks specific to this slice
 

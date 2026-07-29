@@ -24,9 +24,6 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  MACOSX_DEPLOYMENT_TARGET: "14.0"
-
 jobs:
   lint:
     name: lint
@@ -138,14 +135,26 @@ jobs:
           PYTHONPATH: python
         run: python -m pytest tests -v -ra --durations=15
 
-      - name: Build wheel
+      - name: Build wheel without polluting the source package
         run: |
-          source_core="$(find python/metal_graph -maxdepth 1 \
-            -name '_core*.so' -print -quit)"
-          test -n "$source_core"
-          source_hash="$(shasum -a 256 "$source_core")"
+          # The normal developer build above intentionally copies _core next
+          # to the Python sources. Remove it so this is a clean source-package
+          # check: any _core written there by the wheel build is now an
+          # observable new file, even if its contents match an earlier build.
+          find python/metal_graph -maxdepth 1 -type f \
+            \( -name '_core*.so' -o -name '_core*.dylib' \) -delete
+          test -z "$(find python/metal_graph -maxdepth 1 -type f \
+            \( -name '_core*.so' -o -name '_core*.dylib' \) -print -quit)"
+
+          # Exercise the deployment target declared in pyproject.toml itself.
+          # In particular, do not let a runner-level value mask a regression.
+          unset MACOSX_DEPLOYMENT_TARGET
           python -m build --wheel
-          test "$source_hash" = "$(shasum -a 256 "$source_core")"
+
+          test -z "${MACOSX_DEPLOYMENT_TARGET+x}"
+          test -z "$(find python/metal_graph -maxdepth 1 -type f \
+            \( -name '_core*.so' -o -name '_core*.dylib' \) -print -quit)"
+          git diff --exit-code -- python/metal_graph
 
       - name: Verify wheel tag and isolated import
         run: |
