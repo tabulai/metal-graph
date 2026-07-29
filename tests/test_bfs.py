@@ -19,18 +19,40 @@ def _source_sets(case):
     return {"single": single, "multi": multi}
 
 
+# The sparse preflight would otherwise absorb every V<=400 fixture on the
+# cpu/auto routes, silently stripping the golden matrix's coverage of the
+# threaded cpu::bfs oracle — so the matrix runs both with the preflight
+# enabled (default) and disabled (full path forced).
+SPARSE_MODES = ["default", "nosparse"]
+
+
+def _apply_sparse_mode(monkeypatch, mode):
+    if mode == "nosparse":
+        monkeypatch.setenv("MG_BFS_SPARSE_MAX_VERTICES", "0")
+        monkeypatch.setenv("MG_BFS_SPARSE_MAX_EDGES", "0")
+
+
+def _assert_full_path_op(mode):
+    if mode == "nosparse":
+        assert mg.last_run_info()["op"] == "bfs", (
+            "preflight disabled: the full (threaded/GPU) path must run")
+
+
+@pytest.mark.parametrize("sparse_mode", SPARSE_MODES)
 @pytest.mark.parametrize("direction", DIRECTIONS)
 @pytest.mark.parametrize("srcset", ["single", "multi"])
 def test_bfs_dist_matches_reference(graph_case, direction, srcset, exec_path,
-                                    assert_path):
+                                    assert_path, sparse_mode, monkeypatch):
     case = graph_case
     if case.num_vertices == 0:
         pytest.skip("no valid sources in an empty graph")
+    _apply_sparse_mode(monkeypatch, sparse_mode)
     sources = _source_sets(case)[srcset]
     g = build_mg(case)
     dist, parent = mg.bfs(g, np.asarray(sources, np.uint32),
                           direction=direction)
     assert_path(bfs_expected_path(case.directed, direction, exec_path))
+    _assert_full_path_op(sparse_mode)
     dist = np.asarray(dist)
     parent = np.asarray(parent)
     assert dist.shape == (case.num_vertices,)
@@ -41,19 +63,23 @@ def test_bfs_dist_matches_reference(graph_case, direction, srcset, exec_path,
     assert ((dist >= 0) | (parent == -1)).all()
 
 
+@pytest.mark.parametrize("sparse_mode", SPARSE_MODES)
 @pytest.mark.parametrize("direction", DIRECTIONS)
-def test_bfs_parent_structural(graph_case, direction, exec_path, assert_path):
+def test_bfs_parent_structural(graph_case, direction, exec_path, assert_path,
+                               sparse_mode, monkeypatch):
     # Parent choice may be nondeterministic on the GPU path — validate
     # structurally: parent is visited, one level closer, and the traversal
     # edge parent -> v exists in the requested direction.
     case = graph_case
     if case.num_vertices == 0:
         pytest.skip("no valid sources in an empty graph")
+    _apply_sparse_mode(monkeypatch, sparse_mode)
     sources = _source_sets(case)["multi"]
     g = build_mg(case)
     dist, parent = mg.bfs(g, np.asarray(sources, np.uint32),
                           direction=direction)
     assert_path(bfs_expected_path(case.directed, direction, exec_path))
+    _assert_full_path_op(sparse_mode)
     dist = np.asarray(dist)
     parent = np.asarray(parent)
     adj = adjacency_sets(case, direction)
@@ -196,3 +222,31 @@ def test_sparse_cpu_path_is_reentrant(monkeypatch):
             np.testing.assert_array_equal(
                 parent[source + 1:], np.arange(source, 255, dtype=np.int32)
             )
+
+
+@pytest.mark.gpu
+def test_bfs_deep_chain_crosses_many_batches(monkeypatch):
+    # 4096-level path graph: the traversal spans dozens of command buffers
+    # under the adaptive 8->64 batch schedule (and hundreds under a pinned
+    # small batch). Guards level/parity bookkeeping across commit boundaries
+    # while exercising the adaptive default; dist on a chain is determined.
+    from conftest import has_gpu
+    if not has_gpu():
+        pytest.skip("no Metal device")
+    monkeypatch.delenv("MG_BFS_LEVELS_PER_BATCH", raising=False)
+    v = 4096
+    src = np.arange(v - 1, dtype=np.uint32)
+    dst = np.arange(1, v, dtype=np.uint32)
+    g = mg.Graph.from_edges(src, dst, directed=True, num_vertices=v)
+    mg.set_execution("gpu")
+    try:
+        dist, parent = mg.bfs(g, np.asarray([0], np.uint32), direction="out")
+        assert mg.last_run_info()["path"] == "gpu"
+        assert mg.last_run_info()["iterations"] == v
+    finally:
+        mg.set_execution("auto")
+    np.testing.assert_array_equal(np.asarray(dist),
+                                  np.arange(v, dtype=np.int32))
+    par = np.asarray(parent)
+    assert par[0] == -1
+    np.testing.assert_array_equal(par[1:], np.arange(v - 1, dtype=np.int32))

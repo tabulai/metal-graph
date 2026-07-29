@@ -11,7 +11,7 @@ under `experimental` as the atomics canary).
 - Python import: `metal_graph` · C ABI: [`include/mg.h`](include/mg.h)
   (`mg_` prefix) · MSL kernels: `mg_` prefix · License: Apache-2.0.
 - Requirements: macOS 14+, Apple Silicon (Apple7+/M1 and up), CPython
-  3.10–3.13, CMake 3.24+, and Xcode with the Metal compiler.
+  3.10–3.14, CMake 3.24+, and Xcode with the Metal compiler.
 - Design + rationale: [v0.1 implementation plan](docs/implementation-plan-v0.1.md).
 
 ## Quick start
@@ -124,7 +124,7 @@ falls back.
 |---|---|---|
 | `MG_E_GPU_MIN` | 1000000 | auto-planner GPU threshold (stored edges) |
 | `MG_PR_AUDIT_INTERVAL` | 5 | iterations per GPU command batch / fp64 audit |
-| `MG_BFS_LEVELS_PER_BATCH` | 8 | BFS levels encoded per command buffer |
+| `MG_BFS_LEVELS_PER_BATCH` | adaptive 8→64 | BFS levels per command buffer; setting the env pins a fixed size (doubling default keeps shallow-graph latency AND deep-graph sync counts low) |
 | `MG_BFS_SPARSE_MAX_VERTICES` | 1024 | auto/CPU BFS latency-path vertex cap (0 disables) |
 | `MG_BFS_SPARSE_MAX_EDGES` | 8192 | auto/CPU BFS latency-path scanned-edge cap (0 disables) |
 | `MG_WCC_ROUNDS_PER_BATCH` | 4 | WCC hook+jump rounds per command buffer |
@@ -198,11 +198,14 @@ Implementation passes addressed the first run's largest gaps:
    the canonical artifact records the resulting iteration counts, while
    `MG_PR_AUDIT_INTERVAL` remains available for repeatable local sweeps.
 
-The canonical table predates the BFS latency work in the current candidate.
-On the same physical M4 Max, the bounded sparse path measured 0.010 ms
-median for that KG source (52 reached vertices, 344 scanned edges), versus
-0.043 ms for rustworkx's no-output visitor and 0.057 ms for an equivalent
-dense `dist+parent` visitor. These candidate numbers will replace the table
+The canonical table predates the BFS latency work in the current candidate,
+and its KG BFS `rustworkx 0.046 ms` baseline (the 0.05× row) was measured
+with the old no-output-visitor harness — semantics the current harness
+explicitly labels non-equivalent. On the same physical M4 Max, the bounded
+sparse path measured 0.010 ms median for that KG source (52 reached
+vertices, 344 scanned edges), versus 0.043 ms for rustworkx's no-output
+visitor and 0.057 ms for an equivalent dense `dist+parent` visitor. These
+candidate numbers (and the equivalent-work baseline) will replace the table
 only after a clean provenance-backed benchmark rerun. A new high-degree KG
 row exercises the GPU path: 1.85 ms versus rustworkx 49.63 ms, though igraph
 remains faster at 0.89 ms.

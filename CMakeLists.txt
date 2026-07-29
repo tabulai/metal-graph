@@ -150,10 +150,14 @@ if(MG_BUILD_PYTHON)
 
   nanobind_add_module(_core src/python/bindings.cpp)
   target_link_libraries(_core PRIVATE mgcore)
-  add_custom_command(TARGET _core POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:_core>
-            ${CMAKE_CURRENT_SOURCE_DIR}/python/metal_graph/
-    COMMENT "Copying _core into python/metal_graph/")
+  # Dev-loop convenience only (PYTHONPATH=python): never write into the
+  # source tree during scikit-build-core wheel builds.
+  if(NOT SKBUILD)
+    add_custom_command(TARGET _core POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:_core>
+              ${CMAKE_CURRENT_SOURCE_DIR}/python/metal_graph/
+      COMMENT "Copying _core into python/metal_graph/")
+  endif()
   install(TARGETS _core LIBRARY DESTINATION metal_graph)
 endif()
 

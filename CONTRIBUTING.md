@@ -2,7 +2,7 @@
 
 metal-graph targets Apple Silicon Macs running macOS 14 or newer. Native
 development requires Xcode with the Metal compiler, CMake 3.24+, and
-CPython 3.10–3.13.
+CPython 3.10–3.14.
 
 ## Development setup
 
