@@ -18,5 +18,7 @@ bench/results/*
 !bench/results/README.md
 !bench/results/bench-20260729T000207Z.json
 !bench/results/bench-20260729T000207Z.md
+!bench/results/bench-20260729T201007Z.json
+!bench/results/bench-20260729T201007Z.md
 dist/
 *.egg-info/

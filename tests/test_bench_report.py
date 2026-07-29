@@ -183,6 +183,10 @@ def test_renderer_accepts_legacy_canonical_artifact():
             "bench-20260729T131101Z-orkut-bounded",
             "a4a8bc325785b4b73f92ff896ec4e7e44ed5b4a6",
         ),
+        (
+            "bench-20260729T201007Z",
+            "7afb4b2ff3dc2a520ecb1388e4b22e4619ab1989",
+        ),
     ],
 )
 def test_checked_in_artifact_pairs_are_strict_and_reproducible(

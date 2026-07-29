@@ -15,8 +15,9 @@ selects a candidate path per call.
 - **Batched PPR with top-k** is the flagship: queries run in tiles of up to
   eight, lanes within a tile share each graph pass, queries converge
   independently, and a GPU radix-select returns `(B, k)` ids/scores. The
-  provisional HippoRAG-shaped B=16 run below measured 15.116 ms total
-  (0.945 ms/query).
+  isolated HippoRAG-shaped B=16 artifact run measured 10.707 ms per batch
+  (0.669 ms/query, meeting the ≤0.7 ms amortized target; the ≤10 ms batch
+  target is missed by 7%).
 - **GPU-resident iteration.** PageRank encodes batches of iterations into
   single command buffers with per-iteration dangling-mass reduction on
   device; BFS runs whole levels through GPU-written indirect dispatch with a
@@ -100,7 +101,7 @@ methodology, baseline versions, and the limitations summarized below.
 | Dataset | PageRank / iteration | `ppr_topk` B=16, k=64 | BFS source 0 | WCC |
 |---|---:|---:|---:|---:|
 | RMAT-18 (V=262k, E=4.2M) | 0.35 ms | 10.2 ms | 1.5 ms | 3.8 ms |
-| HippoRAG-shape KG (V=100k, E=2M, weighted) | 0.21 ms | 15.1 ms | 0.012 ms¹ | 4.1 ms |
+| HippoRAG-shape KG (V=100k, E=2M, weighted) | 0.21 ms | 15.1 ms² | 0.012 ms¹ | 4.1 ms |
 | RMAT-22 (V=4.2M, E=67M) | 3.4 ms | 122 ms | 13.9 ms | 32.4 ms |
 | RMAT-24 (V=16.8M, E=268M) | 14.7 ms | 556 ms | 46.1 ms | 119.8 ms |
 | soc-LiveJournal1 (V=4.8M, E=69M) | 4.0 ms | 174 ms | 13.4 ms | 24.9 ms |
@@ -157,9 +158,18 @@ evidence.
 | LiveJournal | 173.635 ms | did not complete after more than six hours | not comparable |
 | Orkut | 257.417 ms | skipped after the LiveJournal overrun | not comparable |
 
-Despite the contextual igraph advantage, HippoRAG PPR misses the v0.1
-absolute targets: 15.116 ms versus 10 ms per batch and 0.945 ms versus
-0.7 ms amortized per query.
+² The interrupted full-suite run read the HippoRAG PPR batch at
+15.116 ms, but its anomalous per-row accounting (a 3.3 ms `python_boundary`
+residue unique to that collection window) prompted an isolated clean-process
+re-measurement with full provenance
+([JSON](bench/results/bench-20260729T201007Z.json) ·
+[rendered](bench/results/bench-20260729T201007Z.md), clean source commit,
+28 rows including all KG baselines): **10.707 ms per batch (p95 10.922),
+0.669 ms/query over 20 warm runs** — the ≤0.7 ms amortized target passes
+and the ≤10 ms batch target is missed by 7%. The same artifact re-measured
+KG high-degree BFS against the corrected equivalent-output igraph adapter:
+metal-graph 1.857 ms vs igraph 2.321 ms (1.25×) and rustworkx 49.334 ms
+(26.6×).
 
 ¹ Tiny reachable components route to the bounded serial CPU path and are
 assessed against an absolute-latency SLO (≤ 50 µs), rather than a ratio
