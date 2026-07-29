@@ -383,20 +383,23 @@ def load_snap(name):
 # timing helpers
 # ---------------------------------------------------------------------------
 
-# Tiny-component BFS ships an absolute-latency SLO instead of a ratio gate:
+# Tiny-component BFS reports an absolute-latency SLO assessment instead of
+# treating a ratio as an enforceable gate:
 # sub-20-microsecond cells are dominated by output-contract costs (dense
 # int32[V] materialization), so ratios there compare formats, not engines.
 TINY_BFS_SLO_MS = 0.050
+TINY_BFS_SLO_GATE = (
+    "absolute-latency SLO assessment; ratio excluded for sparse-path "
+    "traversals"
+)
 
 
 def tiny_bfs_slo(median_ms, slo_ms=TINY_BFS_SLO_MS):
-    """Stats dict for the tiny-component BFS SLO row (pure; unit-tested)."""
+    """SLO metadata to attach to the measured tiny-component BFS row."""
     return {
-        "median_ms": median_ms,
-        "p95_ms": float("nan"),
-        "runs": 0,
         "slo_ms": slo_ms,
         "slo_pass": bool(median_ms <= slo_ms),
+        "gate": TINY_BFS_SLO_GATE,
     }
 
 
@@ -588,21 +591,22 @@ def bench_dataset(mg, name, data, runs, rows):
     st = stats_ms(lambda: mg.bfs(g, s0, direction="out"), runs)
     info = mg.last_run_info()
     single_result = mg.bfs(g, s0, direction="out")
+    slo = (
+        tiny_bfs_slo(st["median_ms"])
+        if info["op"] == "bfs_sparse" else {}
+    )
     add("bfs", "warm_single_source", st, levels=info["iterations"],
         path=info["path"], variant=info["op"], source=0,
         source_out_degree=int(out_degree[0]),
-        **bfs_diagnostics(single_result))
+        **bfs_diagnostics(single_result), **slo)
 
     if info["op"] == "bfs_sparse":
-        # Tiny-component gate reframing: at microsecond scale a RATIO gate
-        # measures output contracts, not engines (the two dense int32[V]
-        # result arrays alone cost ~9 us at V=100k). The gate for this cell
-        # is an absolute latency SLO; same-contract ratios (igraph dense)
-        # remain in the baseline rows, and rustworkx bfs_layers is excluded
-        # from gates as a different output contract.
-        add("bfs", "tiny_component_slo", tiny_bfs_slo(st["median_ms"]),
-            source=0, gate="absolute-latency SLO (replaces ratio gate for "
-            "sparse-path traversals)")
+        # At microsecond scale a ratio measures output contracts, not
+        # engines (the two dense int32[V] result arrays alone cost ~9 us at
+        # V=100k). Record the absolute-latency assessment on the actual
+        # measured row; same-contract ratios (igraph dense) remain in the
+        # baseline rows, and rustworkx bfs_layers is excluded from gates as
+        # a different output contract.
         st_sp = stats_ms(
             lambda: mg.bfs(g, s0, direction="out", output="sparse"), runs)
         info_sp = mg.last_run_info()

@@ -15,6 +15,7 @@ DIRECTIONS = ["out", "in", "both"]
 def _check_against_dense(case, g, sources, direction):
     vs, dist, parent = mg.bfs(g, np.asarray(sources, np.uint32),
                               direction=direction, output="sparse")
+    sparse_info = dict(mg.last_run_info())
     vs, dist, parent = np.asarray(vs), np.asarray(dist), np.asarray(parent)
     dense_dist, _ = mg.bfs(g, np.asarray(sources, np.uint32),
                            direction=direction)
@@ -38,6 +39,7 @@ def _check_against_dense(case, g, sources, direction):
             assert p in pos, f"parent {p} of {v} not in reached set"
             assert dist[pos[p]] == dist[i] - 1
             assert int(v) in adj[p], f"no edge {p} -> {v} ({direction})"
+    return sparse_info
 
 
 @pytest.mark.parametrize("direction", DIRECTIONS)
@@ -50,15 +52,24 @@ def test_sparse_matches_dense(name, direction, exec_path):
     _check_against_dense(case, g, [0], direction)
 
 
-def test_sparse_fallback_on_cap_overflow(monkeypatch, exec_path):
-    # Caps of 1 force the dense-machinery fallback; the output contract
+@pytest.mark.parametrize("overflow_cap", ["vertices", "edges"])
+def test_sparse_fallback_on_cap_overflow(
+    monkeypatch, exec_path, overflow_cap
+):
+    # Either cap can force the dense-machinery fallback; the output contract
     # (ascending, exact reached set) must hold identically, and telemetry
-    # must report the full path honestly.
+    # captured immediately after the sparse-output call must report it.
     case = ALL_CASES["gnp_dir"]
     g = build_mg(case)
-    monkeypatch.setenv("MG_BFS_SPARSE_MAX_VERTICES", "1")
-    _check_against_dense(case, g, [0, 3], "out")
-    assert mg.last_run_info()["op"] == "bfs"
+    monkeypatch.setenv("MG_BFS_SPARSE_MAX_VERTICES", "1024")
+    monkeypatch.setenv("MG_BFS_SPARSE_MAX_EDGES", "8192")
+    cap_env = {
+        "vertices": "MG_BFS_SPARSE_MAX_VERTICES",
+        "edges": "MG_BFS_SPARSE_MAX_EDGES",
+    }[overflow_cap]
+    monkeypatch.setenv(cap_env, "1")
+    sparse_info = _check_against_dense(case, g, [0, 3], "out")
+    assert sparse_info["op"] == "bfs"
 
 
 def test_sparse_fast_path_telemetry_and_determinism():
