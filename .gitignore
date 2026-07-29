@@ -22,3 +22,4 @@ bench/results/*
 !bench/results/bench-20260729T201007Z.md
 dist/
 *.egg-info/
+.ipynb_checkpoints/
