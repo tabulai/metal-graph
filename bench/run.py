@@ -147,6 +147,26 @@ def make_rustworkx_dense_bfs(rx, graph, v, source):
     return run
 
 
+def make_igraph_dense_bfs(graph, v, source):
+    """Return an API-equivalent dense dist+parent igraph BFS runner."""
+    def run():
+        order, layer_offsets, raw_parent = graph.bfs(source, mode="out")
+        dist = np.full(v, -1, np.int32)
+        parent = np.asarray(raw_parent, dtype=np.int32)
+        parent[parent < 0] = -1
+
+        order = np.asarray(order, dtype=np.intp)
+        layer_offsets = np.asarray(layer_offsets, dtype=np.intp)
+        depths = np.repeat(
+            np.arange(layer_offsets.size - 1, dtype=np.int32),
+            np.diff(layer_offsets),
+        )
+        dist[order] = depths
+        return dist, parent
+
+    return run
+
+
 # ---------------------------------------------------------------------------
 # SNAP datasets (download ONLY with --fetch; cached under bench/data/)
 # ---------------------------------------------------------------------------
@@ -737,24 +757,24 @@ def bench_baselines(name, data, runs, add):
                  lambda: gi.pagerank(damping=0.85, weights=ig_weight),
                  weighted=w is not None)
 
-        def ig_bfs_source_zero():
-            return gi.bfs(0)
-
+        ig_bfs_source_zero = make_igraph_dense_bfs(gi, v, 0)
         probe_ms, _ = timed(ig_bfs_source_zero)
         ig_bfs_runs = max(200, runs) if probe_ms < 2.0 else b_runs
         baseline("bfs", "baseline_igraph", ig_bfs_source_zero, source=0,
+                 semantics="dense int32 dist+parent",
                  sample_runs=ig_bfs_runs)
         degree = stored_out_degrees(src, dst, v, directed)
         high_source = int(np.argmax(degree)) if v else 0
 
-        def ig_bfs_high_degree():
-            return gi.bfs(high_source)
-
+        ig_bfs_high_degree = make_igraph_dense_bfs(
+            gi, v, high_source
+        )
         probe_ms, _ = timed(ig_bfs_high_degree)
         ig_high_runs = max(200, runs) if probe_ms < 2.0 else b_runs
         baseline("bfs", "baseline_igraph_high_degree", ig_bfs_high_degree,
                  source=high_source,
                  source_out_degree=int(degree[high_source]),
+                 semantics="dense int32 dist+parent",
                  sample_runs=ig_high_runs)
         ig_wcc = getattr(gi, "connected_components", None) or gi.clusters
         baseline("wcc", "baseline_igraph", lambda: ig_wcc(mode="weak"))

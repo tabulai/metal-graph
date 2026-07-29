@@ -19,10 +19,10 @@
    competition), SciPy sparse power iteration, a pure-python deque BFS.
    rustworkx / igraph are feature-detected line items for **BFS, WCC,
    and PageRank** (the plan-§10 gate shapes) and reported as
-   `not installed` when absent — never silently skipped. The rustworkx BFS
-   gate constructs dense `int32[V]` distance and parent arrays like
-   metal-graph; its no-output visitor and sparse-layers APIs are labeled
-   separately as non-equivalent context.
+   `not installed` when absent — never silently skipped. Both BFS gate
+   baselines construct dense `int32[V]` distance and parent arrays like
+   metal-graph; rustworkx's no-output visitor and sparse-layers APIs are
+   labeled separately as non-equivalent context.
 5. Every line item records `t_start_utc`/`t_end_utc` (ISO-8601, for
    powermetrics window alignment — see `ENERGY.md`) and peak-RSS
    bracketing: `peak_rss_mb` is the process high-water mark at the end of
@@ -69,6 +69,7 @@ markdown table. Result files use an explicit schema version and strict JSON.
 | `wcc / warm` | hook+jump rounds attached |
 | `k_hop / warm_k2_capped` | capped extraction (agent-latency shape) |
 | `bfs / baseline_rustworkx` | identical-semantics dense `dist+parent` visitor |
+| `bfs / baseline_igraph` | identical-semantics dense `dist+parent` adapter |
 | `bfs / baseline_rustworkx_noop`, `baseline_rustworkx_layers` | non-equivalent traversal-only context |
 | `bfs / baseline_*_high_degree` | same deterministic max-out-degree source as `warm_high_degree_source` |
 | `baseline_*` | other context numbers (see honesty rules); rustworkx / igraph appear under `pagerank`, `bfs`, **and** `wcc` |
