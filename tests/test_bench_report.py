@@ -404,3 +404,14 @@ def test_igraph_bfs_gate_handles_singleton_graph():
 
     np.testing.assert_array_equal(dist, [0])
     np.testing.assert_array_equal(parent, [-1])
+
+
+def test_tiny_bfs_slo_row_semantics():
+    from bench.run import TINY_BFS_SLO_MS, tiny_bfs_slo
+
+    assert TINY_BFS_SLO_MS == 0.050
+    row = tiny_bfs_slo(0.012)
+    assert row["slo_pass"] is True and row["slo_ms"] == 0.050
+    assert tiny_bfs_slo(0.050)["slo_pass"] is True  # boundary inclusive
+    assert tiny_bfs_slo(0.051)["slo_pass"] is False
+    assert tiny_bfs_slo(0.012, slo_ms=0.01)["slo_pass"] is False

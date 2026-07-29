@@ -148,6 +148,26 @@ nb::tuple bfs(GraphHandle& h, ArrU32 sources, int direction) {
   return nb::make_tuple(dist_arr, parent_arr);
 }
 
+nb::tuple bfs_sparse(GraphHandle& h, ArrU32 sources, int direction) {
+  mg::Graph& g = *h.g;
+  mg::BfsDir d = bfs_dir(direction);
+  mg::SparseBfsResult r;
+  {
+    nb::gil_scoped_release rel;
+    mg::bfs_sparse(g, sources.data(), static_cast<uint32_t>(sources.size()),
+                   d, r);
+  }
+  const std::size_t n = r.vertices.size();
+  std::unique_ptr<uint32_t[]> vs(new uint32_t[n]);
+  std::unique_ptr<int32_t[]> dist(new int32_t[n]);
+  std::unique_ptr<int32_t[]> parent(new int32_t[n]);
+  std::copy(r.vertices.begin(), r.vertices.end(), vs.get());
+  std::copy(r.dist.begin(), r.dist.end(), dist.get());
+  std::copy(r.parent.begin(), r.parent.end(), parent.get());
+  return nb::make_tuple(take_1d(vs, n), take_1d(dist, n),
+                        take_1d(parent, n));
+}
+
 nb::tuple k_hop(GraphHandle& h, ArrU32 seeds, uint32_t k, int direction,
                 uint32_t max_vertices, uint64_t max_edges) {
   mg::Graph& g = *h.g;
@@ -357,6 +377,7 @@ NB_MODULE(_core, m) {
   m.def("ppr_topk", &ppr_topk, "graph"_a, "seeds"_a, "seed_weights"_a,
         "offsets"_a, "k"_a, "alpha"_a, "tol"_a, "max_iter"_a);
   m.def("bfs", &bfs, "graph"_a, "sources"_a, "direction"_a);
+  m.def("bfs_sparse", &bfs_sparse, "graph"_a, "sources"_a, "direction"_a);
   m.def("k_hop", &k_hop, "graph"_a, "seeds"_a, "k"_a, "direction"_a,
         "max_vertices"_a, "max_edges"_a);
   m.def("wcc", &wcc, "graph"_a);

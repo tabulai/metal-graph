@@ -281,12 +281,25 @@ def ppr_topk(G, seeds, seed_weights, seed_offsets, k=64, alpha=0.85, tol=1e-6,
                           int(max_iter))
 
 
-def bfs(G, sources, direction="out"):
-    """Multi-source BFS. Returns (dist, parent), both int32 [V], -1 =
-    unreachable / no parent."""
+def bfs(G, sources, direction="out", output="dense"):
+    """Multi-source BFS.
+
+    output="dense" (default): returns (dist, parent), both int32 [V],
+    -1 = unreachable / no parent — unchanged contract.
+
+    output="sparse": returns (vertices, dist, parent) aligned arrays of
+    length |reached| (uint32/int32/int32), vertices ascending, sources at
+    depth 0 with parent -1. Same reachability as dense; O(|reached|)
+    output instead of O(V), which makes tiny-neighborhood queries on huge
+    graphs run in microseconds.
+    """
     core = _core_graph(G)
     srcs = _as_index_array(sources, G.num_vertices, "sources")
-    return _core.bfs(core, srcs, _direction_code(direction))
+    if output == "dense":
+        return _core.bfs(core, srcs, _direction_code(direction))
+    if output == "sparse":
+        return _core.bfs_sparse(core, srcs, _direction_code(direction))
+    raise ValueError('output: must be "dense" or "sparse"')
 
 
 def k_hop(G, seeds, k=2, direction="both", max_vertices=None, max_edges=None,
