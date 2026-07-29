@@ -264,6 +264,47 @@ def load_snap_cache(path, spec):
     return src, dst, None, v, directed
 
 
+def normalize_snap_ids(src, dst, expected_vertices, source):
+    """Validate and densely renumber a pinned SNAP edge list.
+
+    SNAP metadata reports the number of vertices, but some archives use a
+    sparse external-ID range. Treating ``max_id + 1`` as the vertex count
+    would add fake isolated vertices and can make benchmark source 0 fake as
+    well. Preserve already-dense inputs and otherwise map sorted external IDs
+    deterministically to ``[0, expected_vertices)``.
+    """
+    if src.size == 0:
+        if expected_vertices != 0:
+            raise RuntimeError(
+                f"{source}: expected {expected_vertices} vertices, got 0"
+            )
+        return src, dst, 0
+
+    max_id = int(max(src.max(), dst.max()))
+    seen = np.zeros(max_id + 1, dtype=np.bool_)
+    seen[src] = True
+    seen[dst] = True
+    ids = np.flatnonzero(seen)
+    if ids.size != expected_vertices:
+        raise RuntimeError(
+            f"{source}: expected {expected_vertices} unique vertices, got "
+            f"{ids.size}"
+        )
+
+    if ids[0] == 0 and ids[-1] + 1 == expected_vertices:
+        return src, dst, expected_vertices
+
+    dense_of_external = np.full(
+        max_id + 1, np.iinfo(np.uint32).max, dtype=np.uint32
+    )
+    dense_of_external[ids] = np.arange(expected_vertices, dtype=np.uint32)
+    return (
+        dense_of_external[src],
+        dense_of_external[dst],
+        expected_vertices,
+    )
+
+
 def load_snap(name):
     """Parse an edge-list .txt.gz (cached as .npz after first parse).
     Returns None when the dataset was never fetched."""
@@ -292,9 +333,11 @@ def load_snap(name):
             dst_l.append(int(b))
     src = np.asarray(src_l, dtype=np.uint32)
     dst = np.asarray(dst_l, dtype=np.uint32)
-    v = int(max(src.max(), dst.max())) + 1
+    src, dst, v = normalize_snap_ids(
+        src, dst, spec["vertices"], gz
+    )
     directed = spec["directed"]
-    if src.size != spec["edges"] or v != spec["vertices"]:
+    if src.size != spec["edges"]:
         raise RuntimeError(
             f"{gz}: parsed shape does not match the pinned SNAP manifest"
         )

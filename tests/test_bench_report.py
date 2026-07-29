@@ -17,6 +17,7 @@ from bench.run import (
     json_safe,
     load_snap_cache,
     make_rustworkx_dense_bfs,
+    normalize_snap_ids,
     render_markdown,
     stored_out_degrees,
     validate_dataset,
@@ -124,6 +125,29 @@ def test_snap_cache_requires_schema_and_structure(tmp_path):
         directed=True,
     )
     assert load_snap_cache(path, spec) is None
+
+
+def test_snap_ids_are_validated_and_densely_renumbered():
+    dense_src = np.array([0, 1, 2], dtype=np.uint32)
+    dense_dst = np.array([1, 2, 0], dtype=np.uint32)
+    src, dst, vertices = normalize_snap_ids(
+        dense_src, dense_dst, 3, "dense fixture"
+    )
+    assert src is dense_src
+    assert dst is dense_dst
+    assert vertices == 3
+
+    sparse_src = np.array([10, 40, 10], dtype=np.uint32)
+    sparse_dst = np.array([40, 70, 70], dtype=np.uint32)
+    src, dst, vertices = normalize_snap_ids(
+        sparse_src, sparse_dst, 3, "sparse fixture"
+    )
+    np.testing.assert_array_equal(src, [0, 1, 0])
+    np.testing.assert_array_equal(dst, [1, 2, 2])
+    assert vertices == 3
+
+    with pytest.raises(RuntimeError, match="expected 4 unique vertices"):
+        normalize_snap_ids(sparse_src, sparse_dst, 4, "bad fixture")
 
 
 def test_renderer_accepts_legacy_canonical_artifact():
