@@ -290,8 +290,9 @@ def bfs(G, sources, direction="out", output="dense"):
     output="sparse": returns (vertices, dist, parent) aligned arrays of
     length |reached| (uint32/int32/int32), vertices ascending, sources at
     depth 0 with parent -1. Same reachability as dense; O(|reached|)
-    output instead of O(V), which makes tiny-neighborhood queries on huge
-    graphs run in microseconds.
+    output instead of O(V). When the bounded collector finishes within the
+    configured caps, it also avoids dense result initialization. Cap
+    overflow or forced-GPU execution compacts from dense state.
     """
     core = _core_graph(G)
     srcs = _as_index_array(sources, G.num_vertices, "sources")

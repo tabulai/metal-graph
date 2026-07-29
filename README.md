@@ -88,11 +88,12 @@ mg.last_run_info()              # {"op", "path": "gpu"|"cpu", "iterations", "ms"
 
 ## Performance
 
-Measured on an Apple M4 Max (macOS 26.2) at source commit `a4a8bc`, timed
-from the Python call to the returned result. Metal-graph cells are medians
-of 20 warm calls. External baselines generally use four timed calls after
-one warm-up; sub-2 ms BFS baselines receive additional samples. Lower
-latency is better. The
+Measured on an Apple M4 Max (macOS 26.2), timed from the Python call to the
+returned result. Most cells come from source commit `a4a8bc`; the HippoRAG
+PPR cell marked ² comes from the isolated artifact at source commit
+`7afb4b2`. Metal-graph cells are medians of 20 warm calls. External
+baselines generally use four timed calls after one warm-up; sub-2 ms BFS
+baselines receive additional samples. Lower latency is better. The
 [benchmark report](docs/benchmark-report-2026-07-29.md) contains p95s,
 methodology, baseline versions, and the limitations summarized below.
 
@@ -101,7 +102,7 @@ methodology, baseline versions, and the limitations summarized below.
 | Dataset | PageRank / iteration | `ppr_topk` B=16, k=64 | BFS source 0 | WCC |
 |---|---:|---:|---:|---:|
 | RMAT-18 (V=262k, E=4.2M) | 0.35 ms | 10.2 ms | 1.5 ms | 3.8 ms |
-| HippoRAG-shape KG (V=100k, E=2M, weighted) | 0.21 ms | 15.1 ms² | 0.012 ms¹ | 4.1 ms |
+| HippoRAG-shape KG (V=100k, E=2M, weighted) | 0.21 ms | 10.707 ms² | 0.012 ms¹ | 4.1 ms |
 | RMAT-22 (V=4.2M, E=67M) | 3.4 ms | 122 ms | 13.9 ms | 32.4 ms |
 | RMAT-24 (V=16.8M, E=268M) | 14.7 ms | 556 ms | 46.1 ms | 119.8 ms |
 | soc-LiveJournal1 (V=4.8M, E=69M) | 4.0 ms | 174 ms | 13.4 ms | 24.9 ms |
@@ -152,24 +153,24 @@ evidence.
 | Dataset | metal-graph B=16, k=64 | igraph 16-query loop | Contextual speedup |
 |---|---:|---:|---:|
 | RMAT-18 | 10.202 ms | 5,972.022 ms | 585.4× |
-| HippoRAG KG | 15.116 ms | 663.211 ms | 43.9× |
+| HippoRAG KG | 10.707 ms² | 611.357 ms | 57.1× |
 | RMAT-22 | 121.993 ms | 106,395.181 ms | 872.1× |
 | RMAT-24 | 555.634 ms | 588,510.973 ms | 1,059.2× |
 | LiveJournal | 173.635 ms | did not complete after more than six hours | not comparable |
 | Orkut | 257.417 ms | skipped after the LiveJournal overrun | not comparable |
 
-² The interrupted full-suite run read the HippoRAG PPR batch at
-15.116 ms, but its anomalous per-row accounting (a 3.3 ms `python_boundary`
-residue unique to that collection window) prompted an isolated clean-process
+² The displayed HippoRAG PPR values come from an isolated clean-process
 re-measurement with full provenance
 ([JSON](bench/results/bench-20260729T201007Z.json) ·
 [rendered](bench/results/bench-20260729T201007Z.md), clean source commit,
 28 rows including all KG baselines): **10.707 ms per batch (p95 10.922),
 0.669 ms/query over 20 warm runs** — the ≤0.7 ms amortized target passes
-and the ≤10 ms batch target is missed by 7%. The same artifact re-measured
-KG high-degree BFS against the corrected equivalent-output igraph adapter:
-metal-graph 1.857 ms vs igraph 2.321 ms (1.25×) and rustworkx 49.334 ms
-(26.6×).
+and the ≤10 ms batch target is missed by 7%. This supersedes the interrupted
+full-suite run's anomalous 15.116 ms reading, which carried a 3.3 ms
+`python_boundary` residue unique to that collection window. The same
+artifact re-measured KG high-degree BFS against the corrected
+equivalent-output igraph adapter: metal-graph 1.857 ms vs igraph 2.321 ms
+(1.25×) and rustworkx 49.334 ms (26.6×).
 
 ¹ Tiny reachable components route to the bounded serial CPU path and are
 assessed against an absolute-latency SLO (≤ 50 µs), rather than a ratio
