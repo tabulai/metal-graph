@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 #include "../engines/frontier_engine.hpp"
@@ -57,31 +58,59 @@ int bfs(Graph& g, const uint32_t* sources, uint32_t n_sources, BfsDir dir,
     path = ExecPath::cpu;  // documented v0.1 routing (see gpu::bfs)
 
   const uint32_t V = g.V;
-  std::vector<int32_t> dist_c(V, -1), parent_c(V, -1);
   int levels = 0;
-  if (V > 0) {
-    if (path == ExecPath::gpu)
-      levels = gpu::bfs(g, src_canon.data(),
-                        static_cast<uint32_t>(src_canon.size()), dir,
-                        dist_c.data(), parent_c.data(), 0);
-    else
-      levels = cpu::bfs(g, src_canon.data(),
-                        static_cast<uint32_t>(src_canon.size()), dir,
-                        dist_c.data(), parent_c.data());
-  }
-  parallel_for(V, [&](std::size_t b, std::size_t e) {
-    for (std::size_t u = b; u < e; ++u) {
-      const uint32_t c = g.canon_of_user[u];
-      out_dist[u] = dist_c[c];
-      out_parent[u] = boundary::canon_value_to_user(g, parent_c[c]);
+  bool output_ready = false;
+
+  // A full GPU launch is the wrong latency tradeoff for a tiny reachable
+  // component, even when the graph itself is large. In auto/CPU mode, first
+  // try a tightly bounded serial traversal that writes USER-order outputs
+  // directly. Dense outputs still preserve the public BFS contract. Forced
+  // GPU mode remains an exact opt-out for testing and benchmarking kernels.
+  const long sparse_vertices =
+      env_long("MG_BFS_SPARSE_MAX_VERTICES", 1024);
+  const long sparse_edges = env_long("MG_BFS_SPARSE_MAX_EDGES", 8192);
+  if (V > 0 && rt.mode() != ExecMode::gpu && sparse_vertices > 0 &&
+      sparse_edges > 0) {
+    const uint32_t vertex_cap = static_cast<uint32_t>(
+        std::min<long>(sparse_vertices,
+                       static_cast<long>(std::numeric_limits<uint32_t>::max())));
+    const uint64_t edge_cap = static_cast<uint64_t>(sparse_edges);
+    const int sparse_levels = cpu::bfs_sparse_user(
+        g, src_canon.data(), static_cast<uint32_t>(src_canon.size()), dir,
+        vertex_cap, edge_cap, out_dist, out_parent);
+    if (sparse_levels >= 0) {
+      levels = sparse_levels;
+      path = ExecPath::cpu;
+      output_ready = true;
     }
-  });
+  }
+
+  if (!output_ready) {
+    std::vector<int32_t> dist_c(V, -1), parent_c(V, -1);
+    if (V > 0) {
+      if (path == ExecPath::gpu)
+        levels = gpu::bfs(g, src_canon.data(),
+                          static_cast<uint32_t>(src_canon.size()), dir,
+                          dist_c.data(), parent_c.data(), 0);
+      else
+        levels = cpu::bfs(g, src_canon.data(),
+                          static_cast<uint32_t>(src_canon.size()), dir,
+                          dist_c.data(), parent_c.data());
+    }
+    parallel_for(V, [&](std::size_t b, std::size_t e) {
+      for (std::size_t u = b; u < e; ++u) {
+        const uint32_t c = g.canon_of_user[u];
+        out_dist[u] = dist_c[c];
+        out_parent[u] = boundary::canon_value_to_user(g, parent_c[c]);
+      }
+    });
+  }
 
   const double ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - t0)
                         .count();
   RunInfo info;
-  info.op = "bfs";
+  info.op = output_ready ? "bfs_sparse" : "bfs";
   info.path = path;
   info.iterations = levels;
   info.elapsed_ms = ms;

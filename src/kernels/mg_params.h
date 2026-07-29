@@ -170,7 +170,7 @@ typedef struct MGBfsParams {
   mg_u32 tg_size;         // MG_TG_SIZE (so decide can compute groups)
   mg_u32 sgs_per_tg;      // MG_TG_SIZE / threadExecutionWidth (host-computed)
   mg_u32 alpha_cut;       // bottom-up when frontier_edges * alpha_cut > e_unvisited... see decide
-  mg_u32 beta_cut;        // back to top-down when frontier_count * beta_cut < v_count
+  mg_u32 beta_cut;        // bottom-up density guard: frontier_count * beta_cut > V
   mg_u32 enable_bottomup; // 0 disables bottom-up entirely
   mg_u32 pad0;
 } MGBfsParams;
@@ -428,8 +428,10 @@ typedef struct MGScanParams {
 //       bin counters in control), atomically adds d to frontier_edges.
 //       Must no-op entirely when control.done == 1.
 //   mg_bfs_decide (1 tg): unvisited -= frontier_count; mode = BOTTOMUP iff
-//       enable_bottomup && frontier_edges * alpha_cut > e_count (alpha_cut
-//       seed 14; beta_cut reserved). Write args[EXPAND_*] from bin counts
+//       enable_bottomup && frontier_edges * alpha_cut > e_count AND
+//       frontier_count * beta_cut > v_count (seeds 14/24). The density
+//       guard prevents a single high-degree hub from triggering a full
+//       reverse-CSR scan. Write args[EXPAND_*] from bin counts
 //       (0 groups for the unused path), args[BOTTOMUP] = ceil(V/tg_size) or
 //       0. All args 0 when done == 1.
 //   | mg_bfs_expand_tg / _sg / _thread (indirect): top-down expansion of the

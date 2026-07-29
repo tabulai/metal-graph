@@ -103,8 +103,14 @@ kernel void mg_bfs_decide(
   // frontier_edges * alpha_cut > e_count, overflow-free:
   // fe * ac > ec  <=>  fe > ec / ac  (integer division, ac > 0).
   uint mode = MG_BFS_MODE_TOPDOWN;
+  // Edge pressure alone is insufficient on highly skewed graphs: a single
+  // hub can own a large fraction of E while reaching only a tiny fraction of
+  // V. Bottom-up would then scan nearly every unvisited vertex to expand one
+  // sparse frontier. Require both Beamer-style edge pressure and a frontier
+  // dense enough to cover at least ~V / beta_cut vertices.
   if (prm.enable_bottomup != 0u && prm.alpha_cut != 0u &&
-      fe > prm.e_count / prm.alpha_cut)
+      prm.beta_cut != 0u && fe > prm.e_count / prm.alpha_cut &&
+      ctl.frontier_count > prm.v_count / prm.beta_cut)
     mode = MG_BFS_MODE_BOTTOMUP;
   ctl.mode = mode;
   const uint bh =

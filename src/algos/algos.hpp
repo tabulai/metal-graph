@@ -112,7 +112,9 @@ int wcc(Graph& g, int32_t* out_comp);
 
 // ---------------------------------------------------------------------------
 // CPU implementations (threaded; oracles + planner fallback).
-// All operate in CANONICAL space; entry points translate.
+// They operate in CANONICAL space and entry points translate, except the
+// explicitly named bfs_sparse_user latency path, which writes USER order
+// directly to avoid a dense boundary scatter.
 // pvec_canon: normalized teleport vector in canonical order (always dense
 // here; length V). rank_canon out is canonical order.
 // ---------------------------------------------------------------------------
@@ -138,6 +140,19 @@ int ppr(Graph& g, const uint32_t* seeds_canon, const float* seed_w,
 
 int bfs(Graph& g, const uint32_t* sources_canon, uint32_t n_sources,
         BfsDir dir, int32_t* dist_canon, int32_t* parent_canon);
+
+// Serial, output-direct BFS for latency-sensitive traversals that touch only
+// a small component. The traversal still uses canonical CSR internally, but
+// writes dist/parent directly in USER order so a successful attempt avoids
+// two dense canonical scratch arrays and the dense boundary scatter.
+//
+// Returns BFS levels on success, or -1 after max_vertices/max_edges is
+// exceeded. A failed attempt may leave partial output; callers must overwrite
+// it with the regular CPU/GPU path. Limits must be positive.
+int bfs_sparse_user(Graph& g, const uint32_t* sources_canon,
+                    uint32_t n_sources, BfsDir dir, uint32_t max_vertices,
+                    uint64_t max_edges, int32_t* dist_user,
+                    int32_t* parent_user);
 
 // Truncated multi-source BFS honoring caps; returns reached canonical ids
 // in discovery order (deterministic: level by level; when max_vertices

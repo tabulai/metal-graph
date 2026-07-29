@@ -16,7 +16,9 @@ from bench.run import (
     download_dataset,
     json_safe,
     load_snap_cache,
+    make_rustworkx_dense_bfs,
     render_markdown,
+    stored_out_degrees,
     validate_dataset,
 )
 
@@ -304,6 +306,34 @@ def test_rustworkx_gate_baseline_respects_weights():
     assert not np.allclose(
         [rank_left[i] for i in range(3)],
         [rank_right[i] for i in range(3)],
+    )
+
+
+def test_rustworkx_bfs_gate_returns_dense_dist_and_parent():
+    rx = pytest.importorskip("rustworkx")
+    src = np.array([0, 0, 1, 3], dtype=np.uint32)
+    dst = np.array([1, 2, 3, 4], dtype=np.uint32)
+    graph, _ = build_rustworkx_graph(
+        rx, src, dst, None, 6, True
+    )
+    dist, parent = make_rustworkx_dense_bfs(rx, graph, 6, 0)()
+    np.testing.assert_array_equal(dist, [0, 1, 1, 2, 3, -1])
+    assert parent[0] == -1
+    assert parent[1] == 0
+    assert parent[2] == 0
+    assert parent[3] == 1
+    assert parent[4] == 3
+    assert parent[5] == -1
+
+
+def test_stored_out_degrees_matches_directed_and_undirected_storage():
+    src = np.array([0, 0, 1, 2], dtype=np.uint32)
+    dst = np.array([0, 1, 2, 1], dtype=np.uint32)
+    np.testing.assert_array_equal(
+        stored_out_degrees(src, dst, 3, True), [2, 1, 1]
+    )
+    np.testing.assert_array_equal(
+        stored_out_degrees(src, dst, 3, False), [2, 3, 2]
     )
 
 

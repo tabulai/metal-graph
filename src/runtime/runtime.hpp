@@ -85,8 +85,11 @@ class Runtime {
   // ---- planner ----
   void set_mode(ExecMode m);
   ExecMode mode() const;
-  // Decision per operation: GPU iff mode==gpu, or mode==auto && has_gpu()
-  // && stored_edges >= e_gpu_min(). mode==gpu without a device -> Error.
+  // Base decision per operation: GPU iff mode==gpu, or mode==auto &&
+  // has_gpu() && stored_edges >= e_gpu_min(). Algorithms may apply a
+  // documented bounded preflight (BFS's tiny-component CPU latency path)
+  // before using this route. mode==gpu bypasses such preflights and errors
+  // without a device.
   ExecPath plan(uint64_t stored_edges) const;
   uint64_t e_gpu_min() const;  // MG_E_GPU_MIN env, default 1'000'000
 
