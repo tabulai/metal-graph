@@ -118,13 +118,20 @@ errors without a device;
 the path and BFS variant actually executed — CI asserts it, never silently
 falls back.
 
+GPU BFS uses 8-, 8-, 16-, 32-, then 64-level command batches (64 thereafter),
+placing its first completion checks at cumulative depths 8, 16, 32, 64, and
+128. This reduces command-buffer completions on deep-diameter traversals
+without skipping the latency-sensitive power-of-two boundaries. It remains a
+synchronization optimization, not a blanket latency win: a batch can still
+encode levels that are not ultimately needed.
+
 ## Environment knobs
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `MG_E_GPU_MIN` | 1000000 | auto-planner GPU threshold (stored edges) |
 | `MG_PR_AUDIT_INTERVAL` | 5 | iterations per GPU command batch / fp64 audit |
-| `MG_BFS_LEVELS_PER_BATCH` | adaptive 8→64 | BFS levels per command buffer; setting the env pins a fixed size (doubling default keeps shallow-graph latency AND deep-graph sync counts low) |
+| `MG_BFS_LEVELS_PER_BATCH` | adaptive 8,8,16,32,64… | BFS levels per command buffer; an integer setting pins a fixed size clamped to 1–256, while malformed or overflowing values retain the adaptive default |
 | `MG_BFS_SPARSE_MAX_VERTICES` | 1024 | auto/CPU BFS latency-path vertex cap (0 disables) |
 | `MG_BFS_SPARSE_MAX_EDGES` | 8192 | auto/CPU BFS latency-path scanned-edge cap (0 disables) |
 | `MG_WCC_ROUNDS_PER_BATCH` | 4 | WCC hook+jump rounds per command buffer |
@@ -154,8 +161,12 @@ tests/  bench/          golden tests vs NetworkX · benchmark harness
 Reporting decomposes build / transpose / pipeline compile / warm kernels /
 iteration-count and audit-cadence metadata / top-k / aggregate Python
 boundary overhead, with median+p95 over ≥20 runs. It does not claim a
-separate convergence-audit timer. Nothing in the README table is asserted —
-targets come from measurements.
+separate convergence-audit timer. The README performance table reports
+observations, not guarantees; release targets are labeled separately. Every
+numeric or comparative performance claim published in project documentation
+must link to a matched, checked-in raw JSON and rendered Markdown report
+generated from the same physical run; exploratory results stay unpublished
+until that pair exists.
 
 ## Canonical measurements
 
@@ -198,17 +209,14 @@ Implementation passes addressed the first run's largest gaps:
    the canonical artifact records the resulting iteration counts, while
    `MG_PR_AUDIT_INTERVAL` remains available for repeatable local sweeps.
 
-The canonical table predates the BFS latency work in the current candidate,
-and its KG BFS `rustworkx 0.046 ms` baseline (the 0.05× row) was measured
-with the old no-output-visitor harness — semantics the current harness
-explicitly labels non-equivalent. On the same physical M4 Max, the bounded
-sparse path measured 0.010 ms median for that KG source (52 reached
-vertices, 344 scanned edges), versus 0.043 ms for rustworkx's no-output
-visitor and 0.057 ms for an equivalent dense `dist+parent` visitor. These
-candidate numbers (and the equivalent-work baseline) will replace the table
-only after a clean provenance-backed benchmark rerun. A new high-degree KG
-row exercises the GPU path: 1.85 ms versus rustworkx 49.63 ms, though igraph
-remains faster at 0.89 ms.
+The canonical table predates the bounded BFS latency path and the current
+equivalent-work baseline. Its KG BFS row used the old no-output rustworkx
+visitor, which the current harness explicitly classifies as non-equivalent;
+the row is retained as a historical measurement from the linked artifact,
+not as evidence for the current BFS gate. Updated tiny-component and
+high-degree GPU comparisons will be published only after one clean physical
+rerun produces a matched, checked-in JSON and rendered report. Until then,
+both comparisons remain open.
 
 Gate assessment (plan §8, honest):
 
@@ -220,15 +228,15 @@ Gate assessment (plan §8, honest):
   15.28 ms against the ≤10 ms target, and identical-iteration comparison is
   unavailable with this igraph solver.
 * **Primary ≥2× speed sub-gate**: the clean canonical artifact met **7 of
-  8** workload×algorithm cells (3.37×–656×). The candidate bounded BFS
-  latency path resolves its tiny-component miss by routing on measured
-  traversal work rather than graph size. The new high-degree diagnostic beats
-  rustworkx but not igraph, so further GPU work remains; a clean canonical
-  rerun is pending.
+  8** workload×algorithm cells (3.37×–656×). The bounded BFS latency path
+  was added to address the tiny-component miss by routing on measured
+  traversal work rather than graph size, but no provenance-backed rerun yet
+  establishes its gate result. The high-degree GPU comparison is likewise
+  open.
 * **Broader ship gate**: still open pending the full SNAP/RMAT suite,
   contention and end-to-end agent-workflow evidence, a provisioned physical
-  benchmark runner, and resolution or explicit waiver of the PPR and
-  high-degree BFS/igraph misses.
+  benchmark runner, and resolution or explicit waiver of the PPR and updated
+  BFS measurements.
 
 ## Status
 

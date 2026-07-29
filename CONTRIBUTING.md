@@ -30,11 +30,14 @@ MG_REQUIRE_GPU=1 ctest --test-dir build/dev --output-on-failure
 Build and smoke-test a distributable wheel:
 
 ```bash
-MACOSX_DEPLOYMENT_TARGET=14.0 python -m build --wheel
+env -u MACOSX_DEPLOYMENT_TARGET python -m build --wheel
 python -m pip install --force-reinstall dist/*.whl
 cd /tmp
 python -c "import metal_graph as mg; print(mg.__version__, mg.has_gpu())"
 ```
+
+Unsetting the ambient variable makes this exercise the deployment target
+declared by the project rather than silently substituting a shell setting.
 
 ## C ABI
 
@@ -54,9 +57,14 @@ The C smoke test and exported-symbol allowlist run through CTest.
 ## Benchmarks
 
 Performance claims must come from `bench/run.py` on physical Apple Silicon.
-Do not publish hosted-runner timing. Include the raw JSON and rendered
-Markdown for any result cited in project documentation, together with the
-hardware and software metadata produced by the harness.
+Do not publish hosted-runner timing. For every numeric timing, speedup, or
+comparative performance conclusion cited in project documentation, check in
+and link a matched raw JSON and rendered Markdown report generated from the
+same harness run, including the hardware and software metadata produced by
+the harness. Exploratory or candidate results must not appear in project
+documentation until that artifact pair exists. Baseline comparisons must
+also use equivalent output semantics; label non-equivalent diagnostic rows
+as context rather than gate evidence.
 
 Keep changes focused, add regression tests for behavior changes, and run the
 build, CTest, Python tests, and wheel smoke test before merging.

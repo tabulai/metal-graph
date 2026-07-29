@@ -9,11 +9,11 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 
 #include "../kernels/mg_params.h"
+#include "bfs_batch_schedule.hpp"
 #include "scan_engine.hpp"
 
 namespace mg {
@@ -107,41 +107,24 @@ int FrontierEngine::run_bfs(Graph& g,
   Buffer* rrow = rev ? rev->row_offsets.get() : dmy.get();
   Buffer* rcol = rev ? rev->col_indices.get() : dmy.get();
 
-  // Batch sizing: an explicit MG_BFS_LEVELS_PER_BATCH pins a fixed size;
-  // otherwise start at 8 and double up to 64. Small first batches keep
-  // shallow-diameter latency low (few wasted no-op levels past `done`),
-  // while doubling bounds host round-trips on deep-diameter graphs at
-  // ~L/64 instead of L/8 (a fixed 8 costs 2x the syncs of the old fixed 16
-  // on a 4096-level chain).
-  const char* pb_env = std::getenv("MG_BFS_LEVELS_PER_BATCH");
-  long pb = 8;
-  bool fixed_batch = false;
-  if (pb_env != nullptr && *pb_env != '\0') {
-    char* end = nullptr;
-    errno = 0;
-    const long parsed = std::strtol(pb_env, &end, 10);
-    if (end != pb_env && end != nullptr && *end == '\0' && errno != ERANGE) {
-      pb = parsed;
-      fixed_batch = true;
-    }
-  }
-  // A BFS cannot consume more than V non-empty levels; cap explicit values
-  // there so a typo cannot encode billions of redundant dispatches.
-  const long max_batch = static_cast<long>(std::max(V, 1u));
-  uint32_t per_batch =
-      static_cast<uint32_t>(std::clamp(pb, 1L, max_batch));
-  constexpr uint32_t k_adaptive_cap = 64;
-  uint32_t encoded = 0;  // total prepares issued; parity = encoded & 1
+  // An explicit MG_BFS_LEVELS_PER_BATCH pins a fixed size, bounded by a
+  // command-buffer ceiling independent of V. The default adaptive schedule
+  // commits at cumulative levels 8,16,32,64, then every 64 levels.
+  detail::BfsBatchSchedule schedule =
+      detail::BfsBatchSchedule::from_environment();
+  uint64_t encoded = 0;  // total prepares issued; parity = encoded & 1
   bool done = false;
 
   while (!done) {
-    uint32_t batch_n = per_batch;
-    if (max_levels != 0 && max_levels - encoded < batch_n)
-      batch_n = max_levels - encoded;
+    if (detail::bfs_prepare_limit_exceeded(encoded, V))
+      throw Error(ErrorCode::internal,
+                  "bfs: level protocol failed to terminate");
+    uint32_t batch_n = schedule.next_batch(encoded, max_levels);
+    batch_n = detail::clamp_batch_to_prepare_limit(encoded, V, batch_n);
     if (batch_n == 0) break;
     CommandBatch cb(rt_);
     for (uint32_t i = 0; i < batch_n; ++i) {
-      const bool even = ((encoded + i) & 1u) == 0u;
+      const bool even = ((encoded + uint64_t{i}) & 1u) == 0u;
       Buffer* cur = even ? f0.get() : f1.get();
       Buffer* nxt = even ? f1.get() : f0.get();
       // Uniform b1..b12 binding set for every BFS kernel (b0 = params via
@@ -170,12 +153,11 @@ int FrontierEngine::run_bfs(Graph& g,
     cb.commit_and_wait();
     encoded += batch_n;
     done = ctrl->done != 0;
-    if (!done && max_levels != 0 && encoded >= max_levels) break;
-    if (!done && uint64_t(encoded) > uint64_t(V) + 2u + per_batch)
+    if (!done && detail::bfs_prepare_limit_exceeded(encoded, V))
       throw Error(ErrorCode::internal,
                   "bfs: level protocol failed to terminate");
-    if (!fixed_batch && per_batch < k_adaptive_cap)
-      per_batch = std::min(per_batch * 2u, k_adaptive_cap);
+    if (!done && max_levels != 0 && encoded >= max_levels) break;
+    schedule.advance();
   }
 
   std::memcpy(dist_canon, dist_b->data(), std::size_t(V) * sizeof(int32_t));

@@ -18,6 +18,7 @@
 
 #include "../algos/algos.hpp"
 #include "../common/mg_common.hpp"
+#include "../engines/bfs_batch_schedule.hpp"
 #include "../graph/graph.hpp"
 #include "../runtime/runtime.hpp"
 
@@ -264,6 +265,53 @@ nb::dict last_run_info() {
   return d;
 }
 
+// Private test hook for the exact parser/scheduler used by FrontierEngine.
+// Simulates a device that never sets `done`, making both bounded traversal
+// and the defensive termination guard observable without requiring a GPU.
+nb::dict debug_bfs_batch_schedule(uint32_t vertex_count, uint32_t max_levels,
+                                  uint64_t encoded, uint32_t max_batches) {
+  mg::detail::BfsBatchSchedule schedule =
+      mg::detail::BfsBatchSchedule::from_environment();
+  nb::list batches;
+  const uint32_t configured_levels = schedule.levels();
+  const bool fixed = schedule.fixed();
+  const uint64_t prepare_limit =
+      mg::detail::bfs_prepare_limit(vertex_count);
+  const char* stopped = "batch_limit";
+
+  for (uint32_t i = 0; i < max_batches; ++i) {
+    if (mg::detail::bfs_prepare_limit_exceeded(encoded, vertex_count)) {
+      stopped = "safety";
+      break;
+    }
+    uint32_t batch = schedule.next_batch(encoded, max_levels);
+    batch = mg::detail::clamp_batch_to_prepare_limit(
+        encoded, vertex_count, batch);
+    if (batch == 0) {
+      stopped = "level_bound";
+      break;
+    }
+    batches.append(batch);
+    encoded += batch;
+    if (mg::detail::bfs_prepare_limit_exceeded(encoded, vertex_count)) {
+      stopped = "safety";
+      break;
+    }
+    schedule.advance();
+  }
+
+  nb::dict d;
+  d["fixed"] = fixed;
+  d["configured_levels"] = configured_levels;
+  d["command_buffer_level_cap"] =
+      mg::detail::k_bfs_command_buffer_level_cap;
+  d["prepare_limit"] = prepare_limit;
+  d["batches"] = batches;
+  d["encoded"] = encoded;
+  d["stopped"] = stopped;
+  return d;
+}
+
 }  // namespace
 
 NB_MODULE(_core, m) {
@@ -317,6 +365,9 @@ NB_MODULE(_core, m) {
   m.def("last_run_info", &last_run_info);
   // Private, test-only; no stability guarantee. direction: 0=out, 1=in.
   m.def("_debug_orientation", &debug_orientation, "graph"_a, "direction"_a);
+  m.def("_debug_bfs_batch_schedule", &debug_bfs_batch_schedule,
+        "vertex_count"_a, "max_levels"_a, "encoded"_a = 0,
+        "max_batches"_a = 8);
   m.def("has_gpu", [] { return mg::Runtime::instance().has_gpu(); },
         nb::call_guard<nb::gil_scoped_release>());
   m.def("version", [] { return "0.1.0"; });
