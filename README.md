@@ -2,55 +2,61 @@
 
 [![CI](https://github.com/tabulai/metal-graph/actions/workflows/ci.yml/badge.svg)](https://github.com/tabulai/metal-graph/actions/workflows/ci.yml)
 
-**Metal-native graph analytics for Apple Silicon.** metal-graph runs the
-graph algorithms that dominate agent retrieval workloads — batched
-personalized PageRank with top-k, full-vector PageRank, direction-optimizing
-BFS, bounded k-hop extraction, and weakly connected components — as
-GPU-resident Metal kernels over unified memory, with threaded CPU
-implementations behind the same API and a threshold-based planner that
-selects a candidate path per call.
+**Fast graph analytics for Apple Silicon.**
 
-## Highlights
+metal-graph is a Python and C library for ranking, searching, and exploring
+graphs on a Mac. Build a graph once from NumPy arrays, then run PageRank,
+batched personalized PageRank, breadth-first search, neighborhood extraction,
+and connected-components analysis through one consistent API.
 
-- **Batched PPR with top-k** is the flagship: queries run in tiles of up to
-  eight, lanes within a tile share each graph pass, queries converge
-  independently, and a GPU radix-select returns `(B, k)` ids/scores. The
-  isolated HippoRAG-shaped B=16 artifact run measured 10.707 ms per batch
-  (0.669 ms/query, meeting the ≤0.7 ms amortized target; the ≤10 ms batch
-  target is missed by 7%).
-- **GPU-resident iteration.** PageRank encodes batches of iterations into
-  single command buffers with per-iteration dangling-mass reduction on
-  device; BFS runs whole levels through GPU-written indirect dispatch with a
-  Beamer-style top-down/bottom-up switch; power-law mega-hubs are decomposed
-  into fixed edge tiles so one vertex can't serialize a threadgroup.
-- **Latency-aware planning.** Tiny traversals skip the GPU entirely via a
-  serial path bounded by configured vertex and scanned-edge caps.
-  `mg.bfs(..., output="sparse")` always returns |reached|-length arrays;
-  only a traversal that finishes inside those caps avoids dense result
-  initialization. Telemetry reports the path that actually executed.
-- **Deterministic and tested.** PageRank is bit-deterministic at a fixed
-  iteration count, batched PPR is bit-identical to sequential single
-  queries, and top-k GPU selection is bit-identical to its CPU oracle. More
-  than 1,000 Python cases cover correctness, properties, and integration
-  behavior; CI separately checks the native C ABI and wheels, including
-  GPU-required jobs. NetworkX and independent references are used where
-  their contracts align.
-- **Three surfaces:** Python (`metal_graph`, NumPy in/out), a stable C ABI
-  ([`include/mg.h`](include/mg.h)), and installable wheels.
+The library uses the Metal GPU for work that benefits from it and a threaded
+CPU path for smaller jobs. That choice is automatic by default, so using
+metal-graph does not require Metal knowledge or device-management code.
+
+It is particularly useful for:
+
+- knowledge-graph and retrieval pipelines;
+- entity ranking, recommendations, and repo maps;
+- graph-backed agent memory and neighborhood lookup;
+- local analysis of large graphs on Apple Silicon.
+
+## Why use metal-graph?
+
+- **A small, practical API.** Inputs and outputs are NumPy arrays, and integer
+  or string IDs are supported.
+- **Useful graph operations included.** PageRank, batched PPR with top-k, BFS,
+  sparse BFS, bounded k-hop extraction, and weakly connected components are
+  available today.
+- **Good performance across different query sizes.** Large traversals can use
+  the GPU, while tiny reachable components can stay on the CPU and avoid GPU
+  launch overhead.
+- **Transparent execution.** `mg.last_run_info()` reports what ran, where it
+  ran, and how long the engine took.
+- **Tested against established libraries.** More than 1,000 Python cases cover
+  correctness, properties, and integration behavior. CI also checks the C API,
+  wheels, and GPU-required jobs.
+
+The main interface is Python (`metal_graph`, with NumPy input and output).
+A stable C API is available in [`include/mg.h`](include/mg.h).
 
 ## Requirements
 
-macOS 14+, Apple Silicon (M1/Apple7 GPU family or newer), CPython
-3.10–3.14, CMake 3.24+, and Xcode with the Metal compiler.
+- macOS 14 or newer
+- Apple Silicon with an M1 or newer
+- CPython 3.10–3.14
+- CMake 3.24 or newer
+- Xcode with the Metal compiler
 
-## Installation
+## Install
+
+From the repository root:
 
 ```bash
 python3 -m pip install .
 python3 -c "import metal_graph as mg; print(mg.__version__, mg.has_gpu())"
 ```
 
-Development builds, native tests, wheel validation, and C ABI installation
+Development builds, native tests, wheel validation, and C API installation
 are covered in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Quick start
@@ -59,45 +65,90 @@ are covered in [CONTRIBUTING.md](CONTRIBUTING.md).
 import numpy as np
 import metal_graph as mg
 
-# Build once — an immutable snapshot. IDs may be any integers or strings;
-# they are mapped to dense indices 0..V-1 ("user indices").
+# Build an immutable directed graph.
 src = np.array([0, 0, 1, 2], dtype=np.uint32)
 dst = np.array([1, 2, 2, 3], dtype=np.uint32)
-G = mg.Graph.from_edges(src, dst, weights=None, directed=True,
-                        num_vertices=4, ids="auto")
-G.num_vertices, G.num_edges, G.external_ids
+G = mg.Graph.from_edges(
+    src,
+    dst,
+    directed=True,
+    num_vertices=4,
+)
 
-# Batched personalized PageRank with top-k.
+# Rank every vertex.
+rank = mg.pagerank(G)
+
+# Explore from vertex 0.
+dist, parent = mg.bfs(G, sources=[0], direction="out")
+vertices, sparse_dist, sparse_parent = mg.bfs(
+    G,
+    sources=[0],
+    direction="out",
+    output="sparse",
+)
+neighbors, edge_ids = mg.k_hop(
+    G,
+    seeds=[0],
+    k=2,
+    direction="both",
+)
+
+# Find weakly connected components.
+components = mg.experimental.wcc(G)
+```
+
+For a batch of personalized ranking queries, pack the seeds using offsets:
+
+```python
 seeds = np.array([0, 2], dtype=np.uint32)
 seed_weights = np.ones(2, dtype=np.float32)
 seed_offsets = np.array([0, 1, 2], dtype=np.uint64)
-ids, scores = mg.ppr_topk(G, seeds, seed_weights, seed_offsets,
-                          k=4, alpha=0.85, tol=1e-6, max_iter=50)
-# ids: int32 (B, k) user indices (-1 padding), scores: float32 (B, k)
 
-pr = mg.pagerank(G, alpha=0.85, tol=1e-6, max_iter=100, personalization=None)
-dist, parent = mg.bfs(G, sources=[0], direction="out")
-vs, dv, pv = mg.bfs(G, sources=[0], direction="out", output="sparse")
-vs, es = mg.k_hop(G, seeds=[0], k=2, direction="both",
-                  max_vertices=None, max_edges=None)
-comp = mg.experimental.wcc(G)
-
-mg.set_execution(mode="auto")   # "auto" | "gpu" | "cpu" (per-operation planner)
-mg.last_run_info()              # {"op", "path": "gpu"|"cpu", "iterations", "ms"}
+ids, scores = mg.ppr_topk(
+    G,
+    seeds,
+    seed_weights,
+    seed_offsets,
+    k=4,
+)
+# ids and scores both have shape (number_of_queries, k)
 ```
+
+By default, metal-graph chooses the execution path for each call:
+
+```python
+mg.set_execution("auto")       # "auto", "gpu", or "cpu"
+mg.last_run_info()             # op, path, iterations, and engine time
+```
+
+The [`notebooks/`](notebooks/) directory contains complete examples for the
+core API, batched PPR retrieval, and low-latency BFS.
+
+## Available operations
+
+- `Graph.from_edges(...)` builds an immutable weighted or unweighted graph.
+- `pagerank(...)` returns a score for every vertex.
+- `ppr_topk(...)` answers a batch of personalized PageRank queries and returns
+  only the highest-scoring vertices.
+- `bfs(...)` returns dense distances and parents, or compact results with
+  `output="sparse"`.
+- `k_hop(...)` finds a bounded neighborhood and its induced input edges.
+- `experimental.wcc(...)` labels weakly connected components.
 
 ## Performance
 
-Measured on an Apple M4 Max (macOS 26.2), timed from the Python call to the
-returned result. Most cells come from source commit `a4a8bc`; the HippoRAG
-PPR cell marked ² comes from the isolated artifact at source commit
-`7afb4b2`. Metal-graph cells are medians of 20 warm calls. External
-baselines generally use four timed calls after one warm-up; sub-2 ms BFS
-baselines receive additional samples. Lower latency is better. The
-[benchmark report](docs/benchmark-report-2026-07-29.md) contains p95s,
-methodology, baseline versions, and the limitations summarized below.
+The results below were measured on an Apple M4 Max running macOS 26.2.
+Timings cover the Python call through the returned result, so they include
+normal API overhead. Lower is better.
 
-### metal-graph medians
+Most cells come from source commit `a4a8bc`; the HippoRAG PPR cell marked ²
+comes from the isolated artifact at source commit `7afb4b2`. metal-graph
+cells are medians of 20 warm calls. External baselines generally use four
+timed calls after one warm-up, with additional samples for sub-2 ms BFS
+measurements. The full [benchmark report](docs/benchmark-report-2026-07-29.md)
+contains p95 values, package versions, and methodology.
+
+### metal-graph latency
 
 | Dataset | PageRank / iteration | `ppr_topk` B=16, k=64 | BFS source 0 | WCC |
 |---|---:|---:|---:|---:|
@@ -108,22 +159,19 @@ methodology, baseline versions, and the limitations summarized below.
 | soc-LiveJournal1 (V=4.8M, E=69M) | 4.0 ms | 174 ms | 13.4 ms | 24.9 ms |
 | com-orkut (V=3.1M, E=117M) | 7.9 ms | 257 ms | 8.3 ms | 55.9 ms |
 
-### External CPU comparisons
+### Comparison with CPU graph libraries
 
-These are end-to-end API latency comparisons, not uniform identical-work
-measurements. The rustworkx BFS adapter returns the same dense
-`dist+parent` shape as metal-graph. PageRank uses the faster completed
-igraph or rustworkx call for each dataset, but solver and iteration behavior
-are not fully normalized. WCC compares the corresponding operation, but the
-external libraries return their native component representation rather than
-metal-graph's dense canonicalized array. Treat the PageRank and WCC ratios
-as API-level context. The recorded versions were rustworkx 0.18.0 and
-igraph 1.0.0. Each cell is
-`metal-graph vs external median (speedup)`.
-The run's igraph BFS rows predate the corrected dense-output adapter and
-are excluded as non-equivalent; the current harness has the correction but
-needs a new physical rerun. SciPy and NetworkX context remains in the full
-run artifacts and is summarized where relevant in the report.
+Each cell shows `metal-graph vs external median (speedup)`. These are
+end-to-end API comparisons, not claims that every library performs identical
+internal work.
+
+The rustworkx BFS adapter returns the same dense `dist + parent` shape as
+metal-graph. PageRank uses the faster completed igraph or rustworkx call for
+each dataset, but solver and iteration behavior are not fully normalized.
+WCC compares the corresponding operation, although the external libraries
+return their native component representation. Treat the PageRank and WCC
+ratios as practical API-level context. The recorded versions were rustworkx
+0.18.0 and igraph 1.0.0.
 
 | Dataset | PageRank full run | BFS source 0 | WCC |
 |---|---:|---:|---:|
@@ -134,21 +182,17 @@ run artifacts and is summarized where relevant in the report.
 | LiveJournal | 19.773 vs 6,803.438 ms, rustworkx (344.1×) | 13.398 vs 9,417.407 ms, rustworkx (702.9×) | 24.932 vs 1,652.573 ms, igraph (66.3×) |
 | Orkut | 39.501 vs 24,247.799 ms, igraph (613.9×) | 8.290 vs 41,158.931 ms, rustworkx (4,965.2×) | 55.942 vs 67.772 ms, igraph (1.21×; below the 2× target) |
 
-Using its then-current baseline definitions, the report's historical gate
-accounting counted 17 of 18 full-run PageRank, high-degree BFS, and WCC
-cells above the documented 2× target. The source-0 BFS column displayed
-here is not that exact gate matrix. The displayed ratios are broad rather
-than uniformly orders-of-magnitude: HippoRAG WCC and source-0 BFS are 3.2×
-and 4.8×, respectively, and Orkut WCC is 1.21×. Orkut's rustworkx PageRank
-call failed on the undirected graph, leaving igraph as its only completed
-PageRank comparator. These are workload-specific measurements from one
-machine, not a blanket GPU-speedup claim.
+Performance varies with the graph and operation. For example, HippoRAG WCC
+and source-0 BFS measured 3.2× and 4.8× faster, while Orkut WCC measured
+1.21×. Using the benchmark's historical gate definitions, 17 of 18 full-run
+PageRank, high-degree BFS, and WCC cells exceeded the documented 2× target.
+The source-0 BFS column above is not that exact gate matrix.
 
-### Contextual PPR comparison
+### Contextual personalized PageRank comparison
 
 The igraph query loop uses PRPACK and cannot be pinned to metal-graph's
-iteration count, so these ratios are context, not equivalent-work gate
-evidence.
+iteration count. This table is useful end-to-end context, not an
+identical-work comparison.
 
 | Dataset | metal-graph B=16, k=64 | igraph 16-query loop | Contextual speedup |
 |---|---:|---:|---:|
@@ -159,63 +203,87 @@ evidence.
 | LiveJournal | 173.635 ms | did not complete after more than six hours | not comparable |
 | Orkut | 257.417 ms | skipped after the LiveJournal overrun | not comparable |
 
-² The displayed HippoRAG PPR values come from an isolated clean-process
-re-measurement with full provenance
-([JSON](bench/results/bench-20260729T201007Z.json) ·
-[rendered](bench/results/bench-20260729T201007Z.md), clean source commit,
-28 rows including all KG baselines): **10.707 ms per batch (p95 10.922),
-0.669 ms/query over 20 warm runs** — the ≤0.7 ms amortized target passes
-and the ≤10 ms batch target is missed by 7%. This supersedes the interrupted
-full-suite run's anomalous 15.116 ms reading, which carried a 3.3 ms
-`python_boundary` residue unique to that collection window. The same
-artifact re-measured KG high-degree BFS against the corrected
-equivalent-output igraph adapter: metal-graph 1.857 ms vs igraph 2.321 ms
-(1.25×) and rustworkx 49.334 ms (26.6×).
+<details>
+<summary>Notes for the marked benchmark cells</summary>
 
-¹ Tiny reachable components route to the bounded serial CPU path and are
-assessed against an absolute-latency SLO (≤ 50 µs), rather than a ratio
-alone. At microsecond scale, dense `int32[V]` output materialization
-dominates the measurement. `output="sparse"` avoids that dense-output cost
-when the traversal fits the configured sparse caps. Cap overflow or
-forced-GPU execution remains exact but materializes dense state before
-compaction.
-The bounded collector still reserves a lazily zeroed V-byte visited map, so
-sparse output is not an unconditional O(|reached|) total-memory guarantee.
+¹ **Tiny-component BFS.** Small reachable components use a bounded serial CPU
+path and are assessed against a 50 µs absolute-latency objective rather than
+a ratio alone. Dense result initialization dominates at this scale.
+`output="sparse"` avoids that cost when the traversal fits the configured
+caps. Overflow or forced-GPU execution remains exact but materializes dense
+state before compaction. The bounded collector still reserves a lazily zeroed
+V-byte visited map, so sparse output is not an unconditional
+O(|reached|)-memory guarantee. The benchmark records whether the objective
+passed but does not fail the command when it is missed.
+
 For the HippoRAG high-degree source, which exercises the GPU, metal-graph
 measured 1.905 ms versus rustworkx at 50.058 ms (26.3×).
-The harness records whether the SLO passed; it does not currently fail the
-benchmark command when the SLO is missed.
 
-Evidence status matters: the Orkut measurements have a strict checked-in
+² **Isolated HippoRAG PPR measurement.** The displayed values come from a
+clean-process, 20-run artifact:
+[JSON](bench/results/bench-20260729T201007Z.json) ·
+[rendered report](bench/results/bench-20260729T201007Z.md). It measured
+10.707 ms per batch (p95 10.922), or 0.669 ms/query. That meets the
+0.7 ms/query objective and misses the 10 ms batch objective by 7%.
+
+This measurement supersedes the interrupted full-suite run's anomalous
+15.116 ms reading, which carried a 3.3 ms `python_boundary` residue unique to
+that collection window. The same artifact measured high-degree BFS at
+1.857 ms versus igraph at 2.321 ms (1.25×) and rustworkx at 49.334 ms
+(26.6×), using the corrected equivalent-output adapter.
+
+</details>
+
+<details>
+<summary>Benchmark provenance and comparison caveats</summary>
+
+The run's original igraph BFS rows predate the corrected dense-output adapter
+and are excluded as non-equivalent. The current harness contains the corrected
+adapter but needs a new physical rerun. SciPy and NetworkX comparisons remain
+in the full artifacts and benchmark report.
+
+The Orkut results have a strict checked-in
 [JSON](bench/results/bench-20260729T131101Z-orkut-bounded.json) and
 [rendered-report](bench/results/bench-20260729T131101Z-orkut-bounded.md)
-pair. The displayed completed core and comparator rows for RMAT-18 through
-LiveJournal are reconstructed from the
-[preserved run log](bench/results/bench-20260729-full-partial.log) and are
-therefore provisional; LiveJournal's contextual PPR comparison did not
-complete. The report documents the interrupted run and its missing final
-JSON.
+pair. Completed rows for RMAT-18 through LiveJournal were reconstructed from
+the [preserved run log](bench/results/bench-20260729-full-partial.log) and
+remain provisional. The original run was interrupted before its final JSON
+was written; LiveJournal's contextual PPR comparison did not complete.
 
-## Execution model
+These are workload-specific measurements from one machine, not a blanket
+GPU-speedup claim. Orkut's rustworkx PageRank call failed on the undirected
+graph, leaving igraph as its completed comparator.
 
-The base auto planner selects a candidate CPU or GPU path **once per
-operation**: GPU when a Metal device exists and the stored edge count is at
-least `MG_E_GPU_MIN` (default 1M). Algorithm-specific semantic routes can
-override that candidate. BFS first attempts the bounded serial preflight. A
-within-cap traversal completes there; overflow discards its partial result
-and runs the planned CPU/GPU path. The cited HippoRAG source-0 case measured
-12 µs, but that is an observation, not a general latency guarantee.
-`mode="gpu"` bypasses the preflight and errors without a device;
-`MG_FORCE_CPU=1` hides the GPU; `MG_REQUIRE_GPU=1` turns device absence into
-a hard failure (used in CI). `mg.last_run_info()` reports the op (including
-the executed variant, e.g. `bfs_sparse`), the path, the iteration count, and
-the engine time.
+</details>
 
-GPU BFS encodes levels in growing command batches (8, 8, 16, 32, then 64),
-keeping completion checks close for shallow traversals while bounding host
-round-trips on deep-diameter graphs.
+## How execution is chosen
 
-### Environment knobs
+`mode="auto"` is intended for normal use. The planner starts with the GPU
+when a Metal device is available and the graph has at least one million
+stored edges; otherwise it starts with the CPU. Individual algorithms can
+override that candidate when another path is more appropriate.
+
+BFS, for example, first tries a bounded serial traversal. If the reachable
+component fits within its vertex and scanned-edge caps, the CPU answers the
+query directly. If it does not fit, the partial attempt is discarded and the
+regular CPU or GPU path runs instead.
+
+You can override the planner when testing or profiling:
+
+```python
+mg.set_execution("gpu")   # require the GPU path
+mg.set_execution("cpu")   # require the CPU path
+mg.set_execution("auto")  # restore automatic selection
+```
+
+`mg.last_run_info()` reports the operation, chosen path, iteration count, and
+engine time. Forced GPU mode raises an error if no device is available.
+
+<details>
+<summary>Advanced environment settings</summary>
+
+GPU BFS batches increasing numbers of levels (8, 8, 16, 32, then 64) to keep
+shallow traversals responsive while reducing host round-trips on deep graphs.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -232,99 +300,93 @@ round-trips on deep-diameter graphs.
 | `MG_THREADS` | all cores | CPU-path thread count |
 | `MG_METALLIB` | embedded | override path to a .metallib (dev loop) |
 
-## Semantics reference
+</details>
 
-**Identity model.** External IDs (int32/int64/str) map to dense user
-indices `0..V-1` in `np.unique` order (the identity when your IDs are
-already dense ints — the only mode where `num_vertices=` adds isolated tail
-vertices). Every algorithm input and output uses user indices;
-`G.external_ids[i]` recovers the original ID and `G.index_of(ids)` maps the
-other way. Internal renumbering for gather locality is invisible at the API.
+## Graph IDs and result behavior
 
-**Input policy.** Duplicate edges and self-loops are kept (PageRank counts
-them); non-finite or negative weights are rejected at build, including
-fp32-overflowing per-vertex weight sums. Undirected graphs are symmetrized
-internally; `num_edges` reports the input count.
+External integer or string IDs are mapped to dense user indices in
+`np.unique` order. Algorithm inputs and outputs use those user indices.
+Use `G.index_of(ids)` to map external IDs to indices and
+`G.external_ids[index]` to map back.
 
-**PageRank / `ppr_topk`.** NetworkX-compatible iteration: weighted graphs
-normalize by outgoing weight sums, dangling mass is redistributed by the
-teleport/personalization vector every iteration, on device. Convergence is
-`L1(r_new − r_old) < V · tol`, audited in fp64 every `MG_PR_AUDIT_INTERVAL`
-iterations, so iteration counts land on audit boundaries; `max_iter` is a
-budget (the current iterate is returned, where NetworkX raises). Per-query
-seed weights are normalized with duplicates summed; converged queries
-freeze at audit boundaries; top-k ties break by ascending user index and
-`k > V` rows pad with `id=-1, score=0`.
+Graphs are immutable after construction. Duplicate edges and self-loops are
+kept, and PageRank counts them. Non-finite or negative weights are rejected.
+Undirected graphs are symmetrized internally, while `G.num_edges` continues
+to report the number of input edges.
 
-**BFS / `k_hop`.** Multi-source; `direction="out"|"in"|"both"`; `dist=-1`
-unreachable, `parent=-1` for sources and unreachable vertices. Parent
-choice among equal-depth candidates is nondeterministic on the parallel
-paths and validated structurally. Sparse BFS returns aligned
-`(vertices uint32, dist int32, parent int32)` arrays in ascending user-index
-order. `k_hop` returns reached vertices and induced original-input edge ids,
-sorted ascending. `max_vertices` deterministically truncates admitted
-vertices; `max_edges` truncates sorted returned edge IDs only after full
-induced-edge extraction. Capped calls force the CPU path and bound result
-cardinality, not worst-case runtime, scanned edges, or O(V) scratch state.
-`as_graph=True` materializes the subgraph.
+The most important result conventions are:
 
-**WCC** (`metal_graph.experimental`). Directed edges are treated as
-undirected; component ids are numbered by first occurrence in user-index
-order.
+- PageRank follows NetworkX-compatible weighted normalization and dangling
+  mass handling. `max_iter` is a budget: metal-graph returns the current
+  result when it is reached, while NetworkX raises.
+- `ppr_topk` normalizes seed weights, combines duplicate seeds, returns
+  deterministic top-k ordering, and pads with `id=-1, score=0` when `k > V`.
+- BFS supports `direction="out"`, `"in"`, or `"both"`. Unreachable distances
+  and missing parents are `-1`. Parent choice can vary when several
+  same-depth parents are valid on a parallel path.
+- Sparse BFS returns aligned `(vertices, dist, parent)` arrays in ascending
+  user-index order.
+- `k_hop` returns ascending vertex indices and original input edge IDs.
+  `max_vertices` and `max_edges` bound result size, not worst-case runtime,
+  scanned edges, or scratch memory. Use `as_graph=True` to materialize the
+  returned neighborhood as a new graph.
+- WCC treats directed edges as undirected and numbers components by their
+  first appearance in user-index order.
 
-**Forward compatibility.** `edge_types=` / `time_range=` kwargs are
-reserved and raise `NotImplementedError`.
+<details>
+<summary>Exact PageRank convergence behavior</summary>
+
+Convergence is `L1(r_new - r_old) < V * tol`, audited in fp64 every
+`MG_PR_AUDIT_INTERVAL` iterations. Iteration counts therefore land on audit
+boundaries. Batched PPR queries converge independently and freeze at those
+boundaries. Top-k ties are resolved by ascending user index.
+
+</details>
 
 ## Current limits
 
-- `V, E < 2^31` (fp32 values, int32 ids); graphs are immutable snapshots.
-- `direction="both"` BFS on directed graphs and cap-bounded `k_hop` run on
-  the (deterministic) CPU path.
-- Batched PPR on GPU keeps the CSR plus a fixed 8-lane tile state resident
-  (~100 bytes/vertex); graphs exceeding `recommendedMaxWorkingSetSize`
-  raise a descriptive error. The dominant V-scaled tile state is independent
-  of B; inputs, per-query metadata, and B×k outputs still scale with batch
-  size. `mode="cpu"` avoids that GPU working-set check.
-- The GPU top-k radix-select falls back to its bit-identical CPU oracle for
-  tiny graphs (`V < 4096`), `k ≥ V`, `k > 4096`, and degenerate tie floods.
+- The library currently supports `V, E < 2^31`; graph values are fp32 and
+  graph IDs are int32 internally.
+- Graphs are immutable snapshots rather than streaming or mutable graphs.
+- `direction="both"` BFS on directed graphs and capped `k_hop` run on the
+  deterministic CPU path.
+- Batched GPU PPR keeps the CSR plus an eight-query tile in memory. The
+  dominant tile state uses roughly 100 bytes per vertex. Oversized workloads
+  raise a descriptive working-set error; `mode="cpu"` avoids that GPU limit.
+- GPU top-k selection uses its bit-identical CPU fallback for tiny graphs
+  (`V < 4096`), `k >= V`, `k > 4096`, and degenerate tie floods.
+- Typed and temporal `k_hop` filters are reserved for a future release;
+  `edge_types=` and `time_range=` currently raise `NotImplementedError`.
 
-## Repository layout
+## Benchmarks and reproducibility
 
-```
-include/mg.h            stable C ABI
-src/kernels/            MSL kernels + mg_params.h (kernel<->host contract)
-src/runtime/            device, queue, pipeline cache, buffers, planner
-src/graph/              CPU threaded build: renumber, CSR, worklists
-src/engines/            host-side dispatch drivers
-src/algos/              entry points + cpu/ threaded oracles
-src/c_api/  python/     C ABI impl · nanobind module + package
-tests/  bench/          correctness/property tests · benchmark harness
-```
+`bench/run.py --suite v01` runs the full matrix against igraph, rustworkx,
+SciPy, and NetworkX. It uses synthetic RMAT and knowledge-graph-shaped data
+plus SHA-pinned SNAP datasets, which are downloaded only with `--fetch`.
+See [`bench/README.md`](bench/README.md) for commands and artifact format.
 
-## Benchmarking
-
-`bench/run.py --suite v01` runs the full matrix (synthetic RMAT and
-KG-shape graphs plus SHA-pinned SNAP datasets, fetched only with `--fetch`)
-against igraph, rustworkx, SciPy, and NetworkX baselines with decomposed,
-provenance-stamped reporting — see [`bench/README.md`](bench/README.md).
 New published performance claims require a matched, checked-in JSON and
-rendered-report pair from a physical run. All claims above for RMAT-18
-through LiveJournal are a disclosed provisional exception: they are backed
-by the preserved physical-run log and reconstruction report, not a
-completed machine-readable pair, and should be replaced after a
-checkpointed rerun. Only Orkut has a matched pair for the later full-suite
-values.
+rendered-report pair from a physical run. The disclosed exception is the
+reconstructed RMAT-18 through LiveJournal data described above; only Orkut
+has a matched pair for the later full-suite values.
+
+## Project resources
+
+- [Example notebooks](notebooks/)
+- [Benchmark guide](bench/README.md)
+- [Contribution and development guide](CONTRIBUTING.md)
+- [C API](include/mg.h)
+- [v0.1 implementation and design rationale](docs/implementation-plan-v0.1.md)
 
 ## Roadmap
 
-v0.2 candidates: label propagation, core number, similarity top-k,
-typed/temporal k-hop filters (the reserved kwargs), `MTLHeap` allocation,
-MLX device-resident results, and a NetworkX backend preview. v0.3 targets
-the Louvain/Leiden index path. Design rationale for v0.1 is preserved in
-the [implementation plan](docs/implementation-plan-v0.1.md).
+Possible v0.2 additions include label propagation, core number, similarity
+top-k, typed and temporal neighborhood filters, MLX device-resident results,
+and a NetworkX backend preview. Louvain and Leiden community detection are
+longer-term candidates.
 
 ## License
 
-Apache-2.0 ([LICENSE](LICENSE)); vendored
-[metal-cpp](third_party/metal-cpp/) is Apache-2.0, © Apple Inc. — see
+Apache-2.0 ([LICENSE](LICENSE)). The vendored
+[metal-cpp](third_party/metal-cpp/) library is Apache-2.0, © Apple Inc.; see
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
