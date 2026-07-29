@@ -43,6 +43,7 @@ DATA_DIR = BENCH_DIR / "data"
 RESULTS_DIR = BENCH_DIR / "results"
 RESULT_SCHEMA_VERSION = 1
 SNAP_CACHE_SCHEMA_VERSION = 1
+DOWNLOAD_TIMEOUT_SECONDS = 60
 
 SNAP_DATASETS = {
     "soc-LiveJournal1": {
@@ -140,6 +141,41 @@ def validate_dataset(path, spec):
         )
 
 
+def download_dataset(spec, destination):
+    """Download one pinned dataset with a timeout, byte cap, and streaming hash."""
+    digest = hashlib.sha256()
+    total = 0
+    request = urllib.request.Request(
+        spec["url"],
+        headers={"User-Agent": "metal-graph-benchmark/0.1"},
+    )
+    with urllib.request.urlopen(
+        request, timeout=DOWNLOAD_TIMEOUT_SECONDS
+    ) as response, destination.open("wb") as stream:
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > spec["bytes"]:
+                raise RuntimeError(
+                    f"{spec['url']}: download exceeds pinned size "
+                    f"{spec['bytes']}"
+                )
+            stream.write(chunk)
+            digest.update(chunk)
+    if total != spec["bytes"]:
+        raise RuntimeError(
+            f"{spec['url']}: expected {spec['bytes']} bytes, got {total}"
+        )
+    actual = digest.hexdigest()
+    if actual != spec["sha256"]:
+        raise RuntimeError(
+            f"{spec['url']}: SHA-256 mismatch; expected {spec['sha256']}, "
+            f"got {actual}"
+        )
+
+
 def fetch_datasets():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     for name, spec in SNAP_DATASETS.items():
@@ -151,10 +187,7 @@ def fetch_datasets():
         partial = path.with_suffix(path.suffix + ".part")
         print(f"[fetch] downloading {spec['url']} -> {path}")
         try:
-            urllib.request.urlretrieve(
-                spec["url"], partial
-            )  # noqa: S310 (explicit opt-in, pinned digest)
-            validate_dataset(partial, spec)
+            download_dataset(spec, partial)
             partial.replace(path)
         finally:
             partial.unlink(missing_ok=True)
@@ -837,6 +870,7 @@ def run_contention(mg, args, rows):
 class EnergyCaptureHandle:
     process: subprocess.Popen
     output_stream: object
+    output_path: Path | None = None
 
 
 def start_energy_capture(out_path):
@@ -877,21 +911,31 @@ def start_energy_capture(out_path):
     return EnergyCaptureHandle(
         process=process,
         output_stream=output_stream,
+        output_path=out_path,
     )
 
 
 def stop_energy_capture(handle):
     """Stop sudo, which relays the signal to its powermetrics command."""
     try:
-        if handle.process.poll() is None:
+        status = handle.process.poll()
+        if status is None:
             handle.process.terminate()
             try:
                 handle.process.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                handle.process.terminate()
-                handle.process.wait(timeout=10)
+            except subprocess.TimeoutExpired as error:
+                raise RuntimeError(
+                    "powermetrics did not stop after SIGTERM"
+                ) from error
+        elif status != 0:
+            raise RuntimeError(
+                f"powermetrics exited before cleanup with status {status}"
+            )
     finally:
         handle.output_stream.close()
+    if (handle.output_path is not None and
+            handle.output_path.stat().st_size == 0):
+        raise RuntimeError("powermetrics produced an empty capture")
 
 
 @contextmanager

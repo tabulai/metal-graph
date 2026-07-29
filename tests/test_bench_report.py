@@ -12,6 +12,7 @@ from bench.run import (
     build_igraph_graph,
     build_rustworkx_graph,
     build_suite,
+    download_dataset,
     json_safe,
     load_snap_cache,
     render_markdown,
@@ -51,6 +52,27 @@ def test_validate_dataset_checks_size_and_digest(tmp_path):
     path.write_bytes(payload + b"!")
     with pytest.raises(RuntimeError, match="expected .* bytes"):
         validate_dataset(path, spec)
+
+
+def test_download_is_bounded_and_stream_verified(monkeypatch, tmp_path):
+    payload = b"pinned benchmark payload"
+    spec = {
+        "url": "https://example.test/dataset.gz",
+        "bytes": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+    monkeypatch.setattr(
+        bench_run.urllib.request,
+        "urlopen",
+        lambda request, timeout: io.BytesIO(payload),
+    )
+    destination = tmp_path / "dataset.part"
+    download_dataset(spec, destination)
+    assert destination.read_bytes() == payload
+
+    oversized = dict(spec, bytes=len(payload) - 1)
+    with pytest.raises(RuntimeError, match="exceeds pinned size"):
+        download_dataset(oversized, tmp_path / "oversized.part")
 
 
 def test_snap_datasets_only_run_in_full_suite():
@@ -207,7 +229,33 @@ def test_energy_start_elevates_only_fixed_powermetrics(
         "--samplers",
         "cpu_power,gpu_power",
     ]
+    handle.output_stream.write(b"sample")
+    handle.output_stream.flush()
     bench_run.stop_energy_capture(handle)
+
+
+def test_energy_stop_timeout_is_a_hard_error():
+    class FakeProcess:
+        @staticmethod
+        def poll():
+            return None
+
+        @staticmethod
+        def terminate():
+            return None
+
+        @staticmethod
+        def wait(timeout):
+            raise bench_run.subprocess.TimeoutExpired("sudo", timeout)
+
+    output_stream = io.BytesIO()
+    handle = bench_run.EnergyCaptureHandle(
+        process=FakeProcess(),
+        output_stream=output_stream,
+    )
+    with pytest.raises(RuntimeError, match="did not stop"):
+        bench_run.stop_energy_capture(handle)
+    assert output_stream.closed
 
 
 def weighted_fixture():
