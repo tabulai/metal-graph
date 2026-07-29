@@ -65,7 +65,7 @@ markdown table. Result files use an explicit schema version and strict JSON.
 | `ppr_topk / warm_batch16_k64` | the flagship gate shape: B=16, k=64, from Python call to NumPy result |
 | `ppr_topk / python_boundary` | wall median minus `last_run_info()["ms"]` (engine time) |
 | `ppr_topk / topk_selection_estimate` | median(k=1024) − median(k=1): selection cost estimate |
-| `bfs / warm_single_source`, `warm_high_degree_source`, `warm_64_sources` | path/variant and levels attached; single-source rows also record source degree, reached vertices, scanned reachable edges, max distance, and frontier sizes |
+| `bfs / warm_single_source`, `warm_high_degree_source`, `warm_64_sources` | path/variant and levels attached; single-source rows also record source degree, reached vertices, scanned reachable edges, max distance, and frontier sizes; bounded sparse-path rows carry the ≤50 µs SLO assessment |
 | `wcc / warm` | hook+jump rounds attached |
 | `k_hop / warm_k2_capped` | capped extraction (agent-latency shape) |
 | `bfs / baseline_rustworkx` | identical-semantics dense `dist+parent` visitor |
@@ -77,6 +77,10 @@ markdown table. Result files use an explicit schema version and strict JSON.
 Every row additionally carries `t_start_utc` / `t_end_utc`,
 `peak_rss_mb`, and `peak_rss_delta_mb` (honesty rule 5); the markdown
 table shows the peak-RSS delta per line item.
+
+The tiny-component SLO is reporting metadata on the measured
+`warm_single_source` row. `slo_pass=false` is visible in JSON/Markdown but
+does not currently make the benchmark command fail.
 
 The v0.1 suite includes `rmat24` (V≈16.8M, E≈268M — the ship-gate scale
 point); smoke deliberately does not, so it stays fast.

@@ -7,31 +7,33 @@ graph algorithms that dominate agent retrieval workloads — batched
 personalized PageRank with top-k, full-vector PageRank, direction-optimizing
 BFS, bounded k-hop extraction, and weakly connected components — as
 GPU-resident Metal kernels over unified memory, with threaded CPU
-implementations behind the same API and a planner that picks the faster
-path per operation.
+implementations behind the same API and a threshold-based planner that
+selects a candidate path per call.
 
 ## Highlights
 
-- **Batched PPR with top-k** is the flagship: B queries share one streaming
-  pass over the graph in 8-lane tiles, converge independently, and return
-  `(B, k)` ids/scores selected by a GPU radix-select — the whole HippoRAG /
-  aider-style query path in one call, at sub-millisecond amortized cost per
-  query at knowledge-graph scale.
+- **Batched PPR with top-k** is the flagship: queries run in tiles of up to
+  eight, lanes within a tile share each graph pass, queries converge
+  independently, and a GPU radix-select returns `(B, k)` ids/scores. The
+  provisional HippoRAG-shaped B=16 run below measured 15.116 ms total
+  (0.945 ms/query).
 - **GPU-resident iteration.** PageRank encodes batches of iterations into
   single command buffers with per-iteration dangling-mass reduction on
   device; BFS runs whole levels through GPU-written indirect dispatch with a
   Beamer-style top-down/bottom-up switch; power-law mega-hubs are decomposed
   into fixed edge tiles so one vertex can't serialize a threadgroup.
 - **Latency-aware planning.** Tiny traversals skip the GPU entirely via a
-  bounded serial path (microseconds, not milliseconds); `mg.bfs(...,
-  output="sparse")` returns O(|reached|) results for
-  tiny-neighborhood-on-huge-graph queries. Telemetry reports the path that
-  actually executed — there is no silent fallback.
+  serial path bounded by configured vertex and scanned-edge caps.
+  `mg.bfs(..., output="sparse")` always returns |reached|-length arrays;
+  only a traversal that finishes inside those caps avoids dense result
+  initialization. Telemetry reports the path that actually executed.
 - **Deterministic and tested.** PageRank is bit-deterministic at a fixed
   iteration count, batched PPR is bit-identical to sequential single
-  queries, top-k GPU selection is bit-identical to its CPU oracle. 1,000+
-  golden tests validate every algorithm against NetworkX on both execution
-  paths, enforced in CI with the GPU required.
+  queries, and top-k GPU selection is bit-identical to its CPU oracle. More
+  than 1,000 Python cases cover correctness, properties, and integration
+  behavior; CI separately checks the native C ABI and wheels, including
+  GPU-required jobs. NetworkX and independent references are used where
+  their contracts align.
 - **Three surfaces:** Python (`metal_graph`, NumPy in/out), a stable C ABI
   ([`include/mg.h`](include/mg.h)), and installable wheels.
 
@@ -85,14 +87,17 @@ mg.last_run_info()              # {"op", "path": "gpu"|"cpu", "iterations", "ms"
 
 ## Performance
 
-Measured on an Apple M4 Max (macOS 26.2) by `bench/run.py`; medians of 20
-warm runs, timed from the Python call to the returned NumPy result. Full
-per-cell baselines, provenance, and caveats:
-[benchmark report](docs/benchmark-report-2026-07-29.md) and the checked-in
-run artifacts (JSON, rendered tables, and the preserved run log) under
-[`bench/results/`](bench/results/).
+Measured on an Apple M4 Max (macOS 26.2) at source commit `a4a8bc`, timed
+from the Python call to the returned result. Metal-graph cells are medians
+of 20 warm calls. External baselines generally use four timed calls after
+one warm-up; sub-2 ms BFS baselines receive additional samples. Lower
+latency is better. The
+[benchmark report](docs/benchmark-report-2026-07-29.md) contains p95s,
+methodology, baseline versions, and the limitations summarized below.
 
-| dataset | PageRank / iter | `ppr_topk` B=16, k=64 | BFS | WCC |
+### metal-graph medians
+
+| Dataset | PageRank / iteration | `ppr_topk` B=16, k=64 | BFS source 0 | WCC |
 |---|---:|---:|---:|---:|
 | RMAT-18 (V=262k, E=4.2M) | 0.35 ms | 10.2 ms | 1.5 ms | 3.8 ms |
 | HippoRAG-shape KG (V=100k, E=2M, weighted) | 0.21 ms | 15.1 ms | 0.012 ms¹ | 4.1 ms |
@@ -101,28 +106,99 @@ run artifacts (JSON, rendered tables, and the preserved run log) under
 | soc-LiveJournal1 (V=4.8M, E=69M) | 4.0 ms | 174 ms | 13.4 ms | 24.9 ms |
 | com-orkut (V=3.1M, E=117M) | 7.9 ms | 257 ms | 8.3 ms | 55.9 ms |
 
-Against the fastest maintained CPU baselines (igraph / rustworkx) at
-equivalent output semantics, the multi-million-edge cells run roughly one
-to three orders of magnitude faster; the report carries the per-cell
-ratios and the measurement-window variance of this shared workstation.
+### External CPU comparisons
+
+These are end-to-end API latency comparisons, not uniform identical-work
+measurements. The rustworkx BFS adapter returns the same dense
+`dist+parent` shape as metal-graph. PageRank uses the faster completed
+igraph or rustworkx call for each dataset, but solver and iteration behavior
+are not fully normalized. WCC compares the corresponding operation, but the
+external libraries return their native component representation rather than
+metal-graph's dense canonicalized array. Treat the PageRank and WCC ratios
+as API-level context. The recorded versions were rustworkx 0.18.0 and
+igraph 1.0.0. Each cell is
+`metal-graph vs external median (speedup)`.
+The run's igraph BFS rows predate the corrected dense-output adapter and
+are excluded as non-equivalent; the current harness has the correction but
+needs a new physical rerun. SciPy and NetworkX context remains in the full
+run artifacts and is summarized where relevant in the report.
+
+| Dataset | PageRank full run | BFS source 0 | WCC |
+|---|---:|---:|---:|
+| RMAT-18 | 1.759 vs 306.411 ms, rustworkx (174.2×) | 1.538 vs 1,030.735 ms, rustworkx (670.2×) | 3.819 vs 125.525 ms, igraph (32.9×) |
+| HippoRAG KG | 3.074 vs 35.893 ms, igraph (11.7×) | 0.012 vs 0.057 ms, rustworkx (4.8×)¹ | 4.090 vs 13.136 ms, igraph (3.2×) |
+| RMAT-22 | 16.892 vs 6,346.648 ms, rustworkx (375.7×) | 13.920 vs 17,600.397 ms, rustworkx (1,264.4×) | 32.362 vs 2,173.854 ms, igraph (67.2×) |
+| RMAT-24 | 73.464 vs 30,765.861 ms, rustworkx (418.8×) | 46.096 vs 79,206.021 ms, rustworkx (1,718.3×) | 119.823 vs 9,058.173 ms, igraph (75.6×) |
+| LiveJournal | 19.773 vs 6,803.438 ms, rustworkx (344.1×) | 13.398 vs 9,417.407 ms, rustworkx (702.9×) | 24.932 vs 1,652.573 ms, igraph (66.3×) |
+| Orkut | 39.501 vs 24,247.799 ms, igraph (613.9×) | 8.290 vs 41,158.931 ms, rustworkx (4,965.2×) | 55.942 vs 67.772 ms, igraph (1.21×; below the 2× target) |
+
+Using its then-current baseline definitions, the report's historical gate
+accounting counted 17 of 18 full-run PageRank, high-degree BFS, and WCC
+cells above the documented 2× target. The source-0 BFS column displayed
+here is not that exact gate matrix. The displayed ratios are broad rather
+than uniformly orders-of-magnitude: HippoRAG WCC and source-0 BFS are 3.2×
+and 4.8×, respectively, and Orkut WCC is 1.21×. Orkut's rustworkx PageRank
+call failed on the undirected graph, leaving igraph as its only completed
+PageRank comparator. These are workload-specific measurements from one
+machine, not a blanket GPU-speedup claim.
+
+### Contextual PPR comparison
+
+The igraph query loop uses PRPACK and cannot be pinned to metal-graph's
+iteration count, so these ratios are context, not equivalent-work gate
+evidence.
+
+| Dataset | metal-graph B=16, k=64 | igraph 16-query loop | Contextual speedup |
+|---|---:|---:|---:|
+| RMAT-18 | 10.202 ms | 5,972.022 ms | 585.4× |
+| HippoRAG KG | 15.116 ms | 663.211 ms | 43.9× |
+| RMAT-22 | 121.993 ms | 106,395.181 ms | 872.1× |
+| RMAT-24 | 555.634 ms | 588,510.973 ms | 1,059.2× |
+| LiveJournal | 173.635 ms | did not complete after more than six hours | not comparable |
+| Orkut | 257.417 ms | skipped after the LiveJournal overrun | not comparable |
+
+Despite the contextual igraph advantage, HippoRAG PPR misses the v0.1
+absolute targets: 15.116 ms versus 10 ms per batch and 0.945 ms versus
+0.7 ms amortized per query.
 
 ¹ Tiny reachable components route to the bounded serial CPU path and are
-gated by an absolute-latency SLO (≤ 50 µs) rather than a ratio: at
-microsecond scale, dense `int32[V]` output materialization dominates the
-measurement. `output="sparse"` returns O(|reached|) results and removes
-that cost entirely.
+assessed against an absolute-latency SLO (≤ 50 µs), rather than a ratio
+alone. At microsecond scale, dense `int32[V]` output materialization
+dominates the measurement. `output="sparse"` avoids that dense-output cost
+when the traversal fits the configured sparse caps. Cap overflow or
+forced-GPU execution remains exact but materializes dense state before
+compaction.
+The bounded collector still reserves a lazily zeroed V-byte visited map, so
+sparse output is not an unconditional O(|reached|) total-memory guarantee.
+For the HippoRAG high-degree source, which exercises the GPU, metal-graph
+measured 1.905 ms versus rustworkx at 50.058 ms (26.3×).
+The harness records whether the SLO passed; it does not currently fail the
+benchmark command when the SLO is missed.
+
+Evidence status matters: the Orkut measurements have a strict checked-in
+[JSON](bench/results/bench-20260729T131101Z-orkut-bounded.json) and
+[rendered-report](bench/results/bench-20260729T131101Z-orkut-bounded.md)
+pair. The displayed completed core and comparator rows for RMAT-18 through
+LiveJournal are reconstructed from the
+[preserved run log](bench/results/bench-20260729-full-partial.log) and are
+therefore provisional; LiveJournal's contextual PPR comparison did not
+complete. The report documents the interrupted run and its missing final
+JSON.
 
 ## Execution model
 
-The planner picks CPU or GPU **once per operation**: GPU when a Metal
-device exists and the stored edge count is at least `MG_E_GPU_MIN` (default
-1M). BFS first attempts a bounded serial traversal; when the reachable work
-fits the sparse caps it returns directly from the CPU in microseconds,
-otherwise it proceeds with the planned path. `mode="gpu"` bypasses the
-preflight and errors without a device; `MG_FORCE_CPU=1` hides the GPU;
-`MG_REQUIRE_GPU=1` turns device absence into a hard failure (used in CI).
-`mg.last_run_info()` reports the op (including the executed variant, e.g.
-`bfs_sparse`), the path, the iteration count, and the engine time.
+The base auto planner selects a candidate CPU or GPU path **once per
+operation**: GPU when a Metal device exists and the stored edge count is at
+least `MG_E_GPU_MIN` (default 1M). Algorithm-specific semantic routes can
+override that candidate. BFS first attempts the bounded serial preflight. A
+within-cap traversal completes there; overflow discards its partial result
+and runs the planned CPU/GPU path. The cited HippoRAG source-0 case measured
+12 µs, but that is an observation, not a general latency guarantee.
+`mode="gpu"` bypasses the preflight and errors without a device;
+`MG_FORCE_CPU=1` hides the GPU; `MG_REQUIRE_GPU=1` turns device absence into
+a hard failure (used in CI). `mg.last_run_info()` reports the op (including
+the executed variant, e.g. `bfs_sparse`), the path, the iteration count, and
+the engine time.
 
 GPU BFS encodes levels in growing command batches (8, 8, 16, 32, then 64),
 keeping completion checks close for shallow traversals while bounding host
@@ -172,10 +248,14 @@ freeze at audit boundaries; top-k ties break by ascending user index and
 **BFS / `k_hop`.** Multi-source; `direction="out"|"in"|"both"`; `dist=-1`
 unreachable, `parent=-1` for sources and unreachable vertices. Parent
 choice among equal-depth candidates is nondeterministic on the parallel
-paths and validated structurally. `k_hop` returns reached vertices and
-induced original-input edge ids, sorted ascending; `max_vertices` /
-`max_edges` caps give predictable agent-side latency; `as_graph=True`
-materializes the subgraph.
+paths and validated structurally. Sparse BFS returns aligned
+`(vertices uint32, dist int32, parent int32)` arrays in ascending user-index
+order. `k_hop` returns reached vertices and induced original-input edge ids,
+sorted ascending. `max_vertices` deterministically truncates admitted
+vertices; `max_edges` truncates sorted returned edge IDs only after full
+induced-edge extraction. Capped calls force the CPU path and bound result
+cardinality, not worst-case runtime, scanned edges, or O(V) scratch state.
+`as_graph=True` materializes the subgraph.
 
 **WCC** (`metal_graph.experimental`). Directed edges are treated as
 undirected; component ids are numbered by first occurrence in user-index
@@ -191,8 +271,9 @@ reserved and raise `NotImplementedError`.
   the (deterministic) CPU path.
 - Batched PPR on GPU keeps the CSR plus a fixed 8-lane tile state resident
   (~100 bytes/vertex); graphs exceeding `recommendedMaxWorkingSetSize`
-  raise a descriptive error — batch size does not change the footprint,
-  `mode="cpu"` does.
+  raise a descriptive error. The dominant V-scaled tile state is independent
+  of B; inputs, per-query metadata, and B×k outputs still scale with batch
+  size. `mode="cpu"` avoids that GPU working-set check.
 - The GPU top-k radix-select falls back to its bit-identical CPU oracle for
   tiny graphs (`V < 4096`), `k ≥ V`, `k > 4096`, and degenerate tie floods.
 
@@ -206,7 +287,7 @@ src/graph/              CPU threaded build: renumber, CSR, worklists
 src/engines/            host-side dispatch drivers
 src/algos/              entry points + cpu/ threaded oracles
 src/c_api/  python/     C ABI impl · nanobind module + package
-tests/  bench/          golden tests vs NetworkX · benchmark harness
+tests/  bench/          correctness/property tests · benchmark harness
 ```
 
 ## Benchmarking
@@ -215,8 +296,13 @@ tests/  bench/          golden tests vs NetworkX · benchmark harness
 KG-shape graphs plus SHA-pinned SNAP datasets, fetched only with `--fetch`)
 against igraph, rustworkx, SciPy, and NetworkX baselines with decomposed,
 provenance-stamped reporting — see [`bench/README.md`](bench/README.md).
-Published performance claims always link a matched, checked-in JSON +
-rendered report pair from a physical run.
+New published performance claims require a matched, checked-in JSON and
+rendered-report pair from a physical run. All claims above for RMAT-18
+through LiveJournal are a disclosed provisional exception: they are backed
+by the preserved physical-run log and reconstruction report, not a
+completed machine-readable pair, and should be replaced after a
+checkpointed rerun. Only Orkut has a matched pair for the later full-suite
+values.
 
 ## Roadmap
 

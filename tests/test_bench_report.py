@@ -172,26 +172,37 @@ def test_renderer_accepts_legacy_canonical_artifact():
     assert "git `unknown` (unknown)" in rendered
 
 
-def test_checked_in_canonical_artifact_is_strict_and_reproducible():
+@pytest.mark.parametrize(
+    ("stem", "expected_sha"),
+    [
+        (
+            "bench-20260729T000207Z",
+            "be8763c8b87de72d1b92e36739809a02651cc116",
+        ),
+        (
+            "bench-20260729T131101Z-orkut-bounded",
+            "a4a8bc325785b4b73f92ff896ec4e7e44ed5b4a6",
+        ),
+    ],
+)
+def test_checked_in_artifact_pairs_are_strict_and_reproducible(
+    stem, expected_sha
+):
     results = Path(__file__).resolve().parents[1] / "bench/results"
-    json_path = results / "bench-20260729T000207Z.json"
+    json_path = results / f"{stem}.json"
     data = json.loads(
         json_path.read_text(),
         parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
     )
     assert data["schema_version"] == 1
-    assert data["meta"]["git_sha"] == (
-        "be8763c8b87de72d1b92e36739809a02651cc116"
-    )
+    assert data["meta"]["git_sha"] == expected_sha
     assert data["meta"]["git_dirty"] is False
     assert len(data["meta"]["native_module_sha256"]) == 64
     assert set(data["meta"]["snap_datasets"]) == {
         "soc-LiveJournal1",
         "com-orkut",
     }
-    expected = (
-        results / "bench-20260729T000207Z.md"
-    ).read_text()
+    expected = (results / f"{stem}.md").read_text()
     assert render_markdown(data["meta"], data["rows"]) == expected
 
 
@@ -406,12 +417,23 @@ def test_igraph_bfs_gate_handles_singleton_graph():
     np.testing.assert_array_equal(parent, [-1])
 
 
-def test_tiny_bfs_slo_row_semantics():
-    from bench.run import TINY_BFS_SLO_MS, tiny_bfs_slo
+def test_tiny_bfs_slo_metadata_semantics():
+    from bench.run import (
+        TINY_BFS_SLO_GATE,
+        TINY_BFS_SLO_MS,
+        tiny_bfs_slo,
+    )
 
     assert TINY_BFS_SLO_MS == 0.050
-    row = tiny_bfs_slo(0.012)
-    assert row["slo_pass"] is True and row["slo_ms"] == 0.050
+    metadata = tiny_bfs_slo(0.012)
+    assert metadata == {
+        "slo_ms": 0.050,
+        "slo_pass": True,
+        "gate": TINY_BFS_SLO_GATE,
+    }
+    # This helper contributes annotations to the real measured row; it must
+    # not manufacture a second timing row with invented sample provenance.
+    assert {"median_ms", "p95_ms", "runs"}.isdisjoint(metadata)
     assert tiny_bfs_slo(0.050)["slo_pass"] is True  # boundary inclusive
     assert tiny_bfs_slo(0.051)["slo_pass"] is False
     assert tiny_bfs_slo(0.012, slo_ms=0.01)["slo_pass"] is False
