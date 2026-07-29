@@ -4,6 +4,15 @@ All notable changes to metal-graph are documented here.
 
 ## Unreleased
 
+- Added `bench/run.py --dataset` for isolated single-dataset runs with
+  unchanged artifact provenance, and checked in the isolated HippoRAG KG
+  re-measurement (`bench-20260729T201007Z`): PPR B=16 batch 10.707 ms /
+  0.669 ms per query (amortized ≤0.7 ms target met; ≤10 ms batch target
+  missed by 7%), superseding the interrupted full-suite run's anomalous
+  15.116 ms reading for gate purposes. The same artifact records KG
+  high-degree BFS beating the corrected equivalent-output igraph adapter
+  (1.857 ms vs 2.321 ms).
+
 - Added opt-in sparse-output BFS: `mg.bfs(..., output="sparse")` returns
   `(vertices, dist, parent)` of length |reached| (ascending user order on
   every execution path, structural-parent semantics unchanged). Tiny

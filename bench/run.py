@@ -1182,7 +1182,7 @@ def energy_capture(enabled, out_path):
 # main
 # ---------------------------------------------------------------------------
 
-def build_suite(suite):
+def build_suite(suite, only=None):
     datasets = [("rmat18", lambda: gen_rmat(18)),
                 ("kg-hipporag", lambda: gen_kg())]
     if suite == "v01":
@@ -1192,12 +1192,26 @@ def build_suite(suite):
         datasets.append(("rmat24", lambda: gen_rmat(24)))
         for name in SNAP_DATASETS:
             datasets.append((name, lambda n=name: load_snap(n)))
+    if only is not None:
+        # Isolated single-dataset runs (e.g. re-measuring one contested row
+        # in a clean process) keep full artifact provenance; the JSON simply
+        # carries fewer datasets.
+        names = [n for n, _ in datasets]
+        if only not in names:
+            raise SystemExit(
+                f"--dataset {only!r} not in suite {suite!r}; "
+                f"choose from: {', '.join(names)}")
+        datasets = [(n, load) for n, load in datasets if n == only]
     return datasets
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--suite", choices=["smoke", "v01"], default="smoke")
+    ap.add_argument("--dataset", default=None,
+                    help="restrict the run to ONE dataset from the suite "
+                         "(isolated re-measurement; artifact provenance is "
+                         "unchanged)")
     ap.add_argument("--runs", type=int, default=20,
                     help="warm-run repetitions per line item (>=20 for "
                          "publishable numbers)")
@@ -1260,7 +1274,7 @@ def main():
         rows = []
         METER.mark()  # exclude import/fetch/idle time from the first item
         pipeline_warm_probe(mg, rows)
-        for name, load in build_suite(args.suite):
+        for name, load in build_suite(args.suite, only=args.dataset):
             data = load()
             if data is None:
                 print(f"\n=== {name}: not fetched — rerun with --fetch ===")

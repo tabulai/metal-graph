@@ -18,6 +18,14 @@ documentation. Other local runs remain ignored.
   These files support the current README's Orkut row and
   `docs/benchmark-report-2026-07-29.md`; they do not replace the earlier
   smoke artifact for historical comparisons.
+- `bench-20260729T201007Z.{json,md}` is the isolated clean-process
+  re-measurement of the HippoRAG KG dataset (28 rows, 20 warm runs, clean
+  source commit `7afb4b2ff3dc`, `--dataset kg-hipporag`), produced after
+  the full-suite run's KG PPR row showed anomalous per-row accounting. It
+  is the artifact behind the README's HippoRAG PPR gate numbers
+  (10.707 ms per batch, 0.669 ms/query) and the first artifact measuring
+  KG high-degree BFS against the corrected equivalent-output igraph
+  adapter.
 
 Where a completed pair exists, JSON is the machine-readable source of truth
 and Markdown is the rendered view produced by `bench/run.py`. The

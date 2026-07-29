@@ -183,6 +183,10 @@ def test_renderer_accepts_legacy_canonical_artifact():
             "bench-20260729T131101Z-orkut-bounded",
             "a4a8bc325785b4b73f92ff896ec4e7e44ed5b4a6",
         ),
+        (
+            "bench-20260729T201007Z",
+            "7afb4b2ff3dc2a520ecb1388e4b22e4619ab1989",
+        ),
     ],
 )
 def test_checked_in_artifact_pairs_are_strict_and_reproducible(
@@ -437,3 +441,12 @@ def test_tiny_bfs_slo_metadata_semantics():
     assert tiny_bfs_slo(0.050)["slo_pass"] is True  # boundary inclusive
     assert tiny_bfs_slo(0.051)["slo_pass"] is False
     assert tiny_bfs_slo(0.012, slo_ms=0.01)["slo_pass"] is False
+
+
+def test_build_suite_dataset_filter():
+    from bench.run import build_suite
+
+    names = [n for n, _ in build_suite("smoke", only="kg-hipporag")]
+    assert names == ["kg-hipporag"]
+    with pytest.raises(SystemExit, match="rmat18, kg-hipporag"):
+        build_suite("smoke", only="soc-LiveJournal1")  # v01-only dataset
