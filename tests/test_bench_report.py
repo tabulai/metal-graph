@@ -437,3 +437,12 @@ def test_tiny_bfs_slo_metadata_semantics():
     assert tiny_bfs_slo(0.050)["slo_pass"] is True  # boundary inclusive
     assert tiny_bfs_slo(0.051)["slo_pass"] is False
     assert tiny_bfs_slo(0.012, slo_ms=0.01)["slo_pass"] is False
+
+
+def test_build_suite_dataset_filter():
+    from bench.run import build_suite
+
+    names = [n for n, _ in build_suite("smoke", only="kg-hipporag")]
+    assert names == ["kg-hipporag"]
+    with pytest.raises(SystemExit, match="rmat18, kg-hipporag"):
+        build_suite("smoke", only="soc-LiveJournal1")  # v01-only dataset
