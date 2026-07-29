@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <cstdlib>
 #include <cstring>
 
 #include "../kernels/mg_params.h"
@@ -105,8 +107,30 @@ int FrontierEngine::run_bfs(Graph& g,
   Buffer* rrow = rev ? rev->row_offsets.get() : dmy.get();
   Buffer* rcol = rev ? rev->col_indices.get() : dmy.get();
 
-  long pb = env_long("MG_BFS_LEVELS_PER_BATCH", 8);
-  const uint32_t per_batch = pb < 1 ? 1u : static_cast<uint32_t>(pb);
+  // Batch sizing: an explicit MG_BFS_LEVELS_PER_BATCH pins a fixed size;
+  // otherwise start at 8 and double up to 64. Small first batches keep
+  // shallow-diameter latency low (few wasted no-op levels past `done`),
+  // while doubling bounds host round-trips on deep-diameter graphs at
+  // ~L/64 instead of L/8 (a fixed 8 costs 2x the syncs of the old fixed 16
+  // on a 4096-level chain).
+  const char* pb_env = std::getenv("MG_BFS_LEVELS_PER_BATCH");
+  long pb = 8;
+  bool fixed_batch = false;
+  if (pb_env != nullptr && *pb_env != '\0') {
+    char* end = nullptr;
+    errno = 0;
+    const long parsed = std::strtol(pb_env, &end, 10);
+    if (end != pb_env && end != nullptr && *end == '\0' && errno != ERANGE) {
+      pb = parsed;
+      fixed_batch = true;
+    }
+  }
+  // A BFS cannot consume more than V non-empty levels; cap explicit values
+  // there so a typo cannot encode billions of redundant dispatches.
+  const long max_batch = static_cast<long>(std::max(V, 1u));
+  uint32_t per_batch =
+      static_cast<uint32_t>(std::clamp(pb, 1L, max_batch));
+  constexpr uint32_t k_adaptive_cap = 64;
   uint32_t encoded = 0;  // total prepares issued; parity = encoded & 1
   bool done = false;
 
@@ -150,6 +174,8 @@ int FrontierEngine::run_bfs(Graph& g,
     if (!done && uint64_t(encoded) > uint64_t(V) + 2u + per_batch)
       throw Error(ErrorCode::internal,
                   "bfs: level protocol failed to terminate");
+    if (!fixed_batch && per_batch < k_adaptive_cap)
+      per_batch = std::min(per_batch * 2u, k_adaptive_cap);
   }
 
   std::memcpy(dist_canon, dist_b->data(), std::size_t(V) * sizeof(int32_t));

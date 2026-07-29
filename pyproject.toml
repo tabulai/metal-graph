@@ -16,7 +16,7 @@ license-files = [
   "third_party/metal-cpp/LICENSE.txt",
   "THIRD_PARTY_NOTICES.md",
 ]
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.10,<3.15"
 dependencies = ["numpy>=1.24"]
 keywords = ["graph", "analytics", "metal", "apple-silicon", "pagerank", "bfs"]
 classifiers = [
@@ -27,6 +27,7 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Scientific/Engineering",
 ]
 
@@ -54,6 +55,13 @@ Changelog = "https://github.com/tabulai/metal-graph/blob/main/CHANGELOG.md"
 cmake.version = ">=3.24"
 wheel.packages = ["python/metal_graph"]
 build-dir = "build/{wheel_tag}"
+# Pin the deployment target HERE, not only in CMakeLists: scikit-build-core
+# derives the wheel's macosx platform tag from this define (or the ambient
+# MACOSX_DEPLOYMENT_TARGET / host OS when absent) and cannot see values set
+# inside CMakeLists.txt. Without it, wheels built on macOS 26 are tagged
+# macosx_26_0 (uninstallable on supported macOS 14/15) while the binary's
+# real floor is 14.0.
+cmake.define.CMAKE_OSX_DEPLOYMENT_TARGET = "14.0"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

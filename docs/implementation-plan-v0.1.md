@@ -3,12 +3,23 @@
 **A Metal-native graph-analytics engine for Apple Silicon. First release scoped to the few algorithms that accelerate the most.**
 
 *Prepared 2026-07-10; rev B 2026-07-10 incorporating external technical
-review. This retained plan records the design inputs; the implemented and
-tested behavior is documented in the repository README.*
+review; rev C 2026-07-28 — post-implementation amendments, see the Rev C
+changelog below. This retained plan records the design inputs; the
+implemented and tested behavior is documented in the repository README.*
 
 **Naming record** — project/repo/PyPI: `metal-graph` · Python import: `metal_graph` · NetworkX backend name: `"metal"` (shipped later as `nx-metal-graph`) · C ABI prefix: `mg_` · MSL kernel prefix: `mg_`.
 
 **Rev B changelog** (disposition of the external review): accepted all seven must-fix technical items — per-iteration GPU dangling-mass handling, corrected MSL sketches (attributes, `simd_vote`, atomic bitmap access, no hard-coded SIMD width), per-orientation degree worklists replacing permutation-based segmentation, GPU-resident BFS via indirect dispatch instead of per-level CPU switching, scan + indirect-args promoted to M0 primitives, tracked `MTLBuffer`s before heaps with explicit sync protocol, tightened WCC semantics. Accepted the product reshape: **batched PPR with top-k is now the flagship API**; k-hop gains `direction`/`max_vertices`/`max_edges` and returns views; WCC is repositioned as the atomics canary shipping under `experimental`. Accepted the benchmark/CI overhaul (workload-level ship gate, timing decomposition, concurrent-LLM contention scenario, GPU-required CI, measured-not-asserted build target, staffing honesty). Consciously deferred, with API reserved: typed/temporal k-hop filters (needs the edge-property/mask subsystem — v0.2) and fully-async MLX device-resident results (v0.2); GPU top-k is the M3 target with a semantically identical CPU selection fallback behind the same API so the contract never depends on which processor selects.
+
+**Rev C changelog** (2026-07-28, post-implementation): edited for repository
+publication and to reflect implemented behavior — references to the private
+companion assessment (`apple-gpu-graph-acceleration.md`, `cuGraph_assessment`
+checkout) were scrubbed; the §5 M2 milestone, §10 benchmark-reporting, and
+§11 bottom-up-risk passages were amended to describe the bounded
+output-direct CPU BFS latency path and equivalent-work baseline rules that
+shipped AFTER rev B was frozen. The rev-B wording is preserved in git
+history; treat rev B as the design-time record and rev C as descriptive of
+the implementation.
 
 ---
 
