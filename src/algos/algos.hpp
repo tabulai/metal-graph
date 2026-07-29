@@ -92,6 +92,22 @@ enum class BfsDir : int { out = 0, in = 1, both = 2 };
 int bfs(Graph& g, const uint32_t* sources, uint32_t n_sources, BfsDir dir,
         int32_t* out_dist, int32_t* out_parent);
 
+// Sparse-output BFS (opt-in; the dense contract above is unchanged).
+// vertices: reached USER indices ascending (sources included, depth 0);
+// dist/parent aligned with vertices; parent is -1 for sources and a USER
+// index otherwise. Reachability is identical to dense bfs; only the output
+// shape differs (O(|reached|) instead of O(V)). Deterministic: ascending
+// order is part of the contract on every execution path.
+struct SparseBfsResult {
+  std::vector<uint32_t> vertices;
+  std::vector<int32_t> dist;
+  std::vector<int32_t> parent;
+};
+
+// Returns BFS levels executed (same convention as bfs()).
+int bfs_sparse(Graph& g, const uint32_t* sources, uint32_t n_sources,
+               BfsDir dir, SparseBfsResult& out);
+
 struct KhopOpts {
   uint32_t k = 2;
   BfsDir dir = BfsDir::both;
@@ -140,6 +156,18 @@ int ppr(Graph& g, const uint32_t* seeds_canon, const float* seed_w,
 
 int bfs(Graph& g, const uint32_t* sources_canon, uint32_t n_sources,
         BfsDir dir, int32_t* dist_canon, int32_t* parent_canon);
+
+// Serial, sparse-collecting BFS for the sparse-output API: appends each
+// reached vertex (USER index, incl. sources) with its dist/parent to the
+// out vectors in TRAVERSAL order (caller sorts). The dense visited scratch
+// is calloc-backed so an untouched graph costs O(pages touched), not O(V).
+// Returns BFS levels, or -1 once max_vertices/max_edges is exceeded (out
+// vectors left partial; caller discards). Limits must be positive.
+int bfs_sparse_collect(Graph& g, const uint32_t* sources_canon,
+                       uint32_t n_sources, BfsDir dir, uint32_t max_vertices,
+                       uint64_t max_edges, std::vector<uint32_t>& out_user,
+                       std::vector<int32_t>& out_dist,
+                       std::vector<int32_t>& out_parent);
 
 // Serial, output-direct BFS for latency-sensitive traversals that touch only
 // a small component. The traversal still uses canonical CSR internally, but

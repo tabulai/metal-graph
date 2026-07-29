@@ -8,8 +8,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <vector>
 
 #include "../algos.hpp"
@@ -28,6 +30,89 @@ Csr csr_of(const Orientation& o) {
 }
 
 }  // namespace
+
+int bfs_sparse_collect(Graph& g, const uint32_t* sources_canon,
+                       uint32_t n_sources, BfsDir dir, uint32_t max_vertices,
+                       uint64_t max_edges, std::vector<uint32_t>& out_user,
+                       std::vector<int32_t>& out_dist,
+                       std::vector<int32_t>& out_parent) {
+  const uint32_t V = g.V;
+  out_user.clear();
+  out_dist.clear();
+  out_parent.clear();
+  if (V == 0 || n_sources == 0) return 0;
+
+  Csr fwd{}, rev{};
+  bool two_sided = false;
+  if (dir == BfsDir::out) {
+    fwd = csr_of(g.orientation(Dir::out));
+  } else if (dir == BfsDir::in) {
+    fwd = csr_of(g.orientation(Dir::in));
+  } else {
+    fwd = csr_of(g.orientation(Dir::out));
+    if (g.directed) {
+      rev = csr_of(g.orientation(Dir::in));
+      two_sided = true;
+    }
+  }
+
+  // calloc: the kernel hands back lazily-zeroed pages, so a traversal that
+  // touches R vertices faults in O(R) pages of this array, not O(V) — the
+  // whole point of the sparse output path.
+  std::unique_ptr<unsigned char, decltype(&std::free)> visited(
+      static_cast<unsigned char*>(std::calloc(V, 1)), &std::free);
+  if (!visited) throw std::bad_alloc();
+  unsigned char* seen = visited.get();
+
+  std::vector<uint32_t> queue;  // canonical ids, aligned with out_* entries
+  queue.reserve(std::min<uint32_t>(max_vertices, 256u));
+  for (uint32_t i = 0; i < n_sources; ++i) {
+    const uint32_t c = sources_canon[i];
+    if (seen[c]) continue;
+    if (queue.size() >= max_vertices) return -1;
+    seen[c] = 1;
+    queue.push_back(c);
+    out_user.push_back(g.user_of_canon[c]);
+    out_dist.push_back(0);
+    out_parent.push_back(-1);
+  }
+
+  uint64_t scanned_edges = 0;
+  std::size_t level_begin = 0;
+  int32_t depth = 0;
+  int levels = 0;
+  while (level_begin < queue.size()) {
+    const std::size_t level_end = queue.size();
+    ++levels;
+    const int32_t next_depth = depth + 1;
+    for (std::size_t i = level_begin; i < level_end; ++i) {
+      const uint32_t c = queue[i];
+      const int32_t parent_u = static_cast<int32_t>(g.user_of_canon[c]);
+      auto expand = [&](const Csr& csr) -> bool {
+        const uint32_t begin = csr.row[c];
+        const uint32_t end = csr.row[c + 1];
+        const uint64_t degree = uint64_t(end) - begin;
+        if (degree > max_edges - scanned_edges) return false;
+        scanned_edges += degree;
+        for (uint32_t edge = begin; edge < end; ++edge) {
+          const uint32_t next_c = csr.col[edge];
+          if (seen[next_c]) continue;
+          if (queue.size() >= max_vertices) return false;
+          seen[next_c] = 1;
+          queue.push_back(next_c);
+          out_user.push_back(g.user_of_canon[next_c]);
+          out_dist.push_back(next_depth);
+          out_parent.push_back(parent_u);
+        }
+        return true;
+      };
+      if (!expand(fwd) || (two_sided && !expand(rev))) return -1;
+    }
+    level_begin = level_end;
+    depth = next_depth;
+  }
+  return levels;
+}
 
 int bfs_sparse_user(Graph& g, const uint32_t* sources_canon,
                     uint32_t n_sources, BfsDir dir, uint32_t max_vertices,
