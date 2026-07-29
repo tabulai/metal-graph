@@ -58,5 +58,8 @@ build-dir = "build/{wheel_tag}"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
 [tool.ruff.lint.per-file-ignores]
 "tests/*.py" = ["E402"]
