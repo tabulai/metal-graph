@@ -115,6 +115,38 @@ def gen_kg(v=100_000, e=2_000_000, seed=7):
     return src, dst, w, v, True
 
 
+def stored_out_degrees(src, dst, v, directed):
+    """USER-order degree of the traversal CSR used by direction='out'."""
+    degree = np.bincount(src, minlength=v).astype(np.uint64, copy=False)
+    if not directed:
+        reverse = dst != src
+        degree += np.bincount(
+            dst[reverse], minlength=v
+        ).astype(np.uint64, copy=False)
+    return degree
+
+
+def make_rustworkx_dense_bfs(rx, graph, v, source):
+    """Return an API-equivalent dense dist+parent rustworkx BFS runner."""
+    class OutputVisitor(rx.visit.BFSVisitor):
+        def __init__(self):
+            self.dist = np.full(v, -1, np.int32)
+            self.parent = np.full(v, -1, np.int32)
+            self.dist[source] = 0
+
+        def tree_edge(self, edge):
+            parent, child, _ = edge
+            self.parent[child] = parent
+            self.dist[child] = self.dist[parent] + 1
+
+    def run():
+        visitor = OutputVisitor()
+        rx.bfs_search(graph, [source], visitor)
+        return visitor.dist, visitor.parent
+
+    return run
+
+
 # ---------------------------------------------------------------------------
 # SNAP datasets (download ONLY with --fetch; cached under bench/data/)
 # ---------------------------------------------------------------------------
@@ -375,6 +407,7 @@ def make_queries(v, batch=16, max_seeds=5, seed=3):
 def bench_dataset(mg, name, data, runs, rows):
     src, dst, w, v, directed = data
     e = len(src)
+    out_degree = stored_out_degrees(src, dst, v, directed)
     print(f"\n=== {name}: V={v:,} E={e:,} "
           f"{'weighted' if w is not None else 'unweighted'} ===")
     METER.mark()  # window starts here, not at generation/parse time
@@ -458,13 +491,43 @@ def bench_dataset(mg, name, data, runs, rows):
         k_lo=1, k_hi=min(1024, v))
 
     # -- bfs ---------------------------------------------------------------
+    def bfs_diagnostics(result):
+        dist = np.asarray(result[0])
+        reached = dist >= 0
+        frontier_sizes = (
+            np.bincount(dist[reached]).astype(int).tolist()
+            if reached.any() else []
+        )
+        return {
+            "reached_vertices": int(reached.sum()),
+            "reachable_edges_scanned": int(out_degree[reached].sum()),
+            "max_distance": int(dist[reached].max()) if reached.any() else -1,
+            "frontier_sizes": frontier_sizes,
+        }
+
     st = stats_ms(lambda: mg.bfs(g, s0, direction="out"), runs)
     info = mg.last_run_info()
+    single_result = mg.bfs(g, s0, direction="out")
     add("bfs", "warm_single_source", st, levels=info["iterations"],
-        path=info["path"])
+        path=info["path"], variant=info["op"], source=0,
+        source_out_degree=int(out_degree[0]),
+        **bfs_diagnostics(single_result))
+
+    high_source = int(np.argmax(out_degree)) if v else 0
+    high = np.asarray([high_source], np.uint32)
+    st = stats_ms(lambda: mg.bfs(g, high, direction="out"), runs)
+    info = mg.last_run_info()
+    high_result = mg.bfs(g, high, direction="out")
+    add("bfs", "warm_high_degree_source", st, levels=info["iterations"],
+        path=info["path"], variant=info["op"], source=high_source,
+        source_out_degree=int(out_degree[high_source]),
+        **bfs_diagnostics(high_result))
+
     src64 = np.arange(0, v, max(v // 64, 1), dtype=np.uint32)[:64]
     st = stats_ms(lambda: mg.bfs(g, src64, direction="out"), runs)
-    add("bfs", "warm_64_sources", st)
+    info = mg.last_run_info()
+    add("bfs", "warm_64_sources", st, path=info["path"],
+        variant=info["op"])
 
     # -- wcc -----------------------------------------------------------------
     st = stats_ms(lambda: mg.experimental.wcc(g), runs)
@@ -565,9 +628,11 @@ def bench_baselines(name, data, runs, add):
         return {"median_ms": float("nan"), "p95_ms": float("nan"),
                 "runs": 0}
 
-    def baseline(algo, item, fn, **extra):
+    def baseline(algo, item, fn, sample_runs=None, **extra):
         try:
-            st = stats_ms(fn, b_runs, warmup=1)
+            st = stats_ms(
+                fn, b_runs if sample_runs is None else sample_runs, warmup=1
+            )
         except Exception as err:  # API drift across versions: report it
             add(algo, item, nan_stats(), note=f"failed: {err}")
             return
@@ -586,9 +651,34 @@ def bench_baselines(name, data, runs, add):
                  lambda: rx.pagerank(gr, alpha=0.85, tol=1e-6,
                                      max_iter=100, weight_fn=rx_weight),
                  weighted=w is not None)
-        baseline("bfs", "baseline_rustworkx",
-                 lambda: rx.bfs_search(gr, [0], rx.visit.BFSVisitor()),
-                 source=0)
+        degree = stored_out_degrees(src, dst, v, directed)
+        # A handful of samples cannot support a microsecond-scale p95.
+        # Calibrate from one traversal rather than source degree: a degree-1
+        # source can still enter a giant component on SNAP/RMAT.
+        def rx_bfs_noop():
+            return rx.bfs_search(gr, [0], rx.visit.BFSVisitor())
+
+        rx_bfs_dense = make_rustworkx_dense_bfs(rx, gr, v, 0)
+        probe_ms, _ = timed(rx_bfs_dense)
+        bfs_runs = max(200, runs) if probe_ms < 2.0 else b_runs
+        baseline("bfs", "baseline_rustworkx", rx_bfs_dense, source=0,
+                 semantics="dense int32 dist+parent",
+                 sample_runs=bfs_runs)
+        baseline("bfs", "baseline_rustworkx_noop", rx_bfs_noop,
+                 source=0, semantics="traversal only; no returned result",
+                 sample_runs=bfs_runs)
+        baseline("bfs", "baseline_rustworkx_layers",
+                 lambda: rx.bfs_layers(gr, [0]), source=0,
+                 semantics="sparse layers; no parent array",
+                 sample_runs=bfs_runs)
+        high_source = int(np.argmax(degree)) if v else 0
+        rx_bfs_high = make_rustworkx_dense_bfs(
+            rx, gr, v, high_source
+        )
+        baseline("bfs", "baseline_rustworkx_high_degree", rx_bfs_high,
+                 source=high_source,
+                 source_out_degree=int(degree[high_source]),
+                 semantics="dense int32 dist+parent")
         rx_wcc = (rx.weakly_connected_components if directed
                   else rx.connected_components)
         baseline("wcc", "baseline_rustworkx", lambda: rx_wcc(gr))
@@ -603,7 +693,26 @@ def bench_baselines(name, data, runs, add):
         baseline("pagerank", "baseline_igraph",
                  lambda: gi.pagerank(damping=0.85, weights=ig_weight),
                  weighted=w is not None)
-        baseline("bfs", "baseline_igraph", lambda: gi.bfs(0), source=0)
+
+        def ig_bfs_source_zero():
+            return gi.bfs(0)
+
+        probe_ms, _ = timed(ig_bfs_source_zero)
+        ig_bfs_runs = max(200, runs) if probe_ms < 2.0 else b_runs
+        baseline("bfs", "baseline_igraph", ig_bfs_source_zero, source=0,
+                 sample_runs=ig_bfs_runs)
+        degree = stored_out_degrees(src, dst, v, directed)
+        high_source = int(np.argmax(degree)) if v else 0
+
+        def ig_bfs_high_degree():
+            return gi.bfs(high_source)
+
+        probe_ms, _ = timed(ig_bfs_high_degree)
+        ig_high_runs = max(200, runs) if probe_ms < 2.0 else b_runs
+        baseline("bfs", "baseline_igraph_high_degree", ig_bfs_high_degree,
+                 source=high_source,
+                 source_out_degree=int(degree[high_source]),
+                 sample_runs=ig_high_runs)
         ig_wcc = getattr(gi, "connected_components", None) or gi.clusters
         baseline("wcc", "baseline_igraph", lambda: ig_wcc(mode="weak"))
 
@@ -769,8 +878,23 @@ def render_markdown(meta, rows):
     ]
     for r in rows:
         notes = []
-        for k in ("path", "iterations", "levels", "rounds", "note",
-                  "amortized_per_query_ms", "achieved_gb_s"):
+        note_keys = [
+            "path", "iterations", "levels", "rounds", "note",
+            "amortized_per_query_ms", "achieved_gb_s",
+        ]
+        # Preserve byte-for-byte rendering of legacy artifacts while showing
+        # the richer fields on rows emitted by the corrected BFS harness.
+        if "variant" in r:
+            note_keys.extend([
+                "variant", "source", "source_out_degree",
+                "reached_vertices", "reachable_edges_scanned",
+                "max_distance", "frontier_sizes",
+            ])
+        if "semantics" in r:
+            note_keys.extend([
+                "source", "source_out_degree", "semantics",
+            ])
+        for k in note_keys:
             if k in r and r[k] is not None:
                 val = r[k]
                 if isinstance(val, float):

@@ -19,7 +19,10 @@
    competition), SciPy sparse power iteration, a pure-python deque BFS.
    rustworkx / igraph are feature-detected line items for **BFS, WCC,
    and PageRank** (the plan-§10 gate shapes) and reported as
-   `not installed` when absent — never silently skipped.
+   `not installed` when absent — never silently skipped. The rustworkx BFS
+   gate constructs dense `int32[V]` distance and parent arrays like
+   metal-graph; its no-output visitor and sparse-layers APIs are labeled
+   separately as non-equivalent context.
 5. Every line item records `t_start_utc`/`t_end_utc` (ISO-8601, for
    powermetrics window alignment — see `ENERGY.md`) and peak-RSS
    bracketing: `peak_rss_mb` is the process high-water mark at the end of
@@ -62,10 +65,13 @@ markdown table. Result files use an explicit schema version and strict JSON.
 | `ppr_topk / warm_batch16_k64` | the flagship gate shape: B=16, k=64, from Python call to NumPy result |
 | `ppr_topk / python_boundary` | wall median minus `last_run_info()["ms"]` (engine time) |
 | `ppr_topk / topk_selection_estimate` | median(k=1024) − median(k=1): selection cost estimate |
-| `bfs / warm_single_source`, `warm_64_sources` | levels attached from telemetry |
+| `bfs / warm_single_source`, `warm_high_degree_source`, `warm_64_sources` | path/variant and levels attached; single-source rows also record source degree, reached vertices, scanned reachable edges, max distance, and frontier sizes |
 | `wcc / warm` | hook+jump rounds attached |
 | `k_hop / warm_k2_capped` | capped extraction (agent-latency shape) |
-| `baseline_*` | context numbers (see honesty rules); `baseline_rustworkx` / `baseline_igraph` appear under `pagerank`, `bfs`, **and** `wcc` |
+| `bfs / baseline_rustworkx` | identical-semantics dense `dist+parent` visitor |
+| `bfs / baseline_rustworkx_noop`, `baseline_rustworkx_layers` | non-equivalent traversal-only context |
+| `bfs / baseline_*_high_degree` | same deterministic max-out-degree source as `warm_high_degree_source` |
+| `baseline_*` | other context numbers (see honesty rules); rustworkx / igraph appear under `pagerank`, `bfs`, **and** `wcc` |
 
 Every row additionally carries `t_start_utc` / `t_end_utc`,
 `peak_rss_mb`, and `peak_rss_delta_mb` (honesty rule 5); the markdown

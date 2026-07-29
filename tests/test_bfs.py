@@ -1,4 +1,6 @@
 # test_bfs.py — multi-source BFS: golden dist + structural parent checks.
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 import pytest
 
@@ -120,3 +122,77 @@ def test_bfs_source_out_of_range_raises():
     with pytest.raises(ValueError):
         mg.bfs(g, np.asarray([case.num_vertices], np.uint32),
                direction="out")
+
+
+def test_sparse_cpu_path_and_cap_fallback_agree(monkeypatch):
+    """The latency path and regular CPU fallback preserve dense semantics."""
+    src = np.arange(63, dtype=np.uint32)
+    dst = src + 1
+    g = mg.Graph.from_edges(
+        src, dst, directed=True, num_vertices=64
+    )
+    source = np.asarray([0], np.uint32)
+    mg.set_execution("cpu")
+    try:
+        monkeypatch.setenv("MG_BFS_SPARSE_MAX_VERTICES", "128")
+        monkeypatch.setenv("MG_BFS_SPARSE_MAX_EDGES", "128")
+        sparse_dist, sparse_parent = mg.bfs(g, source, direction="out")
+        assert mg.last_run_info()["op"] == "bfs_sparse"
+
+        monkeypatch.setenv("MG_BFS_SPARSE_MAX_VERTICES", "1")
+        fallback_dist, fallback_parent = mg.bfs(
+            g, source, direction="out"
+        )
+        assert mg.last_run_info()["op"] == "bfs"
+
+        monkeypatch.setenv("MG_BFS_SPARSE_MAX_VERTICES", "128")
+        monkeypatch.setenv("MG_BFS_SPARSE_MAX_EDGES", "1")
+        edge_fallback_dist, edge_fallback_parent = mg.bfs(
+            g, source, direction="out"
+        )
+        assert mg.last_run_info()["op"] == "bfs"
+    finally:
+        mg.set_execution("auto")
+
+    np.testing.assert_array_equal(sparse_dist, fallback_dist)
+    np.testing.assert_array_equal(sparse_dist, edge_fallback_dist)
+    np.testing.assert_array_equal(sparse_dist, np.arange(64, dtype=np.int32))
+    for parent in (
+        sparse_parent, fallback_parent, edge_fallback_parent
+    ):
+        assert parent[0] == -1
+        np.testing.assert_array_equal(
+            parent[1:], np.arange(63, dtype=np.int32)
+        )
+
+
+def test_sparse_cpu_path_is_reentrant(monkeypatch):
+    """Concurrent calls use call-local queues and output arrays."""
+    src = np.arange(255, dtype=np.uint32)
+    dst = src + 1
+    g = mg.Graph.from_edges(
+        src, dst, directed=True, num_vertices=256
+    )
+    monkeypatch.setenv("MG_BFS_SPARSE_MAX_VERTICES", "512")
+    monkeypatch.setenv("MG_BFS_SPARSE_MAX_EDGES", "512")
+    mg.set_execution("cpu")
+    try:
+        def run(source):
+            dist, parent = mg.bfs(g, [source], direction="out")
+            return np.asarray(dist), np.asarray(parent)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(run, range(16)))
+    finally:
+        mg.set_execution("auto")
+
+    for source, (dist, parent) in enumerate(results):
+        np.testing.assert_array_equal(dist[:source], -1)
+        np.testing.assert_array_equal(
+            dist[source:], np.arange(256 - source, dtype=np.int32)
+        )
+        assert parent[source] == -1
+        if source + 1 < 256:
+            np.testing.assert_array_equal(
+                parent[source + 1:], np.arange(source, 255, dtype=np.int32)
+            )

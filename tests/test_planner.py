@@ -150,6 +150,29 @@ print("PATH", mg.last_run_info()["path"])
     assert "PATH gpu" in r.stdout
 
 
+@pytest.mark.gpu
+def test_auto_bfs_sparse_component_overrides_graph_size_subprocess():
+    if not has_gpu():
+        pytest.skip("no Metal device")
+    code = TINY_GRAPH_CODE + """
+mg.set_execution("auto")
+mg.bfs(g, [0], direction="out")
+info = mg.last_run_info()
+print("PATH", info["path"])
+print("OP", info["op"])
+"""
+    r = run_python(code, {
+        "MG_E_GPU_MIN": "1",
+        "MG_BFS_SPARSE_MAX_VERTICES": "16",
+        "MG_BFS_SPARSE_MAX_EDGES": "16",
+        "MG_REQUIRE_GPU": "0",
+        "MG_FORCE_CPU": "0",
+    })
+    assert r.returncode == 0, r.stderr
+    assert "PATH cpu" in r.stdout
+    assert "OP bfs_sparse" in r.stdout
+
+
 # ---------------------------------------------------------------------------
 # GPU/CPU agreement across the matrix
 # ---------------------------------------------------------------------------

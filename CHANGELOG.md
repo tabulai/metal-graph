@@ -13,3 +13,9 @@ All notable changes to metal-graph are documented here.
   overflowing fp32 outgoing-weight sums.
 - Added installable CPython wheels, CMake installation for the C ABI,
   explicit ABI symbol visibility, and macOS 14 deployment targeting.
+- Added a bounded, output-direct CPU BFS latency path for tiny reachable
+  components while preserving forced-GPU execution and dense results.
+- Reduced the default GPU BFS command batch from 16 to 8 levels and guarded
+  bottom-up traversal against sparse high-degree hub frontiers.
+- Made the rustworkx BFS gate return equivalent dense distance and parent
+  arrays, with no-output and sparse-layer calls reported separately.

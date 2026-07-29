@@ -105,7 +105,7 @@ int FrontierEngine::run_bfs(Graph& g,
   Buffer* rrow = rev ? rev->row_offsets.get() : dmy.get();
   Buffer* rcol = rev ? rev->col_indices.get() : dmy.get();
 
-  long pb = env_long("MG_BFS_LEVELS_PER_BATCH", 16);
+  long pb = env_long("MG_BFS_LEVELS_PER_BATCH", 8);
   const uint32_t per_batch = pb < 1 ? 1u : static_cast<uint32_t>(pb);
   uint32_t encoded = 0;  // total prepares issued; parity = encoded & 1
   bool done = false;

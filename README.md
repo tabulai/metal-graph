@@ -106,12 +106,17 @@ benchmark rules are documented in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Execution planner
 
-`mode="auto"` picks CPU or GPU **once per operation**: GPU when a Metal
+`mode="auto"` starts with an operation-level CPU/GPU plan: GPU when a Metal
 device exists and the stored edge count is ≥ `MG_E_GPU_MIN` (default 1M,
-placeholder until the M4 sweep). `mode="gpu"` errors without a device;
+placeholder until the M4 sweep). BFS first attempts a bounded serial
+traversal; if the reachable work stays within the sparse caps below, it
+returns dense user-order results directly on CPU, otherwise it continues
+with the original plan. `mode="gpu"` bypasses this latency preflight and
+errors without a device;
 `MG_REQUIRE_GPU=1` makes device absence a hard failure everywhere (CI).
 `MG_FORCE_CPU=1` hides the GPU. Telemetry from `mg.last_run_info()` reports
-the path actually executed — CI asserts it, never silently falls back.
+the path and BFS variant actually executed — CI asserts it, never silently
+falls back.
 
 ## Environment knobs
 
@@ -119,7 +124,9 @@ the path actually executed — CI asserts it, never silently falls back.
 |---|---|---|
 | `MG_E_GPU_MIN` | 1000000 | auto-planner GPU threshold (stored edges) |
 | `MG_PR_AUDIT_INTERVAL` | 5 | iterations per GPU command batch / fp64 audit |
-| `MG_BFS_LEVELS_PER_BATCH` | 16 | BFS levels encoded per command buffer |
+| `MG_BFS_LEVELS_PER_BATCH` | 8 | BFS levels encoded per command buffer |
+| `MG_BFS_SPARSE_MAX_VERTICES` | 1024 | auto/CPU BFS latency-path vertex cap (0 disables) |
+| `MG_BFS_SPARSE_MAX_EDGES` | 8192 | auto/CPU BFS latency-path scanned-edge cap (0 disables) |
 | `MG_WCC_ROUNDS_PER_BATCH` | 4 | WCC hook+jump rounds per command buffer |
 | `MG_GPU_TOPK` | 1 | GPU radix-select for `ppr_topk` (0 = CPU oracle) |
 | `MG_BFS_BOTTOMUP` | 1 | enable direction-optimizing bottom-up switch |
@@ -171,7 +178,7 @@ every gate baseline.
 | KG-shape | BFS single-source (tiny component) | 0.95 ms | rustworkx 0.046 | 0.05× |
 | KG-shape | WCC | 4.17 ms | igraph 14.04 | **3.37×** |
 
-Three implementation passes addressed the first run's largest gaps:
+Implementation passes addressed the first run's largest gaps:
 
 1. **Huge-bin edge tiling** (plan-§11 CSR-tiling fallback): the synthetic KG
    puts 44% of all in-edges on ONE vertex, which serialized on a single
@@ -191,6 +198,15 @@ Three implementation passes addressed the first run's largest gaps:
    the canonical artifact records the resulting iteration counts, while
    `MG_PR_AUDIT_INTERVAL` remains available for repeatable local sweeps.
 
+The canonical table predates the BFS latency work in the current candidate.
+On the same physical M4 Max, the bounded sparse path measured 0.010 ms
+median for that KG source (52 reached vertices, 344 scanned edges), versus
+0.043 ms for rustworkx's no-output visitor and 0.057 ms for an equivalent
+dense `dist+parent` visitor. These candidate numbers will replace the table
+only after a clean provenance-backed benchmark rerun. A new high-degree KG
+row exercises the GPU path: 1.85 ms versus rustworkx 49.63 ms, though igraph
+remains faster at 0.89 ms.
+
 Gate assessment (plan §8, honest):
 
 * **PPR relative-speed sub-gate**: ≥5× the igraph per-query loop — **met**
@@ -200,14 +216,16 @@ Gate assessment (plan §8, honest):
   ms). The complete PPR gate remains **open**: the canonical KG batch is
   15.28 ms against the ≤10 ms target, and identical-iteration comparison is
   unavailable with this igraph solver.
-* **Primary ≥2× speed sub-gate**: met on **7 of 8**
-  workload×algorithm cells (3.37×–656×). The one failure is BFS from a tiny
-  reachable component, which loses to CPU baselines because graph size does
-  not predict traversal size (v0.2: first-frontier fallback).
+* **Primary ≥2× speed sub-gate**: the clean canonical artifact met **7 of
+  8** workload×algorithm cells (3.37×–656×). The candidate bounded BFS
+  latency path resolves its tiny-component miss by routing on measured
+  traversal work rather than graph size. The new high-degree diagnostic beats
+  rustworkx but not igraph, so further GPU work remains; a clean canonical
+  rerun is pending.
 * **Broader ship gate**: still open pending the full SNAP/RMAT suite,
   contention and end-to-end agent-workflow evidence, a provisioned physical
-  benchmark runner, and resolution or explicit waiver of the PPR/BFS misses
-  above.
+  benchmark runner, and resolution or explicit waiver of the PPR and
+  high-degree BFS/igraph misses.
 
 ## Status
 
