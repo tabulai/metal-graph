@@ -1,0 +1,30 @@
+
+=== com-orkut: V=3,072,441 E=117,185,083 unweighted ===
+       build from_edges                 median   1856.951 ms   p95   1856.951 ms
+       build transpose_estimate         median     17.215 ms   p95        nan ms
+    pagerank warm_full_run              median     39.501 ms   p95     41.915 ms
+    pagerank per_iteration              median      7.900 ms   p95      8.383 ms
+    ppr_topk warm_batch16_k64           median    257.417 ms   p95    265.154 ms
+    ppr_topk python_boundary            median      0.000 ms   p95        nan ms
+    ppr_topk topk_selection_estimate    median      1.906 ms   p95        nan ms
+         bfs warm_single_source         median      8.290 ms   p95      8.540 ms
+         bfs warm_high_degree_source    median      9.482 ms   p95      9.725 ms
+         bfs warm_64_sources            median      8.086 ms   p95      8.558 ms
+         wcc warm                       median     55.942 ms   p95     57.855 ms
+       k_hop warm_k2_capped             median      0.367 ms   p95      0.425 ms
+    pagerank baseline_networkx          median        nan ms   p95        nan ms
+    pagerank baseline_scipy_20iter      median   2261.802 ms   p95   2282.839 ms
+    pagerank baseline_rustworkx         median        nan ms   p95        nan ms
+         bfs baseline_rustworkx         median  41158.931 ms   p95  44012.201 ms
+         bfs baseline_rustworkx_noop    median  41580.829 ms   p95  41760.935 ms
+         bfs baseline_rustworkx_layers  median  14367.501 ms   p95  14663.581 ms
+         bfs baseline_rustworkx_high_degree median  42125.959 ms   p95  42204.570 ms
+         wcc baseline_rustworkx         median  13661.075 ms   p95  13746.372 ms
+    pagerank baseline_igraph            median  24247.799 ms   p95  24440.438 ms
+         bfs baseline_igraph            median   1263.730 ms   p95   1264.789 ms
+         bfs baseline_igraph_high_degree median   1463.188 ms   p95   1496.221 ms
+         wcc baseline_igraph            median     67.772 ms   p95     67.969 ms
+    ppr_topk baseline_igraph_query_loop median        nan ms   p95        nan ms
+
+results: bench/results/bench-20260729T131101Z-orkut-bounded.json
+         bench/results/bench-20260729T131101Z-orkut-bounded.md

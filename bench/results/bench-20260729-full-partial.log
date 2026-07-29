@@ -1,0 +1,145 @@
+SNAP datasets (downloaded only with --fetch):
+  soc-LiveJournal1: https://snap.stanford.edu/data/soc-LiveJournal1.txt.gz
+  com-orkut: https://snap.stanford.edu/data/bigdata/communities/com-orkut.ungraph.txt.gz
+[fetch] cached: /Users/tunguz/Programming/metal-graph/bench/data/soc-LiveJournal1.txt.gz
+[fetch] cached: /Users/tunguz/Programming/metal-graph/bench/data/com-orkut.txt.gz
+[fetch] done
+
+chip: Apple M4 Max · macOS 26.2 · metal_graph 0.1.0
+  pipeline warm: first tiny op 0.064 ms, second 0.010 ms
+
+=== rmat18: V=262,144 E=4,194,304 unweighted ===
+       build from_edges                 median     66.479 ms   p95     66.479 ms
+       build transpose_estimate         median     33.574 ms   p95        nan ms
+    pagerank warm_full_run              median      1.759 ms   p95      6.059 ms
+    pagerank per_iteration              median      0.352 ms   p95      1.212 ms
+    ppr_topk warm_batch16_k64           median     10.202 ms   p95     11.543 ms
+    ppr_topk python_boundary            median      0.158 ms   p95        nan ms
+    ppr_topk topk_selection_estimate    median      0.281 ms   p95        nan ms
+         bfs warm_single_source         median      1.538 ms   p95      2.215 ms
+         bfs warm_high_degree_source    median      1.446 ms   p95      2.135 ms
+         bfs warm_64_sources            median      1.679 ms   p95      3.331 ms
+         wcc warm                       median      3.819 ms   p95      5.679 ms
+       k_hop warm_k2_capped             median     75.940 ms   p95     77.128 ms
+    pagerank baseline_networkx          median        nan ms   p95        nan ms
+    pagerank baseline_scipy_20iter      median     92.502 ms   p95     93.662 ms
+         bfs baseline_python_deque      median    280.321 ms   p95    282.235 ms
+    pagerank baseline_rustworkx         median    306.411 ms   p95    307.356 ms
+         bfs baseline_rustworkx         median   1030.735 ms   p95   1036.612 ms
+         bfs baseline_rustworkx_noop    median   1012.066 ms   p95   1017.554 ms
+         bfs baseline_rustworkx_layers  median    424.143 ms   p95    433.370 ms
+         bfs baseline_rustworkx_high_degree median   1028.553 ms   p95   1037.849 ms
+         wcc baseline_rustworkx         median    853.192 ms   p95    856.518 ms
+    pagerank baseline_igraph            median    382.695 ms   p95    383.525 ms
+         bfs baseline_igraph            median     28.451 ms   p95     28.535 ms
+         bfs baseline_igraph_high_degree median     27.136 ms   p95     28.109 ms
+         wcc baseline_igraph            median    125.525 ms   p95    126.324 ms
+    ppr_topk baseline_igraph_query_loop median   5972.022 ms   p95   6014.259 ms
+
+=== kg-hipporag: V=100,000 E=2,000,000 weighted ===
+       build from_edges                 median     30.664 ms   p95     30.664 ms
+       build transpose_estimate         median     58.420 ms   p95        nan ms
+    pagerank warm_full_run              median      3.074 ms   p95      3.981 ms
+    pagerank per_iteration              median      0.205 ms   p95      0.265 ms
+    ppr_topk warm_batch16_k64           median     15.116 ms   p95     19.085 ms
+    ppr_topk python_boundary            median      3.311 ms   p95        nan ms
+    ppr_topk topk_selection_estimate    median      3.377 ms   p95        nan ms
+         bfs warm_single_source         median      0.012 ms   p95      0.030 ms
+         bfs warm_high_degree_source    median      1.905 ms   p95      2.094 ms
+         bfs warm_64_sources            median      0.014 ms   p95      0.018 ms
+         wcc warm                       median      4.090 ms   p95      4.324 ms
+       k_hop warm_k2_capped             median     24.166 ms   p95     24.811 ms
+    pagerank baseline_networkx          median    133.095 ms   p95    133.419 ms
+    pagerank baseline_scipy_20iter      median      8.426 ms   p95      8.686 ms
+         bfs baseline_python_deque      median      0.023 ms   p95      0.024 ms
+    pagerank baseline_rustworkx         median     98.590 ms   p95     99.146 ms
+         bfs baseline_rustworkx         median      0.057 ms   p95      0.066 ms
+         bfs baseline_rustworkx_noop    median      0.041 ms   p95      0.052 ms
+         bfs baseline_rustworkx_layers  median      0.003 ms   p95      0.004 ms
+         bfs baseline_rustworkx_high_degree median     50.058 ms   p95     50.364 ms
+         wcc baseline_rustworkx         median     73.869 ms   p95     76.013 ms
+    pagerank baseline_igraph            median     35.893 ms   p95     36.280 ms
+         bfs baseline_igraph            median      0.286 ms   p95      0.334 ms
+         bfs baseline_igraph_high_degree median      0.837 ms   p95      0.940 ms
+         wcc baseline_igraph            median     13.136 ms   p95     13.502 ms
+    ppr_topk baseline_igraph_query_loop median    663.211 ms   p95    673.468 ms
+
+=== rmat22: V=4,194,304 E=67,108,864 unweighted ===
+       build from_edges                 median   1021.045 ms   p95   1021.045 ms
+       build transpose_estimate         median    466.030 ms   p95        nan ms
+    pagerank warm_full_run              median     16.892 ms   p95     17.689 ms
+    pagerank per_iteration              median      3.378 ms   p95      3.538 ms
+    ppr_topk warm_batch16_k64           median    121.993 ms   p95    124.861 ms
+    ppr_topk python_boundary            median      0.689 ms   p95        nan ms
+    ppr_topk topk_selection_estimate    median      8.418 ms   p95        nan ms
+         bfs warm_single_source         median     13.920 ms   p95     14.233 ms
+         bfs warm_high_degree_source    median     13.746 ms   p95     14.183 ms
+         bfs warm_64_sources            median     12.498 ms   p95     16.671 ms
+         wcc warm                       median     32.362 ms   p95     32.858 ms
+       k_hop warm_k2_capped             median    376.852 ms   p95    380.855 ms
+    pagerank baseline_networkx          median        nan ms   p95        nan ms
+    pagerank baseline_scipy_20iter      median   2074.944 ms   p95   2090.591 ms
+    pagerank baseline_rustworkx         median   6346.648 ms   p95   6400.244 ms
+         bfs baseline_rustworkx         median  17600.397 ms   p95  17757.713 ms
+         bfs baseline_rustworkx_noop    median  17405.922 ms   p95  17668.051 ms
+         bfs baseline_rustworkx_layers  median   8252.068 ms   p95   8273.038 ms
+         bfs baseline_rustworkx_high_degree median  17261.418 ms   p95  17651.164 ms
+         wcc baseline_rustworkx         median  16582.052 ms   p95  16923.061 ms
+    pagerank baseline_igraph            median   7470.856 ms   p95   7539.584 ms
+         bfs baseline_igraph            median    611.642 ms   p95    615.725 ms
+         bfs baseline_igraph_high_degree median    609.233 ms   p95    617.840 ms
+         wcc baseline_igraph            median   2173.854 ms   p95   2218.250 ms
+    ppr_topk baseline_igraph_query_loop median 106395.181 ms   p95 106717.190 ms
+
+=== rmat24: V=16,777,216 E=268,435,456 unweighted ===
+       build from_edges                 median   4306.288 ms   p95   4306.288 ms
+       build transpose_estimate         median   1902.829 ms   p95        nan ms
+    pagerank warm_full_run              median     73.464 ms   p95     75.610 ms
+    pagerank per_iteration              median     14.693 ms   p95     15.122 ms
+    ppr_topk warm_batch16_k64           median    555.634 ms   p95    571.736 ms
+    ppr_topk python_boundary            median      3.532 ms   p95        nan ms
+    ppr_topk topk_selection_estimate    median     46.316 ms   p95        nan ms
+         bfs warm_single_source         median     46.096 ms   p95     49.893 ms
+         bfs warm_high_degree_source    median     46.841 ms   p95     48.392 ms
+         bfs warm_64_sources            median     44.378 ms   p95     48.384 ms
+         wcc warm                       median    119.823 ms   p95    120.996 ms
+       k_hop warm_k2_capped             median    478.631 ms   p95    481.056 ms
+    pagerank baseline_networkx          median        nan ms   p95        nan ms
+    pagerank baseline_scipy_20iter      median  10913.503 ms   p95  10983.427 ms
+    pagerank baseline_rustworkx         median  30765.861 ms   p95  30983.677 ms
+         bfs baseline_rustworkx         median  79206.021 ms   p95  81826.174 ms
+         bfs baseline_rustworkx_noop    median  77626.499 ms   p95  79613.074 ms
+         bfs baseline_rustworkx_layers  median  38569.715 ms   p95  38649.949 ms
+         bfs baseline_rustworkx_high_degree median  78634.809 ms   p95  78786.962 ms
+         wcc baseline_rustworkx         median  70909.762 ms   p95  71656.680 ms
+    pagerank baseline_igraph            median  39414.186 ms   p95  39571.498 ms
+         bfs baseline_igraph            median   2446.967 ms   p95   2464.345 ms
+         bfs baseline_igraph_high_degree median   2459.061 ms   p95   2462.423 ms
+         wcc baseline_igraph            median   9058.173 ms   p95   9180.020 ms
+    ppr_topk baseline_igraph_query_loop median 588510.973 ms   p95 588956.222 ms
+
+=== soc-LiveJournal1: V=4,847,571 E=68,993,773 unweighted ===
+       build from_edges                 median    527.018 ms   p95    527.018 ms
+       build transpose_estimate         median    341.979 ms   p95        nan ms
+    pagerank warm_full_run              median     19.773 ms   p95     20.483 ms
+    pagerank per_iteration              median      3.955 ms   p95      4.097 ms
+    ppr_topk warm_batch16_k64           median    173.635 ms   p95    175.465 ms
+    ppr_topk python_boundary            median      0.000 ms   p95        nan ms
+    ppr_topk topk_selection_estimate    median      3.959 ms   p95        nan ms
+         bfs warm_single_source         median     13.398 ms   p95     14.013 ms
+         bfs warm_high_degree_source    median     14.454 ms   p95     15.261 ms
+         bfs warm_64_sources            median     15.342 ms   p95     20.337 ms
+         wcc warm                       median     24.932 ms   p95     25.435 ms
+       k_hop warm_k2_capped             median      5.551 ms   p95      6.101 ms
+    pagerank baseline_networkx          median        nan ms   p95        nan ms
+    pagerank baseline_scipy_20iter      median   2086.180 ms   p95   2134.746 ms
+    pagerank baseline_rustworkx         median   6803.438 ms   p95   6853.188 ms
+         bfs baseline_rustworkx         median   9417.407 ms   p95   9526.981 ms
+         bfs baseline_rustworkx_noop    median   8766.102 ms   p95   8845.624 ms
+         bfs baseline_rustworkx_layers  median   1255.174 ms   p95   1257.363 ms
+         bfs baseline_rustworkx_high_degree median   9411.310 ms   p95   9440.618 ms
+         wcc baseline_rustworkx         median   6385.109 ms   p95   6389.224 ms
+    pagerank baseline_igraph            median   8495.829 ms   p95   8513.035 ms
+         bfs baseline_igraph            median    702.748 ms   p95    704.152 ms
+         bfs baseline_igraph_high_degree median    696.245 ms   p95    698.833 ms
+         wcc baseline_igraph            median   1652.573 ms   p95   1667.841 ms
