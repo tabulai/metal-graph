@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -142,6 +143,29 @@ def test_renderer_accepts_legacy_canonical_artifact():
     }]
     rendered = render_markdown(meta, rows)
     assert "git `unknown` (unknown)" in rendered
+
+
+def test_checked_in_canonical_artifact_is_strict_and_reproducible():
+    results = Path(__file__).resolve().parents[1] / "bench/results"
+    json_path = results / "bench-20260729T000207Z.json"
+    data = json.loads(
+        json_path.read_text(),
+        parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
+    )
+    assert data["schema_version"] == 1
+    assert data["meta"]["git_sha"] == (
+        "be8763c8b87de72d1b92e36739809a02651cc116"
+    )
+    assert data["meta"]["git_dirty"] is False
+    assert len(data["meta"]["native_module_sha256"]) == 64
+    assert set(data["meta"]["snap_datasets"]) == {
+        "soc-LiveJournal1",
+        "com-orkut",
+    }
+    expected = (
+        results / "bench-20260729T000207Z.md"
+    ).read_text()
+    assert render_markdown(data["meta"], data["rows"]) == expected
 
 
 def test_energy_capture_stops_on_exception(monkeypatch, tmp_path):
