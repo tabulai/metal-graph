@@ -16,6 +16,7 @@ from bench.run import (
     download_dataset,
     json_safe,
     load_snap_cache,
+    make_igraph_dense_bfs,
     make_rustworkx_dense_bfs,
     normalize_snap_ids,
     render_markdown,
@@ -373,3 +374,33 @@ def test_igraph_gate_baseline_respects_weights():
     rank_left = graph_left.pagerank(weights=weight_left)
     rank_right = graph_right.pagerank(weights=weight_right)
     assert not np.allclose(rank_left, rank_right)
+
+
+def test_igraph_bfs_gate_returns_dense_dist_and_parent():
+    ig = pytest.importorskip("igraph")
+    src = np.array([0, 0, 1, 3, 5], dtype=np.uint32)
+    dst = np.array([1, 2, 3, 4, 0], dtype=np.uint32)
+    graph, _ = build_igraph_graph(
+        ig, src, dst, None, 6, True
+    )
+
+    dist, parent = make_igraph_dense_bfs(graph, 6, 0)()
+
+    assert dist.shape == (6,)
+    assert parent.shape == (6,)
+    assert dist.dtype == np.int32
+    assert parent.dtype == np.int32
+    assert dist.flags.c_contiguous
+    assert parent.flags.c_contiguous
+    np.testing.assert_array_equal(dist, [0, 1, 1, 2, 3, -1])
+    np.testing.assert_array_equal(parent, [-1, 0, 0, 1, 3, -1])
+
+
+def test_igraph_bfs_gate_handles_singleton_graph():
+    ig = pytest.importorskip("igraph")
+    graph = ig.Graph(n=1, directed=True)
+
+    dist, parent = make_igraph_dense_bfs(graph, 1, 0)()
+
+    np.testing.assert_array_equal(dist, [0])
+    np.testing.assert_array_equal(parent, [-1])
