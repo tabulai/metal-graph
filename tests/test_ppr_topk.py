@@ -180,6 +180,37 @@ def test_ppr_topk_non_finite_seed_weight_rejected(bad_weight):
         )
 
 
+@pytest.mark.parametrize(
+    ("parameter", "bad_value"),
+    [
+        ("alpha", np.nan),
+        ("alpha", np.inf),
+        ("alpha", -np.inf),
+        ("alpha", 0.0),
+        ("alpha", 1.0),
+        ("tol", np.nan),
+        ("tol", np.inf),
+        ("tol", -np.inf),
+        ("tol", 0.0),
+        ("tol", -1.0),
+        ("max_iter", 0),
+        ("max_iter", -1),
+    ],
+)
+def test_ppr_topk_invalid_scalar_rejected(parameter, bad_value):
+    g = build_mg(ALL_CASES["gnp_dir"])
+    options = dict(k=4, alpha=0.85, tol=1e-6, max_iter=10)
+    options[parameter] = bad_value
+    with pytest.raises(ValueError):
+        mg.ppr_topk(
+            g,
+            np.array([1, 2], np.uint32),
+            np.array([1.0, 1.0], np.float32),
+            np.array([0, 2], np.uint64),
+            **options,
+        )
+
+
 def test_ppr_topk_invalid_inputs_raise():
     case = ALL_CASES["gnp_dir"]
     g = build_mg(case)

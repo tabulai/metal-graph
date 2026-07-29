@@ -2,8 +2,9 @@
 """metal-graph benchmark harness (v0.1, plan section 10).
 
 Decomposed, honest reporting: build / transpose / pipeline warm / warm
-kernels / convergence audit / top-k / Python boundary are separate line
-items; every kernel cell is median + p95 over >= --runs runs. Baselines
+kernels / convergence iteration metadata / top-k / Python boundary are
+separate line items; every kernel cell is median + p95 over >= --runs runs.
+Baselines
 (NetworkX, SciPy, pure-python BFS, rustworkx/igraph BFS/WCC/PageRank when
 installed) are context, never the gate. Every line item carries
 t_start_utc/t_end_utc (powermetrics window alignment, bench/ENERGY.md) and
@@ -18,6 +19,7 @@ Usage:
 
 import argparse
 import gzip
+import hashlib
 import importlib
 import json
 import os
@@ -29,6 +31,8 @@ import sys
 import time
 import urllib.request
 from collections import deque
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -37,10 +41,31 @@ import numpy as np
 BENCH_DIR = Path(__file__).resolve().parent
 DATA_DIR = BENCH_DIR / "data"
 RESULTS_DIR = BENCH_DIR / "results"
+RESULT_SCHEMA_VERSION = 1
+SNAP_CACHE_SCHEMA_VERSION = 1
+DOWNLOAD_TIMEOUT_SECONDS = 60
 
-SNAP_URLS = {
-    "soc-LiveJournal1": "https://snap.stanford.edu/data/soc-LiveJournal1.txt.gz",
-    "com-orkut": "https://snap.stanford.edu/data/bigdata/communities/com-orkut.ungraph.txt.gz",
+SNAP_DATASETS = {
+    "soc-LiveJournal1": {
+        "url": "https://snap.stanford.edu/data/soc-LiveJournal1.txt.gz",
+        "sha256":
+            "d7bcd5a87b88c896c35fdb9611e804c3f4033c39b58c4c9ea3ba53c680d516d8",
+        "bytes": 259_619_239,
+        "vertices": 4_847_571,
+        "edges": 68_993_773,
+        "directed": True,
+    },
+    "com-orkut": {
+        "url":
+            "https://snap.stanford.edu/data/bigdata/communities/"
+            "com-orkut.ungraph.txt.gz",
+        "sha256":
+            "f73e33fb685f411a10c952f2ba3ea788380b91a17bc636e38da1a23f6c6b2bc6",
+        "bytes": 447_251_958,
+        "vertices": 3_072_441,
+        "edges": 117_185_083,
+        "directed": False,
+    },
 }
 
 # NetworkX baseline caps (context only; keeps the loop sane)
@@ -94,16 +119,117 @@ def gen_kg(v=100_000, e=2_000_000, seed=7):
 # SNAP datasets (download ONLY with --fetch; cached under bench/data/)
 # ---------------------------------------------------------------------------
 
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_dataset(path, spec):
+    if path.stat().st_size != spec["bytes"]:
+        raise RuntimeError(
+            f"{path}: expected {spec['bytes']} bytes, got "
+            f"{path.stat().st_size}"
+        )
+    actual = file_sha256(path)
+    if actual != spec["sha256"]:
+        raise RuntimeError(
+            f"{path}: SHA-256 mismatch; expected {spec['sha256']}, "
+            f"got {actual}"
+        )
+
+
+def download_dataset(spec, destination):
+    """Download one pinned dataset with a timeout, byte cap, and streaming hash."""
+    digest = hashlib.sha256()
+    total = 0
+    request = urllib.request.Request(
+        spec["url"],
+        headers={"User-Agent": "metal-graph-benchmark/0.1"},
+    )
+    with urllib.request.urlopen(
+        request, timeout=DOWNLOAD_TIMEOUT_SECONDS
+    ) as response, destination.open("wb") as stream:
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > spec["bytes"]:
+                raise RuntimeError(
+                    f"{spec['url']}: download exceeds pinned size "
+                    f"{spec['bytes']}"
+                )
+            stream.write(chunk)
+            digest.update(chunk)
+    if total != spec["bytes"]:
+        raise RuntimeError(
+            f"{spec['url']}: expected {spec['bytes']} bytes, got {total}"
+        )
+    actual = digest.hexdigest()
+    if actual != spec["sha256"]:
+        raise RuntimeError(
+            f"{spec['url']}: SHA-256 mismatch; expected {spec['sha256']}, "
+            f"got {actual}"
+        )
+
+
 def fetch_datasets():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    for name, url in SNAP_URLS.items():
+    for name, spec in SNAP_DATASETS.items():
         path = DATA_DIR / (name + ".txt.gz")
         if path.exists():
+            validate_dataset(path, spec)
             print(f"[fetch] cached: {path}")
             continue
-        print(f"[fetch] downloading {url} -> {path}")
-        urllib.request.urlretrieve(url, path)  # noqa: S310 (explicit opt-in)
+        partial = path.with_suffix(path.suffix + ".part")
+        print(f"[fetch] downloading {spec['url']} -> {path}")
+        try:
+            download_dataset(spec, partial)
+            partial.replace(path)
+        finally:
+            partial.unlink(missing_ok=True)
     print("[fetch] done")
+
+
+def load_snap_cache(path, spec):
+    """Return a validated parsed SNAP cache, or None when it is unusable."""
+    required = {
+        "cache_schema_version",
+        "source_sha256",
+        "src",
+        "dst",
+        "v",
+        "directed",
+    }
+    try:
+        with np.load(path, allow_pickle=False) as cache:
+            if not required.issubset(cache.files):
+                return None
+            schema = int(np.asarray(cache["cache_schema_version"]).item())
+            digest = str(np.asarray(cache["source_sha256"]).item())
+            src = np.asarray(cache["src"])
+            dst = np.asarray(cache["dst"])
+            v = int(np.asarray(cache["v"]).item())
+            directed = bool(np.asarray(cache["directed"]).item())
+    except (EOFError, KeyError, OSError, ValueError):
+        return None
+
+    if schema != SNAP_CACHE_SCHEMA_VERSION or digest != spec["sha256"]:
+        return None
+    if src.dtype != np.uint32 or dst.dtype != np.uint32:
+        return None
+    if src.ndim != 1 or dst.ndim != 1 or src.size != dst.size:
+        return None
+    if src.size != spec["edges"] or v != spec["vertices"]:
+        return None
+    if directed != spec["directed"]:
+        return None
+    if src.size and (int(src.max()) >= v or int(dst.max()) >= v):
+        return None
+    return src, dst, None, v, directed
 
 
 def load_snap(name):
@@ -111,11 +237,18 @@ def load_snap(name):
     Returns None when the dataset was never fetched."""
     gz = DATA_DIR / (name + ".txt.gz")
     npz = DATA_DIR / (name + ".npz")
+    spec = SNAP_DATASETS[name]
     if npz.exists():
-        z = np.load(npz)
-        return z["src"], z["dst"], None, int(z["v"]), bool(z["directed"])
+        cached = load_snap_cache(npz, spec)
+        if cached is not None:
+            return cached
+        if not gz.exists():
+            raise RuntimeError(
+                f"{npz}: invalid or legacy cache; rerun with --fetch"
+            )
     if not gz.exists():
         return None
+    validate_dataset(gz, spec)
     print(f"[load] parsing {gz} (first time; caching .npz)")
     src_l, dst_l = [], []
     with gzip.open(gz, "rt") as f:
@@ -128,8 +261,26 @@ def load_snap(name):
     src = np.asarray(src_l, dtype=np.uint32)
     dst = np.asarray(dst_l, dtype=np.uint32)
     v = int(max(src.max(), dst.max())) + 1
-    directed = name != "com-orkut"
-    np.savez_compressed(npz, src=src, dst=dst, v=v, directed=directed)
+    directed = spec["directed"]
+    if src.size != spec["edges"] or v != spec["vertices"]:
+        raise RuntimeError(
+            f"{gz}: parsed shape does not match the pinned SNAP manifest"
+        )
+    partial = npz.with_suffix(npz.suffix + ".part")
+    try:
+        with partial.open("wb") as stream:
+            np.savez_compressed(
+                stream,
+                cache_schema_version=SNAP_CACHE_SCHEMA_VERSION,
+                source_sha256=spec["sha256"],
+                src=src,
+                dst=dst,
+                v=v,
+                directed=directed,
+            )
+        partial.replace(npz)
+    finally:
+        partial.unlink(missing_ok=True)
     return src, dst, None, v, directed
 
 
@@ -428,12 +579,13 @@ def bench_baselines(name, data, runs, add):
             add(algo, "baseline_rustworkx", nan_stats(),
                 note="not installed")
     else:
-        gr = rx.PyDiGraph() if directed else rx.PyGraph()
-        gr.add_nodes_from(range(v))
-        gr.add_edges_from_no_data(list(zip(src.tolist(), dst.tolist())))
+        gr, rx_weight = build_rustworkx_graph(
+            rx, src, dst, w, v, directed
+        )
         baseline("pagerank", "baseline_rustworkx",
                  lambda: rx.pagerank(gr, alpha=0.85, tol=1e-6,
-                                     max_iter=100))
+                                     max_iter=100, weight_fn=rx_weight),
+                 weighted=w is not None)
         baseline("bfs", "baseline_rustworkx",
                  lambda: rx.bfs_search(gr, [0], rx.visit.BFSVisitor()),
                  source=0)
@@ -447,10 +599,10 @@ def bench_baselines(name, data, runs, add):
             add(algo, "baseline_igraph", nan_stats(),
                 note="not installed")
     else:
-        gi = ig.Graph(n=v, edges=list(zip(src.tolist(), dst.tolist())),
-                      directed=directed)
+        gi, ig_weight = build_igraph_graph(ig, src, dst, w, v, directed)
         baseline("pagerank", "baseline_igraph",
-                 lambda: gi.pagerank(damping=0.85))
+                 lambda: gi.pagerank(damping=0.85, weights=ig_weight),
+                 weighted=w is not None)
         baseline("bfs", "baseline_igraph", lambda: gi.bfs(0), source=0)
         ig_wcc = getattr(gi, "connected_components", None) or gi.clusters
         baseline("wcc", "baseline_igraph", lambda: ig_wcc(mode="weak"))
@@ -472,7 +624,12 @@ def bench_baselines(name, data, runs, add):
                     lo, hi = int(q_offsets[qi]), int(q_offsets[qi + 1])
                     reset[q_seeds[lo:hi]] = q_weights[lo:hi]
                     scores = np.asarray(
-                        gi.personalized_pagerank(damping=0.85, reset=reset))
+                        gi.personalized_pagerank(
+                            damping=0.85,
+                            reset=reset,
+                            weights=ig_weight,
+                        )
+                    )
                     top = np.argpartition(-scores, k_gate - 1)[:k_gate]
                     out.append(top[np.argsort(-scores[top], kind="stable")])
                     reset[q_seeds[lo:hi]] = 0.0
@@ -480,7 +637,38 @@ def bench_baselines(name, data, runs, add):
 
             baseline("ppr_topk", "baseline_igraph_query_loop", ig_ppr_loop,
                      note="B=16 sequential personalized_pagerank + top-64; "
-                          "PRPACK exact solver (no iteration-count control)")
+                          "PRPACK exact solver (no iteration-count control)",
+                     weighted=w is not None)
+
+
+def build_rustworkx_graph(rx, src, dst, weights, v, directed):
+    graph = rx.PyDiGraph() if directed else rx.PyGraph()
+    graph.add_nodes_from(range(v))
+    endpoints = zip(src.tolist(), dst.tolist())
+    if weights is None:
+        graph.add_edges_from_no_data(list(endpoints))
+        weight_fn = None
+    else:
+        graph.add_edges_from([
+            (source, target, float(weight))
+            for (source, target), weight in zip(endpoints, weights)
+        ])
+        weight_fn = float
+    return graph, weight_fn
+
+
+def build_igraph_graph(ig, src, dst, weights, v, directed):
+    graph = ig.Graph(
+        n=v,
+        edges=list(zip(src.tolist(), dst.tolist())),
+        directed=directed,
+    )
+    if weights is None:
+        weight_arg = None
+    else:
+        graph.es["weight"] = weights.astype(np.float64).tolist()
+        weight_arg = "weight"
+    return graph, weight_arg
 
 
 # ---------------------------------------------------------------------------
@@ -526,6 +714,19 @@ def collect_meta(mg, args):
         m = optional_import(pkg)
         versions[pkg] = getattr(m, "__version__", None) if m else \
             "not installed"
+    git_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], capture_output=True, text=True,
+        timeout=10, cwd=BENCH_DIR.parent
+    )
+    git_dirty = subprocess.run(
+        ["git", "status", "--porcelain"], capture_output=True, text=True,
+        timeout=10, cwd=BENCH_DIR.parent
+    )
+    xcode = subprocess.run(
+        ["xcrun", "xcodebuild", "-version"], capture_output=True, text=True,
+        timeout=10
+    )
+    native_module = Path(mg._core.__file__)
     return {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "chip": sysctl("machdep.cpu.brand_string"),
@@ -537,16 +738,30 @@ def collect_meta(mg, args):
         "argv": sys.argv[1:],
         "env": {k: v for k, v in os.environ.items()
                 if k.startswith("MG_")},
+        "git_sha": git_sha.stdout.strip() if git_sha.returncode == 0
+        else "unknown",
+        "git_dirty": bool(git_dirty.stdout.strip())
+        if git_dirty.returncode == 0 else None,
+        "xcode": xcode.stdout.strip() if xcode.returncode == 0 else "unknown",
+        "native_module_sha256": file_sha256(native_module),
+        "snap_datasets": SNAP_DATASETS,
     }
 
 
 def render_markdown(meta, rows):
+    dirty = meta.get("git_dirty")
+    dirty_label = "dirty" if dirty is True else \
+        "clean" if dirty is False else "unknown"
+    git_sha = str(meta.get("git_sha", "unknown"))
+    xcode = str(meta.get("xcode", "unknown"))
     lines = [
         f"# metal-graph bench — {meta['suite']} — {meta['timestamp_utc']}",
         "",
         f"- chip: `{meta['chip']}`  · macOS {meta['macos']} · "
         f"python {meta['python']} · metal_graph "
         f"{meta['versions']['metal_graph']}",
+        f"- source: git `{git_sha[:12]}` ({dirty_label}) · "
+        f"{xcode.splitlines()[0]}",
         "",
         "| dataset | algo | line item | median ms | p95 ms | "
         "peak RSS Δ MB | notes |",
@@ -561,13 +776,31 @@ def render_markdown(meta, rows):
                 if isinstance(val, float):
                     val = f"{val:.4g}"
                 notes.append(f"{k}={val}")
-        med = r.get("median_ms", float("nan"))
-        p95 = r.get("p95_ms", float("nan"))
-        rssd = r.get("peak_rss_delta_mb", float("nan"))
+        med = r.get("median_ms")
+        p95 = r.get("p95_ms")
+        rssd = r.get("peak_rss_delta_mb")
+        med = float("nan") if med is None else med
+        p95 = float("nan") if p95 is None else p95
+        rssd = float("nan") if rssd is None else rssd
         lines.append(f"| {r['dataset']} | {r['algo']} | {r['item']} | "
                      f"{med:.3f} | {p95:.3f} | {rssd:.1f} | "
                      f"{', '.join(notes)} |")
     return "\n".join(lines) + "\n"
+
+
+def json_safe(value):
+    """Replace non-finite floats so benchmark output is strict JSON."""
+    if isinstance(value, (float, np.floating)):
+        return float(value) if np.isfinite(value) else None
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.ndarray):
+        return json_safe(value.tolist())
+    if isinstance(value, dict):
+        return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -633,19 +866,86 @@ def run_contention(mg, args, rows):
           f"{contended['median_ms']:.2f} ms; mlx {tps:.1f} tok/s")
 
 
+@dataclass
+class EnergyCaptureHandle:
+    process: subprocess.Popen
+    output_stream: object
+    output_path: Path | None = None
+
+
 def start_energy_capture(out_path):
-    if os.geteuid() != 0:
-        print("--energy needs powermetrics, which requires sudo.\n"
-              "Politely refusing: rerun as\n"
-              "  sudo PYTHONPATH=python python3 bench/run.py --energy ...\n"
+    if os.geteuid() == 0:
+        print("Refusing to run the benchmark harness as root. Run `sudo -v` "
+              "first, then invoke the harness as your normal user.\n"
               "Methodology: bench/ENERGY.md")
         sys.exit(2)
-    proc = subprocess.Popen(
-        ["powermetrics", "-i", "100",
-         "--samplers", "cpu_power,gpu_power",
-         "-o", str(out_path)],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return proc
+    auth = subprocess.run(
+        ["sudo", "-n", "true"], stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    if auth.returncode != 0:
+        print("--energy needs a current sudo credential for powermetrics.\n"
+              "Run `sudo -v`, then rerun this command without sudo.\n"
+              "Methodology: bench/ENERGY.md")
+        sys.exit(2)
+    output_stream = out_path.open("xb")
+    try:
+        process = subprocess.Popen(
+            [
+                "sudo",
+                "-n",
+                "/usr/bin/powermetrics",
+                "-i",
+                "100",
+                "--samplers",
+                "cpu_power,gpu_power",
+            ],
+            stdout=output_stream,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:
+        output_stream.close()
+        out_path.unlink(missing_ok=True)
+        raise
+    return EnergyCaptureHandle(
+        process=process,
+        output_stream=output_stream,
+        output_path=out_path,
+    )
+
+
+def stop_energy_capture(handle):
+    """Stop sudo, which relays the signal to its powermetrics command."""
+    try:
+        status = handle.process.poll()
+        if status is None:
+            handle.process.terminate()
+            try:
+                handle.process.wait(timeout=30)
+            except subprocess.TimeoutExpired as error:
+                raise RuntimeError(
+                    "powermetrics did not stop after SIGTERM"
+                ) from error
+        elif status != 0:
+            raise RuntimeError(
+                f"powermetrics exited before cleanup with status {status}"
+            )
+    finally:
+        handle.output_stream.close()
+    if (handle.output_path is not None and
+            handle.output_path.stat().st_size == 0):
+        raise RuntimeError("powermetrics produced an empty capture")
+
+
+@contextmanager
+def energy_capture(enabled, out_path):
+    proc = start_energy_capture(out_path) if enabled else None
+    try:
+        yield proc
+    finally:
+        if proc is not None:
+            stop_energy_capture(proc)
 
 
 # ---------------------------------------------------------------------------
@@ -660,7 +960,7 @@ def build_suite(suite):
         # RMAT-24 (V=16.8M, E=268M) is the plan-§10 ship-gate scale point;
         # deliberately NOT in smoke — smoke stays fast.
         datasets.append(("rmat24", lambda: gen_rmat(24)))
-        for name in SNAP_URLS:
+        for name in SNAP_DATASETS:
             datasets.append((name, lambda n=name: load_snap(n)))
     return datasets
 
@@ -687,8 +987,8 @@ def main():
     args = ap.parse_args()
 
     print("SNAP datasets (downloaded only with --fetch):")
-    for name, url in SNAP_URLS.items():
-        print(f"  {name}: {url}")
+    for name, spec in SNAP_DATASETS.items():
+        print(f"  {name}: {spec['url']}")
     if args.fetch:
         fetch_datasets()
 
@@ -703,12 +1003,10 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
-    energy_proc = None
-    idle_window = None
     energy_path = out_dir / f"powermetrics-{stamp}.txt"
-    if args.energy:
-        energy_proc = start_energy_capture(energy_path)
-        if args.idle_seconds > 0:
+    idle_window = None
+    with energy_capture(args.energy, energy_path) as energy_proc:
+        if energy_proc is not None and args.idle_seconds > 0:
             # Idle baseline INSIDE the powermetrics capture, before any
             # workload: its mean package power is what gets subtracted
             # from every line-item window (bench/ENERGY.md). The window
@@ -723,36 +1021,46 @@ def main():
                 "seconds": args.idle_seconds,
             }
 
-    meta = collect_meta(mg, args)
-    if idle_window is not None:
-        meta["energy_idle_window"] = idle_window
-    print(f"\nchip: {meta['chip']} · macOS {meta['macos']} · "
-          f"metal_graph {meta['versions']['metal_graph']}")
+        meta = collect_meta(mg, args)
+        if idle_window is not None:
+            meta["energy_idle_window"] = idle_window
+        print(f"\nchip: {meta['chip']} · macOS {meta['macos']} · "
+              f"metal_graph {meta['versions']['metal_graph']}")
 
-    rows = []
-    METER.mark()  # exclude import/fetch/idle time from the first item
-    pipeline_warm_probe(mg, rows)
-    for name, load in build_suite(args.suite):
-        data = load()
-        if data is None:
-            print(f"\n=== {name}: not fetched — rerun with --fetch ===")
-            rows.append({"dataset": name, "algo": "-", "item": "not_fetched",
-                         "median_ms": float("nan"), "p95_ms": float("nan"),
-                         "runs": 0, "note": "run bench/run.py --fetch"})
-            continue
-        bench_dataset(mg, name, data, args.runs, rows)
+        rows = []
+        METER.mark()  # exclude import/fetch/idle time from the first item
+        pipeline_warm_probe(mg, rows)
+        for name, load in build_suite(args.suite):
+            data = load()
+            if data is None:
+                print(f"\n=== {name}: not fetched — rerun with --fetch ===")
+                rows.append({
+                    "dataset": name,
+                    "algo": "-",
+                    "item": "not_fetched",
+                    "median_ms": float("nan"),
+                    "p95_ms": float("nan"),
+                    "runs": 0,
+                    "note": "run bench/run.py --fetch",
+                })
+                continue
+            bench_dataset(mg, name, data, args.runs, rows)
 
-    if args.contention:
-        run_contention(mg, args, rows)
+        if args.contention:
+            run_contention(mg, args, rows)
 
     if energy_proc is not None:
-        energy_proc.terminate()
-        energy_proc.wait(timeout=30)
         meta["powermetrics_file"] = str(energy_path)
 
-    result = {"meta": meta, "rows": rows}
+    result = {
+        "schema_version": RESULT_SCHEMA_VERSION,
+        "meta": meta,
+        "rows": rows,
+    }
     json_path = out_dir / f"bench-{stamp}.json"
-    json_path.write_text(json.dumps(result, indent=2, default=str))
+    json_path.write_text(
+        json.dumps(json_safe(result), indent=2, allow_nan=False)
+    )
     md = render_markdown(meta, rows)
     md_path = out_dir / f"bench-{stamp}.md"
     md_path.write_text(md)

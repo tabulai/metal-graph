@@ -8,8 +8,9 @@
    this harness on real Apple Silicon hardware.** CI VMs have Metal but
    meaningless performance; they never produce published numbers.
 2. Reporting is **decomposed**: build, transpose, pipeline warm-up, warm
-   kernel execution, convergence audit, top-k selection, and Python
-   boundary overhead are separate line items. A headline number that hides
+   kernel execution, iteration/cadence metadata, top-k selection, and
+   aggregate Python boundary overhead are separate line items. The fp64
+   convergence audit is not timed separately. A headline number that hides
    cold-start or boundary cost is a lie by omission.
 3. Warm kernel cells are **median + p95 over >= 20 runs** (`--runs`,
    default 20). Cold (first-call) numbers are reported separately, never
@@ -45,7 +46,9 @@ PYTHONPATH=python python3 bench/run.py --suite v01 --fetch
 
 Datasets cache under `bench/data/` (`.txt.gz` plus a parsed `.npz`).
 Results land in `bench/results/` as JSON (with chip / macOS / python /
-package versions and all `MG_*` env vars) plus a rendered markdown table.
+package versions, source commit and dirty state, Xcode version, native-module
+SHA-256, the pinned SNAP manifest, and all `MG_*` env vars) plus a rendered
+markdown table. Result files use an explicit schema version and strict JSON.
 
 ## Line items
 
@@ -71,9 +74,11 @@ table shows the peak-RSS delta per line item.
 The v0.1 suite includes `rmat24` (V≈16.8M, E≈268M — the ship-gate scale
 point); smoke deliberately does not, so it stays fast.
 
-The convergence-audit share is visible as the attached iteration counts:
-iterations land on `MG_PR_AUDIT_INTERVAL` boundaries by design, so audit
-overhead = (reported wall − engine ms) plus the overshoot iterations.
+Attached iteration counts expose audit cadence and convergence overshoot:
+iterations land on `MG_PR_AUDIT_INTERVAL` boundaries by design. The harness
+does not separately time the fp64 convergence audit; reported wall minus
+engine time is aggregate boundary overhead and must not be labeled as audit
+time alone.
 
 ## Contention scenario (`--contention`)
 

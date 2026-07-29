@@ -127,6 +127,7 @@ mg_status mg_graph_create_from_coo(const uint32_t* src, const uint32_t* dst,
                                    mg_graph** out_graph) {
   return wrap([&] {
     require(out_graph != nullptr, "out_graph: must not be NULL");
+    *out_graph = nullptr;
     require(num_edges == 0 || (src != nullptr && dst != nullptr),
             "src/dst: must not be NULL when num_edges > 0");
     mg::GraphPtr g = mg::Graph::build(src, dst, weights, num_edges,
@@ -230,8 +231,9 @@ mg_status mg_khop(mg_graph* g, const uint32_t* seeds, uint32_t num_seeds,
     const uint64_t ne = static_cast<uint64_t>(r.edges.size());
     // Capture capacities, then publish the needed counts (also on the
     // capacity-error path, so callers learn the required sizes).
-    const uint32_t cap_v = *inout_num_vertices;
-    const uint64_t cap_e = *inout_num_edges;
+    const uint32_t cap_v =
+        out_vertices != nullptr ? *inout_num_vertices : 0;
+    const uint64_t cap_e = out_edges != nullptr ? *inout_num_edges : 0;
     *inout_num_vertices = nv;
     *inout_num_edges = ne;
     if (out_vertices != nullptr) {

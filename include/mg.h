@@ -16,6 +16,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifndef MG_API
+#if defined(__GNUC__) || defined(__clang__)
+#define MG_API __attribute__((visibility("default")))
+#else
+#define MG_API
+#endif
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -47,63 +55,64 @@ typedef enum mg_direction {
 
 typedef struct mg_graph mg_graph; /* opaque */
 
-const char* mg_version(void);
-const char* mg_last_error_message(void);
+MG_API const char* mg_version(void);
+MG_API const char* mg_last_error_message(void);
 
 /* Global per-operation planner mode (plan §6). */
-mg_status mg_set_execution(mg_exec_mode mode);
+MG_API mg_status mg_set_execution(mg_exec_mode mode);
 
 /* Telemetry for the last operation on this thread: path 0=gpu 1=cpu. */
-mg_status mg_last_run(int* out_path, int* out_iterations, double* out_ms);
+MG_API mg_status mg_last_run(int* out_path, int* out_iterations,
+                            double* out_ms);
 
 /* Build an immutable snapshot from COO. weights may be NULL (unweighted).
  * Duplicate edges and self-loops are kept; non-finite/negative weights
  * rejected. */
-mg_status mg_graph_create_from_coo(const uint32_t* src, const uint32_t* dst,
-                                   const float* weights, uint64_t num_edges,
-                                   uint32_t num_vertices, int directed,
-                                   mg_graph** out_graph);
-void mg_graph_destroy(mg_graph* g);
+MG_API mg_status mg_graph_create_from_coo(
+    const uint32_t* src, const uint32_t* dst, const float* weights,
+    uint64_t num_edges, uint32_t num_vertices, int directed,
+    mg_graph** out_graph);
+MG_API void mg_graph_destroy(mg_graph* g);
 
-mg_status mg_graph_num_vertices(const mg_graph* g, uint32_t* out);
-mg_status mg_graph_num_edges(const mg_graph* g, uint64_t* out);
+MG_API mg_status mg_graph_num_vertices(const mg_graph* g, uint32_t* out);
+MG_API mg_status mg_graph_num_edges(const mg_graph* g, uint64_t* out);
 
 /* Full-vector PageRank. personalization: NULL or finite float[V] (>=0,
  * finite sum>0).
  * out_rank: caller-allocated float[V]. */
-mg_status mg_pagerank(mg_graph* g, double alpha, double tol, int max_iter,
-                      const float* personalization, float* out_rank,
-                      int* out_iterations);
+MG_API mg_status mg_pagerank(mg_graph* g, double alpha, double tol,
+                            int max_iter, const float* personalization,
+                            float* out_rank, int* out_iterations);
 
 /* Batched personalized PageRank with top-k. Queries packed CSR-style:
  * query q owns seeds[offsets[q]..offsets[q+1]). out_ids: int32[B*k]
  * (row-major, -1 padded), out_scores: float[B*k]. Seed weights must be
  * finite and >=0 with a positive sum per query. */
-mg_status mg_ppr_topk(mg_graph* g, const uint32_t* seeds,
-                      const float* seed_weights, const uint64_t* offsets,
-                      uint32_t num_queries, uint32_t k, double alpha,
-                      double tol, int max_iter, int32_t* out_ids,
-                      float* out_scores);
+MG_API mg_status mg_ppr_topk(
+    mg_graph* g, const uint32_t* seeds, const float* seed_weights,
+    const uint64_t* offsets, uint32_t num_queries, uint32_t k, double alpha,
+    double tol, int max_iter, int32_t* out_ids, float* out_scores);
 
 /* Multi-source BFS. out_dist/out_parent: caller-allocated int32[V], -1 for
  * unreachable / no parent. */
-mg_status mg_bfs(mg_graph* g, const uint32_t* sources, uint32_t num_sources,
-                 mg_direction direction, int32_t* out_dist,
-                 int32_t* out_parent);
+MG_API mg_status mg_bfs(mg_graph* g, const uint32_t* sources,
+                        uint32_t num_sources, mg_direction direction,
+                        int32_t* out_dist, int32_t* out_parent);
 
 /* Bounded k-hop. Two-call pattern: pass NULL out buffers to receive counts,
  * then call again with buffers of (at least) that size. Vertices are user
  * indices ascending; edges are original input edge ids ascending.
  * max_vertices/max_edges: 0 = unlimited. */
-mg_status mg_khop(mg_graph* g, const uint32_t* seeds, uint32_t num_seeds,
-                  uint32_t k, mg_direction direction, uint32_t max_vertices,
-                  uint64_t max_edges, uint32_t* out_vertices,
-                  uint32_t* inout_num_vertices, uint32_t* out_edges,
-                  uint64_t* inout_num_edges);
+MG_API mg_status mg_khop(
+    mg_graph* g, const uint32_t* seeds, uint32_t num_seeds, uint32_t k,
+    mg_direction direction, uint32_t max_vertices, uint64_t max_edges,
+    uint32_t* out_vertices, uint32_t* inout_num_vertices,
+    uint32_t* out_edges, uint64_t* inout_num_edges);
 
 /* Weakly connected components (experimental tier, plan §7).
  * out_comp: caller-allocated int32[V]; canonical-partition ids. */
-mg_status mg_wcc(mg_graph* g, int32_t* out_comp, int* out_num_components);
+MG_API mg_status mg_wcc(mg_graph* g, int32_t* out_comp,
+                        int* out_num_components);
 
 #ifdef __cplusplus
 } /* extern "C" */

@@ -87,6 +87,31 @@ def test_pagerank_non_finite_personalization_rejected(bad_weight):
         mg.pagerank(g, personalization=personalization, **PR_KW)
 
 
+@pytest.mark.parametrize(
+    ("parameter", "bad_value"),
+    [
+        ("alpha", np.nan),
+        ("alpha", np.inf),
+        ("alpha", -np.inf),
+        ("alpha", 0.0),
+        ("alpha", 1.0),
+        ("tol", np.nan),
+        ("tol", np.inf),
+        ("tol", -np.inf),
+        ("tol", 0.0),
+        ("tol", -1.0),
+        ("max_iter", 0),
+        ("max_iter", -1),
+    ],
+)
+def test_pagerank_invalid_scalar_rejected(parameter, bad_value):
+    g = build_mg(ALL_CASES["gnp_dir"])
+    options = dict(PR_KW)
+    options[parameter] = bad_value
+    with pytest.raises(ValueError):
+        mg.pagerank(g, **options)
+
+
 @pytest.mark.parametrize("case_name", ["gnp_dir", "adversarial", "dangling"])
 def test_pagerank_deterministic_per_path(case_name, exec_path, assert_path):
     case = ALL_CASES[case_name]

@@ -1,46 +1,60 @@
 # metal-graph
 
+[![CI](https://github.com/tabulai/metal-graph/actions/workflows/ci.yml/badge.svg)](https://github.com/tabulai/metal-graph/actions/workflows/ci.yml)
+
 **A Metal-native graph-analytics engine for Apple Silicon.** v0.1 ships the
 few algorithms that accelerate the most on unified memory: batched
 personalized PageRank with top-k (the flagship), full-vector PageRank,
 direction-optimizing BFS with bounded k-hop extraction, and WCC (shipped
 under `experimental` as the atomics canary).
 
-- Python import: `metal_graph` · C ABI: `include/mg.h` (`mg_` prefix) · MSL
-  kernels: `mg_` prefix · License: Apache-2.0.
-- Requirements: macOS 14+, Apple Silicon (Apple7+/M1 and up), Python 3.10+.
-- Design + rationale: see `docs/` and the v0.1 implementation plan.
+- Python import: `metal_graph` · C ABI: [`include/mg.h`](include/mg.h)
+  (`mg_` prefix) · MSL kernels: `mg_` prefix · License: Apache-2.0.
+- Requirements: macOS 14+, Apple Silicon (Apple7+/M1 and up), CPython
+  3.10–3.13, CMake 3.24+, and Xcode with the Metal compiler.
+- Design + rationale: [v0.1 implementation plan](docs/implementation-plan-v0.1.md).
 
 ## Quick start
 
+Build and install the native extension from a checkout:
+
 ```bash
-cmake -S . -B build && cmake --build build -j
-PYTHONPATH=python python -c "import metal_graph as mg; print(mg.__version__)"
+python3 -m pip install .
+python3 -c "import metal_graph as mg; print(mg.__version__, mg.has_gpu())"
 ```
 
 ```python
-import numpy as np, metal_graph as mg
+import numpy as np
+import metal_graph as mg
 
 # Build once — immutable snapshot. IDs may be any integers or strings;
 # they are mapped to dense indices 0..V-1 ("user indices").
+src = np.array([0, 0, 1, 2], dtype=np.uint32)
+dst = np.array([1, 2, 2, 3], dtype=np.uint32)
 G = mg.Graph.from_edges(src, dst, weights=None, directed=True,
-                        num_vertices=None, ids="auto")
+                        num_vertices=4, ids="auto")
 G.num_vertices, G.num_edges, G.external_ids
 
 # Flagship: batched personalized PageRank with top-k.
+seeds = np.array([0, 2], dtype=np.uint32)
+seed_weights = np.ones(2, dtype=np.float32)
+seed_offsets = np.array([0, 1, 2], dtype=np.uint64)
 ids, scores = mg.ppr_topk(G, seeds, seed_weights, seed_offsets,
-                          k=64, alpha=0.85, tol=1e-6, max_iter=50)
+                          k=4, alpha=0.85, tol=1e-6, max_iter=50)
 # ids: int32 (B, k) user indices (-1 padding), scores: float32 (B, k)
 
 pr = mg.pagerank(G, alpha=0.85, tol=1e-6, max_iter=100, personalization=None)
-dist, parent = mg.bfs(G, sources=[42], direction="out")
-vs, es = mg.k_hop(G, seeds, k=2, direction="both",
+dist, parent = mg.bfs(G, sources=[0], direction="out")
+vs, es = mg.k_hop(G, seeds=[0], k=2, direction="both",
                   max_vertices=None, max_edges=None)
 comp = mg.experimental.wcc(G)
 
 mg.set_execution(mode="auto")   # "auto" | "gpu" | "cpu" (per-operation planner)
 mg.last_run_info()              # {"op", "path": "gpu"|"cpu", "iterations", "ms"}
 ```
+
+Development setup, native tests, wheel validation, C ABI installation, and
+benchmark rules are documented in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Identity model
 
@@ -65,9 +79,9 @@ mg.last_run_info()              # {"op", "path": "gpu"|"cpu", "iterations", "ms"
   teleport/personalization vector every iteration (on the GPU, on-GPU).
   Convergence is `L1(r_new - r_old) < V * tol`, audited in fp64 every 5
   iterations (`MG_PR_AUDIT_INTERVAL`; the default is the measured cadence-
-  sweep winner), so iteration counts land on audit boundaries. `max_iter` is a budget: hitting it returns the current iterate
-  (NetworkX raises instead — documented divergence). Deterministic at fixed
-  iteration count.
+  sweep winner), so iteration counts land on audit boundaries. `max_iter`
+  is a budget: hitting it returns the current iterate (NetworkX raises
+  instead — documented divergence). Deterministic at fixed iteration count.
 * **ppr_topk**: per-query seed weights are normalized (duplicates summed);
   queries are packed into tiles of 8 lanes sharing one `col_indices` stream;
   converged queries are frozen at audit boundaries. Top-k ties break by
@@ -131,77 +145,69 @@ tests/  bench/          golden tests vs NetworkX · benchmark harness
 
 `bench/run.py --suite v01` (physical hardware only; see `bench/README.md`).
 Reporting decomposes build / transpose / pipeline compile / warm kernels /
-convergence audit / top-k / Python boundary, with median+p95 over ≥20 runs.
-Nothing in the README table is asserted — targets come from measurements.
+iteration-count and audit-cadence metadata / top-k / aggregate Python
+boundary overhead, with median+p95 over ≥20 runs. It does not claim a
+separate convergence-audit timer. Nothing in the README table is asserted —
+targets come from measurements.
 
-## First measurements
+## Canonical measurements
 
-Apple M4 Max, macOS 26.2, 2026-07-28, `bench/run.py --suite smoke --runs 20`
-(medians; run `bench-20260728T205737Z` in `bench/results/`, taken with user
-apps closed — all ratios are within-run; this workstation still carries an
-irreducible interactive load (session host, two long-running user Python
-processes), so treat absolute numbers as workstation medians, not tuned-lab
-figures):
+Apple M4 Max, macOS 26.2, 2026-07-29 UTC,
+`bench/run.py --suite smoke --runs 20` (medians; canonical
+[JSON](bench/results/bench-20260729T000207Z.json) and
+[rendered table](bench/results/bench-20260729T000207Z.md)). All ratios are
+within-run; treat absolute numbers as workstation medians, not tuned-lab
+figures. The weighted KG rows pass the same edge weights to metal-graph and
+every gate baseline.
 
-| graph | operation | metal-graph | fastest maintained CPU baseline | ratio |
+| graph | operation | metal-graph | gate baseline (igraph/rustworkx) | ratio |
 |---|---|---:|---:|---:|
-| RMAT-18 (V=262k, E=4.2M) | PageRank warm (5 iters, 137 GB/s) | 1.5 ms | rustworkx 296 · igraph 365 | **204×** |
-| RMAT-18 | `ppr_topk` B=16, k=64 | 6.9 ms | igraph query loop 6 292 | **908×** |
-| RMAT-18 | BFS single-source | 1.4 ms | igraph 23.7 | **18×** |
-| RMAT-18 | WCC | 3.0 ms | igraph 120.0 | **40×** |
-| KG-shape (V=100k, E=2M, weighted) | PageRank warm (15 iters, 114 GB/s) | 2.4 ms | igraph 30.6 | **13×** |
-| KG-shape | `ppr_topk` B=16, k=64 (20 iters) | 10.3 ms | igraph query loop 571 | **55×** |
-| KG-shape | BFS single-source (tiny component) | 0.9 ms | rustworkx 0.05 | 0.06× |
-| KG-shape | WCC | 3.9 ms | igraph 13.4 | **3.5×** |
+| RMAT-18 (V=262k, E=4.2M) | PageRank warm (5 iters, 130 GB/s) | 1.53 ms | rustworkx 298.13 | **195×** |
+| RMAT-18 | `ppr_topk` B=16, k=64 | 8.93 ms | igraph query loop 5 856.59 | **656×** |
+| RMAT-18 | BFS single-source | 1.28 ms | igraph 24.89 | **19.5×** |
+| RMAT-18 | WCC | 2.99 ms | igraph 120.39 | **40.3×** |
+| KG-shape (V=100k, E=2M, weighted) | PageRank warm (15 iters, 87 GB/s) | 3.17 ms | igraph 36.95 | **11.6×** |
+| KG-shape | `ppr_topk` B=16, k=64 (20 iters) | 15.28 ms | igraph query loop 645.47 | **42.3×** |
+| KG-shape | BFS single-source (tiny component) | 0.95 ms | rustworkx 0.046 | 0.05× |
+| KG-shape | WCC | 4.17 ms | igraph 14.04 | **3.37×** |
 
-Three performance passes closed the first run's gaps:
+Three implementation passes addressed the first run's largest gaps:
 
 1. **Huge-bin edge tiling** (plan-§11 CSR-tiling fallback): the synthetic KG
    puts 44% of all in-edges on ONE vertex, which serialized on a single
    threadgroup. Degree ≥ 16 384 vertices now decompose into fixed 16k-edge
    tiles across many threadgroups (deterministic two-pass gather; tiled WCC
-   hook). KG PageRank: 26.4 → 2.2 ms (11.9 → 134 GB/s); WCC: 16.8 → 3.8 ms.
+   hook).
 2. **GPU radix-select top-k** (the plan-M3 item, no longer deferred): a
    per-lane MSB-first histogram refinement finds the k-th-largest score's
    bit pattern, a compaction pass collects the ≥-threshold candidates, and
    a tiny exact host sort applies the (score desc, user asc) tie rule —
    bit-identical to the CPU oracle, which stays behind the same API
    (`MG_GPU_TOPK=0`, automatic fallback on degenerate tie floods and tiny
-   graphs). KG batch: 13.7 → 10.1 ms; selection line item 3.4 → 0.8 ms.
+   graphs).
 
-3. **Audit-cadence tuning** (plan-M4 threshold sweep): convergence is only
-   observable at audit boundaries, so the boundary spacing controls wasted
-   post-convergence iterations. An interleaved load-controlled A/B across
-   `MG_PR_AUDIT_INTERVAL` ∈ {2..8} made 5 the winner on BOTH canonical
-   shapes — KG's slowest lanes converge by ~20 (24 → 20 iterations vs
-   interval 8) and RMAT-18's queries by ~5 (8 → 5) — worth a controlled
-   ~4% on the KG batch and ~12% on RMAT-18 (7.4 ms, 0.46 ms/query, run
-   `bench-20260728T201931Z`). Default changed to 5; env still overrides.
+3. **Audit-cadence tuning**: convergence is observable only at audit
+   boundaries, so boundary spacing controls overshoot. The default is 5;
+   the canonical artifact records the resulting iteration counts, while
+   `MG_PR_AUDIT_INTERVAL` remains available for repeatable local sweeps.
 
 Gate assessment (plan §8, honest):
 
-* **PPR gate**: ≥5× the igraph per-query loop — **met** on both shapes
-  (55× / 908×; caveat: igraph solves via PRPACK, an exact solver with no
-  iteration-count control). The **amortized ≤0.7 ms/query target is met**
-  (0.65 ms KG, 0.43 ms RMAT-18). The absolute ≤10 ms KG batch target is
-  **not certified on this machine**: official medians span 10.06–10.34
-  across today's windows, including 10.34 with user apps closed. The
-  optimization stack took the batch 96.5 → 10.3 ms (9.3×); what remains is
-  ≥90% fp32 power iteration (20 iterations to tol=1e-6 on this shape) plus
-  the workstation's irreducible interactive load (an A/B-controlled
-  fixed-work anchor varied ~1.4× across today's windows — larger than the
-  3% gap). Killing all competing CPU load did not help and the day's KG
-  gather throughput declined monotonically across benchmark sessions
-  (134 → 114 → 104 GB/s) while load was being *removed* — consistent with
-  sustained-load GPU clock/thermal state after hours of continuous
-  benching, not contention. A cold dedicated runner (plan §9's
-  physical-perf-host requirement) is the credible way to read this number;
-  an inferred quiet-window value is ≈9.7 ms.
-* **Primary ≥2× gate**: met on **7 of 8** workload×algorithm cells
-  (2.9×–678×). The one standing failure: BFS from a tiny reachable component
-  loses to CPU baselines — the per-operation planner keys on graph size, but
-  BFS cost tracks *traversal* size, which no per-op planner can know in
-  advance (v0.2: first-frontier fallback).
+* **PPR relative-speed sub-gate**: ≥5× the igraph per-query loop — **met**
+  on both shapes (42.3× / 656×; caveat: igraph uses PRPACK, an exact solver
+  without matching iteration-count control). The **amortized ≤0.7
+  ms/query target is met on RMAT-18** (0.56 ms) but not the KG shape (0.95
+  ms). The complete PPR gate remains **open**: the canonical KG batch is
+  15.28 ms against the ≤10 ms target, and identical-iteration comparison is
+  unavailable with this igraph solver.
+* **Primary ≥2× speed sub-gate**: met on **7 of 8**
+  workload×algorithm cells (3.37×–656×). The one failure is BFS from a tiny
+  reachable component, which loses to CPU baselines because graph size does
+  not predict traversal size (v0.2: first-frontier fallback).
+* **Broader ship gate**: still open pending the full SNAP/RMAT suite,
+  contention and end-to-end agent-workflow evidence, a provisioned physical
+  benchmark runner, and resolution or explicit waiver of the PPR/BFS misses
+  above.
 
 ## Status
 

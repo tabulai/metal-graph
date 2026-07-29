@@ -49,7 +49,6 @@ def _both(fn):
 
 def test_scale_bins_populated(big_graph):
     # The premise of this module: high/mid/low bins all non-empty.
-    core = big_graph._core_graph if hasattr(big_graph, "_core_graph") else None
     # (bin sizes aren't exposed; the degree distribution is the proxy)
     counts = np.bincount(
         np.asarray(big_graph._src_ext, dtype=np.int64), minlength=V)

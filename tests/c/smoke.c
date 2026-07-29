@@ -1,5 +1,5 @@
-// smoke.cpp — C-ABI smoke test. Uses include/mg.h ONLY; makes no GPU
-// assertions so it passes under MG_FORCE_CPU=1 (CI runs it that way too).
+// smoke.c — C-ABI smoke test. Uses include/mg.h ONLY; makes no GPU
+// assertions, so it can also run under MG_FORCE_CPU=1.
 // SPDX-License-Identifier: Apache-2.0
 #include <math.h>
 #include <stdint.h>
@@ -20,6 +20,30 @@ static void check(int cond, const char* what) {
 int main(void) {
   check(strcmp(mg_version(), "0.1.0") == 0, "mg_version is 0.1.0");
   check(mg_set_execution(MG_EXEC_AUTO) == MG_OK, "set_execution(auto)");
+
+  /* Oversized edge counts must fail before the core reads edge pointers. */
+  {
+    const uint32_t dummy = 0;
+    mg_graph* too_large = NULL;
+    check(mg_graph_create_from_coo(&dummy, &dummy, NULL, UINT64_MAX, 1, 1,
+                                   &too_large) == MG_INVALID_ARGUMENT,
+          "oversized edge count rejected");
+    check(too_large == NULL, "oversized graph handle remains null");
+  }
+
+  /* Every non-finite graph weight must be rejected through the public ABI. */
+  {
+    const uint32_t one_edge = 0;
+    const float bad_weights[3] = {NAN, INFINITY, -INFINITY};
+    int i;
+    for (i = 0; i < 3; ++i) {
+      mg_graph* invalid = NULL;
+      check(mg_graph_create_from_coo(&one_edge, &one_edge, &bad_weights[i], 1,
+                                     1, 1, &invalid) == MG_INVALID_ARGUMENT,
+            "non-finite graph weight rejected");
+      check(invalid == NULL, "invalid graph handle remains null");
+    }
+  }
 
   /* 10 vertices, 11 directed edges; vertex 9 has no out-edges (dangling).
    *   0->1 0->2 1->2 2->3 3->4 4->5 5->6 6->7 7->8 8->9 1->9            */
@@ -125,8 +149,9 @@ int main(void) {
    * induced input edge ids {0,1,2} (1->9 excluded: 9 unreached) */
   {
     const uint32_t seeds[1] = {0};
-    uint32_t n_vs = 0;
-    uint64_t n_es = 0;
+    /* Deliberately uninitialized: the count-only call must only write them. */
+    uint32_t n_vs;
+    uint64_t n_es;
     uint32_t vs[3], es[3];
     check(mg_khop(g, seeds, 1, 1, MG_DIR_OUT, 0, 0, NULL, &n_vs, NULL,
                   &n_es) == MG_OK,
