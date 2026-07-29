@@ -28,7 +28,6 @@ import resource
 import statistics
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.request
 from collections import deque
@@ -837,9 +836,7 @@ def run_contention(mg, args, rows):
 @dataclass
 class EnergyCaptureHandle:
     process: subprocess.Popen
-    control_fd: int
-    control_fifo: Path
-    control_dir: Path
+    output_stream: object
 
 
 def start_energy_capture(out_path):
@@ -857,70 +854,44 @@ def start_energy_capture(out_path):
               "Run `sudo -v`, then rerun this command without sudo.\n"
               "Methodology: bench/ENERGY.md")
         sys.exit(2)
-    control_dir = Path(tempfile.mkdtemp(prefix="metal-graph-energy-"))
-    control_fifo = control_dir / "stop"
-    os.mkfifo(control_fifo, mode=0o600)
-    control_fd = os.open(control_fifo, os.O_RDWR | os.O_NONBLOCK)
-    script = """
-/usr/bin/powermetrics -i 100 --samplers cpu_power,gpu_power -o "$1" &
-child=$!
-cleanup() {
-  /bin/kill -TERM "$child" 2>/dev/null
-  wait "$child" 2>/dev/null
-}
-trap cleanup EXIT HUP INT TERM
-IFS= read -r _ < "$2"
-/bin/kill -TERM "$child" 2>/dev/null
-(
-  sleep 10
-  /bin/kill -KILL "$child" 2>/dev/null
-) &
-watchdog=$!
-wait "$child" 2>/dev/null
-/bin/kill -TERM "$watchdog" 2>/dev/null
-wait "$watchdog" 2>/dev/null
-trap - EXIT HUP INT TERM
-exit 0
-"""
+    output_stream = out_path.open("xb")
     try:
         process = subprocess.Popen(
             [
                 "sudo",
                 "-n",
-                "/bin/sh",
-                "-c",
-                script,
-                "metal-graph-energy",
-                str(out_path),
-                str(control_fifo),
+                "/usr/bin/powermetrics",
+                "-i",
+                "100",
+                "--samplers",
+                "cpu_power,gpu_power",
             ],
-            stdout=subprocess.DEVNULL,
+            stdout=output_stream,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
     except Exception:
-        os.close(control_fd)
-        control_fifo.unlink(missing_ok=True)
-        control_dir.rmdir()
+        output_stream.close()
+        out_path.unlink(missing_ok=True)
         raise
     return EnergyCaptureHandle(
         process=process,
-        control_fd=control_fd,
-        control_fifo=control_fifo,
-        control_dir=control_dir,
+        output_stream=output_stream,
     )
 
 
 def stop_energy_capture(handle):
-    """Signal the root wrapper over its pre-authorized control channel."""
+    """Stop sudo, which relays the signal to its powermetrics command."""
     try:
         if handle.process.poll() is None:
-            os.write(handle.control_fd, b"stop\n")
-            handle.process.wait(timeout=30)
+            handle.process.terminate()
+            try:
+                handle.process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                handle.process.terminate()
+                handle.process.wait(timeout=10)
     finally:
-        os.close(handle.control_fd)
-        handle.control_fifo.unlink(missing_ok=True)
-        handle.control_dir.rmdir()
+        handle.output_stream.close()
 
 
 @contextmanager

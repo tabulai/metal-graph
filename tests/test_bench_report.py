@@ -1,6 +1,6 @@
 import hashlib
+import io
 import json
-import os
 
 import numpy as np
 import pytest
@@ -138,15 +138,17 @@ def test_energy_capture_stops_on_exception(monkeypatch, tmp_path):
     assert stopped == [process]
 
 
-def test_energy_stop_uses_pre_authorized_control_channel(
-    monkeypatch, tmp_path
-):
+def test_energy_stop_does_not_need_a_second_sudo(monkeypatch):
     class FakeProcess:
         waited = False
+        terminated = False
 
         @staticmethod
         def poll():
             return None
+
+        def terminate(self):
+            self.terminated = True
 
         def wait(self, timeout):
             assert timeout == 30
@@ -159,21 +161,53 @@ def test_energy_stop_uses_pre_authorized_control_channel(
             "shutdown must not require a fresh sudo credential"
         ),
     )
-    control_dir = tmp_path / "energy-control"
-    control_dir.mkdir()
-    control_fifo = control_dir / "stop"
-    os.mkfifo(control_fifo, mode=0o600)
-    control_fd = os.open(control_fifo, os.O_RDWR | os.O_NONBLOCK)
     process = FakeProcess()
+    output_stream = io.BytesIO()
     handle = bench_run.EnergyCaptureHandle(
         process=process,
-        control_fd=control_fd,
-        control_fifo=control_fifo,
-        control_dir=control_dir,
+        output_stream=output_stream,
     )
     bench_run.stop_energy_capture(handle)
+    assert process.terminated
     assert process.waited
-    assert not control_dir.exists()
+    assert output_stream.closed
+
+
+def test_energy_start_elevates_only_fixed_powermetrics(
+    monkeypatch, tmp_path
+):
+    command = []
+
+    class Result:
+        returncode = 0
+
+    class FakeProcess:
+        @staticmethod
+        def poll():
+            return 0
+
+    monkeypatch.setattr(bench_run.os, "geteuid", lambda: 501)
+    monkeypatch.setattr(
+        bench_run.subprocess, "run", lambda *args, **kwargs: Result()
+    )
+
+    def fake_popen(args, **kwargs):
+        command.extend(args)
+        assert kwargs["stdout"].name == str(tmp_path / "power.txt")
+        return FakeProcess()
+
+    monkeypatch.setattr(bench_run.subprocess, "Popen", fake_popen)
+    handle = bench_run.start_energy_capture(tmp_path / "power.txt")
+    assert command == [
+        "sudo",
+        "-n",
+        "/usr/bin/powermetrics",
+        "-i",
+        "100",
+        "--samplers",
+        "cpu_power,gpu_power",
+    ]
+    bench_run.stop_energy_capture(handle)
 
 
 def weighted_fixture():

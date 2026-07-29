@@ -14,11 +14,11 @@ sudo -v
 PYTHONPATH=python python3 bench/run.py --suite smoke --energy
 ```
 
-Only a minimal control wrapper and `powermetrics` are elevated; the
-benchmark, Python environment, and repository code never run as root. The
-wrapper listens on a user-owned one-shot control channel, so cleanup does
-not depend on the sudo timestamp still being valid after a long run. The
-raw sample stream is written to
+Only the fixed `/usr/bin/powermetrics` command is elevated; the benchmark,
+Python environment, repository code, and output-file creation remain under
+the normal user. Cleanup signals the original `sudo` process, which relays
+the signal to `powermetrics`, so it does not depend on the sudo timestamp
+still being valid after a long run. The raw sample stream is written to
 `bench/results/powermetrics-<stamp>.txt` and its path recorded in the result
 JSON.
 
