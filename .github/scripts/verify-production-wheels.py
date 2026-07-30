@@ -259,16 +259,30 @@ def validate_metallib(
         f"extra={sorted(actual_kernels - expected_kernels)}",
     )
 
-    deployment_targets = {
-        target.decode("ascii")
-        for target in re.findall(
-            rb"air64_v[0-9]+-apple-macosx([0-9]+\.[0-9]+\.[0-9]+)",
-            metallib,
-        )
-    }
+    private_headers = command(
+        "xcrun",
+        "metal-objdump",
+        "--metallib",
+        "--private-headers",
+        str(metallib_path),
+    )
+    # Xcode renders single-byte integer fields as control characters.
+    normalized_headers = private_headers.replace("\x00", "0").replace(
+        "\x01", "1"
+    )
+    header_fields = {}
+    for line in normalized_headers.splitlines():
+        if ":" in line:
+            key, value = line.split(":", 1)
+            header_fields[key.strip()] = value.strip()
     require(
-        deployment_targets == {"14.0.0"},
-        f"{wheel}: Metal AIR targets are {sorted(deployment_targets)}",
+        header_fields.get("MacOSTarget") == "1"
+        and header_fields.get("Platform") == "MACOS"
+        and header_fields.get("PlatformMajor") == "14"
+        and header_fields.get("PlatformMinor") == "0"
+        and header_fields.get("PlatformUpdate") == "0"
+        and header_fields.get("Arch64Bit") == "1",
+        f"{wheel}: unexpected Metal library target header {header_fields}",
     )
     return hashlib.sha256(metallib).hexdigest()
 
