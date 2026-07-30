@@ -128,12 +128,6 @@ jobs:
               --expect cpu \
               --project-root "$GITHUB_WORKSPACE" \
               --require-macos-major 14
-            env -u PYTHONPATH -u MG_FORCE_CPU -u MG_METALLIB MG_REQUIRE_GPU=1 \
-              "$proof_python" -I \
-              "$GITHUB_WORKSPACE/tests/wheel_smoke.py" \
-              --expect gpu \
-              --project-root "$GITHUB_WORKSPACE" \
-              --require-macos-major 14
             env -u PYTHONPATH "$proof_python" -I -m pip check
           } 2>&1 | tee \
             "$GITHUB_WORKSPACE/wheel-provenance/macos14-runtime-proof.txt"
@@ -155,10 +149,71 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+  gpu-smoke:
+    name: >-
+      CPython ${{ matrix.python_version }} / macOS 15 / arm64 / forced GPU
+    needs: macos-arm64
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python_version: "3.10"
+            python_tag: cp310
+          - python_version: "3.11"
+            python_tag: cp311
+          - python_version: "3.12"
+            python_tag: cp312
+          - python_version: "3.13"
+            python_tag: cp313
+          - python_version: "3.14"
+            python_tag: cp314
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python_version }}
+
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: metal-graph-wheels-${{ github.sha }}
+          path: release-artifact
+
+      - name: Install and exercise the forced-GPU path
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "arm64"
+          test "$(sw_vers -productVersion | cut -d. -f1)" = "15"
+          proof_root="$RUNNER_TEMP/metal-graph-${{ matrix.python_tag }}-gpu"
+          python -m venv "$proof_root/venv"
+          proof_python="$proof_root/venv/bin/python"
+          wheels=(
+            release-artifact/wheelhouse/*-${{ matrix.python_tag }}-${{ matrix.python_tag }}-macosx_14_0_arm64.whl
+          )
+          test "${#wheels[@]}" -eq 1
+          wheel_path="$PWD/${wheels[0]}"
+          cd "$proof_root"
+          env -u PYTHONPATH "$proof_python" -I -m pip install \
+            --only-binary=:all: "$wheel_path"
+          env -u PYTHONPATH -u MG_FORCE_CPU -u MG_METALLIB MG_REQUIRE_GPU=1 \
+            "$proof_python" -I \
+            "$GITHUB_WORKSPACE/tests/wheel_smoke.py" \
+            --expect gpu \
+            --project-root "$GITHUB_WORKSPACE" \
+            --require-macos-major 15
+          env -u PYTHONPATH "$proof_python" -I -m pip check
+
   publish-testpypi:
     name: Publish wheels to TestPyPI
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: macos-arm64
+    needs: gpu-smoke
     runs-on: ubuntu-24.04
     environment:
       name: testpypi
@@ -178,10 +233,10 @@ jobs:
           repository-url: https://test.pypi.org/legacy/
 
   smoke-testpypi:
-    name: Install from TestPyPI on macOS 14
+    name: Install from TestPyPI with CPU and GPU
     if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: publish-testpypi
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     permissions:
       contents: read
@@ -199,7 +254,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(uname -m)" = "arm64"
-          test "$(sw_vers -productVersion | cut -d. -f1)" = "14"
+          test "$(sw_vers -productVersion | cut -d. -f1)" = "15"
           project_version="$(
             python -c \
               'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])'
@@ -228,13 +283,13 @@ jobs:
             "$GITHUB_WORKSPACE/tests/wheel_smoke.py" \
             --expect cpu \
             --project-root "$GITHUB_WORKSPACE" \
-            --require-macos-major 14
+            --require-macos-major 15
           env -u PYTHONPATH -u MG_FORCE_CPU -u MG_METALLIB MG_REQUIRE_GPU=1 \
             "$proof_python" -I \
             "$GITHUB_WORKSPACE/tests/wheel_smoke.py" \
             --expect gpu \
             --project-root "$GITHUB_WORKSPACE" \
-            --require-macos-major 14
+            --require-macos-major 15
           env -u PYTHONPATH "$proof_python" -I -m pip check
 
   publish-pypi:
@@ -259,10 +314,10 @@ jobs:
           packages-dir: release-artifact/wheelhouse/
 
   smoke-pypi:
-    name: Install from PyPI on macOS 14
+    name: Install from PyPI with CPU and GPU
     if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: publish-pypi
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     permissions:
       contents: read
@@ -280,7 +335,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(uname -m)" = "arm64"
-          test "$(sw_vers -productVersion | cut -d. -f1)" = "14"
+          test "$(sw_vers -productVersion | cut -d. -f1)" = "15"
           project_version="$(
             python -c \
               'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])'
@@ -306,11 +361,11 @@ jobs:
             "$GITHUB_WORKSPACE/tests/wheel_smoke.py" \
             --expect cpu \
             --project-root "$GITHUB_WORKSPACE" \
-            --require-macos-major 14
+            --require-macos-major 15
           env -u PYTHONPATH -u MG_FORCE_CPU -u MG_METALLIB MG_REQUIRE_GPU=1 \
             "$proof_python" -I \
             "$GITHUB_WORKSPACE/tests/wheel_smoke.py" \
             --expect gpu \
             --project-root "$GITHUB_WORKSPACE" \
-            --require-macos-major 14
+            --require-macos-major 15
           env -u PYTHONPATH "$proof_python" -I -m pip check

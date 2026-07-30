@@ -57,9 +57,11 @@ its metadata and RECORD hashes, bundled licenses, embedded README, arm64
 Mach-O and macOS 14 minimum, Apple-only dynamic dependencies, code signature,
 and the complete embedded Metal kernel library. cibuildwheel then installs
 each wheel outside the checkout with `PYTHONPATH` unset, runs strict Twine and
-`pip check`, and exercises both forced-CPU and forced-GPU operations. The
-workflow deliberately requires an arm64 machine actually running macOS 14;
-losing access to that runner blocks a release rather than weakening the gate.
+`pip check`, and exercises the forced-CPU path on an arm64 machine actually
+running macOS 14. GitHub's Sonoma runner does not expose a Metal device, so a
+separate CPython 3.10–3.14 matrix installs those same wheels on macOS 15 Apple
+Silicon and requires the GPU path for every interpreter. Losing either runtime
+blocks a release rather than weakening the gate.
 
 ## Releasing
 
@@ -72,12 +74,14 @@ After the release changes have passed pull-request checks and landed on
 `main`, push that exact tag (for example, `v0.1.0`). The production-wheel
 workflow then:
 
-1. builds and validates all five wheels on macOS 14 Apple Silicon;
-2. publishes those same artifacts to TestPyPI;
-3. installs the TestPyPI wheel on macOS 14 and exercises CPU and forced-GPU
+1. builds, validates, and CPU-smoke-tests all five wheels on macOS 14 Apple
+   Silicon;
+2. installs every wheel on macOS 15 Apple Silicon and requires GPU execution;
+3. publishes those same artifacts to TestPyPI;
+4. installs the TestPyPI wheel and exercises CPU and forced-GPU
    operations;
-4. publishes to PyPI only after that smoke test succeeds; and
-5. repeats the installation and runtime checks from PyPI.
+5. publishes to PyPI only after that smoke test succeeds; and
+6. repeats the installation and runtime checks from PyPI.
 
 Do not rerun a partially published release with altered artifacts or use
 `skip-existing`. If a release fails after any upload, diagnose the existing

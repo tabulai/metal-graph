@@ -20,9 +20,10 @@ All notable changes to metal-graph are documented here.
   Apple-only linkage, code-signature, and embedded-Metal validation. Every
   wheel is now installed outside the repository with `PYTHONPATH` unset,
   checked by pip and strict Twine rendering, and exercised through forced CPU
-  and GPU operations on an actual macOS 14 Apple Silicon runner. Complete
-  notices for the statically linked nanobind runtime and its bundled
-  robin-map dependency are included.
+  operations on actual macOS 14 Apple Silicon plus forced GPU operations for
+  every interpreter on macOS 15 Apple Silicon. Complete notices for the
+  statically linked nanobind runtime and its bundled robin-map dependency are
+  included.
 - Made `pyproject.toml` the single source of truth for the package, Python
   extension, and C API version; CMake now generates the public version header.
 - Enforced native Apple Silicon/arm64 source builds at host, requested-target,

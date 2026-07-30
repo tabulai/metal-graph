@@ -95,7 +95,6 @@ test-command = [
   'env -u PYTHONPATH python -I -m pip check',
   'env -u PYTHONPATH python -I -m twine check --strict "{wheel}"',
   'env -u PYTHONPATH -u MG_REQUIRE_GPU -u MG_METALLIB MG_FORCE_CPU=1 python -I "{package}/tests/wheel_smoke.py" --expect cpu --project-root "{package}" --require-macos-major 14',
-  'env -u PYTHONPATH -u MG_FORCE_CPU -u MG_METALLIB MG_REQUIRE_GPU=1 python -I "{package}/tests/wheel_smoke.py" --expect gpu --project-root "{package}" --require-macos-major 14',
 ]
 test-environment = { PYTHONSAFEPATH = "1" }
 
