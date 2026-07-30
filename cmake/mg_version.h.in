@@ -1,0 +1,10 @@
+/* Generated from [project].version in pyproject.toml. Do not edit. */
+#ifndef MG_VERSION_H
+#define MG_VERSION_H
+
+#define MG_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define MG_VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define MG_VERSION_PATCH @PROJECT_VERSION_PATCH@
+#define MG_VERSION_STRING "@PROJECT_VERSION@"
+
+#endif

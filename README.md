@@ -37,27 +37,33 @@ It is particularly useful for:
   wheels, and GPU-required jobs.
 
 The main interface is Python (`metal_graph`, with NumPy input and output).
-A stable C API is available in [`include/mg.h`](include/mg.h).
+A stable C API is available in
+[`include/mg.h`](https://github.com/tabulai/metal-graph/blob/main/include/mg.h),
+but it is not
+bundled into the Python wheel; install it separately from source with CMake.
 
 ## Requirements
 
 - macOS 14 or newer
 - Apple Silicon with an M1 or newer
 - CPython 3.10–3.14
-- CMake 3.24 or newer
-- Xcode with the Metal compiler
+
+Installing a prebuilt wheel does not require a compiler. Building from source,
+including installing the C API, additionally requires CMake 3.24 or newer and
+Xcode with the Metal compiler.
 
 ## Install
 
-From the repository root:
+Install the prebuilt wheel from PyPI:
 
 ```bash
-python3 -m pip install .
+python3 -m pip install metal-graph
 python3 -c "import metal_graph as mg; print(mg.__version__, mg.has_gpu())"
 ```
 
-Development builds, native tests, wheel validation, and C API installation
-are covered in [CONTRIBUTING.md](CONTRIBUTING.md).
+No compiler or Metal setup is needed for the wheel. Source builds, development
+setup, native tests, wheel validation, and C API installation are covered in
+[CONTRIBUTING.md](https://github.com/tabulai/metal-graph/blob/main/CONTRIBUTING.md).
 
 ## Quick start
 
@@ -121,7 +127,9 @@ mg.set_execution("auto")       # "auto", "gpu", or "cpu"
 mg.last_run_info()             # op, path, iterations, and engine time
 ```
 
-The [`notebooks/`](notebooks/) directory contains complete examples for the
+The
+[`notebooks/`](https://github.com/tabulai/metal-graph/tree/main/notebooks)
+directory contains complete examples for the
 core API, batched PPR retrieval, and low-latency BFS.
 
 ## Available operations
@@ -145,7 +153,8 @@ Most cells come from source commit `a4a8bc`; the HippoRAG PPR cell marked ²
 comes from the isolated artifact at source commit `7afb4b2`. metal-graph
 cells are medians of 20 warm calls. External baselines generally use four
 timed calls after one warm-up, with additional samples for sub-2 ms BFS
-measurements. The full [benchmark report](docs/benchmark-report-2026-07-29.md)
+measurements. The full
+[benchmark report](https://github.com/tabulai/metal-graph/blob/main/docs/benchmark-report-2026-07-29.md)
 contains p95 values, package versions, and methodology.
 
 ### metal-graph latency
@@ -221,8 +230,10 @@ measured 1.905 ms versus rustworkx at 50.058 ms (26.3×).
 
 ² **Isolated HippoRAG PPR measurement.** The displayed values come from a
 clean-process, 20-run artifact:
-[JSON](bench/results/bench-20260729T201007Z.json) ·
-[rendered report](bench/results/bench-20260729T201007Z.md). It measured
+[JSON](https://github.com/tabulai/metal-graph/blob/main/bench/results/bench-20260729T201007Z.json)
+·
+[rendered report](https://github.com/tabulai/metal-graph/blob/main/bench/results/bench-20260729T201007Z.md).
+It measured
 10.707 ms per batch (p95 10.922), or 0.669 ms/query. That meets the
 0.7 ms/query objective and misses the 10 ms batch objective by 7%.
 
@@ -243,10 +254,13 @@ adapter but needs a new physical rerun. SciPy and NetworkX comparisons remain
 in the full artifacts and benchmark report.
 
 The Orkut results have a strict checked-in
-[JSON](bench/results/bench-20260729T131101Z-orkut-bounded.json) and
-[rendered-report](bench/results/bench-20260729T131101Z-orkut-bounded.md)
+[JSON](https://github.com/tabulai/metal-graph/blob/main/bench/results/bench-20260729T131101Z-orkut-bounded.json)
+and
+[rendered report](https://github.com/tabulai/metal-graph/blob/main/bench/results/bench-20260729T131101Z-orkut-bounded.md)
 pair. Completed rows for RMAT-18 through LiveJournal were reconstructed from
-the [preserved run log](bench/results/bench-20260729-full-partial.log) and
+the
+[preserved run log](https://github.com/tabulai/metal-graph/blob/main/bench/results/bench-20260729-full-partial.log)
+and
 remain provisional. The original run was interrupted before its final JSON
 was written; LiveJournal's contextual PPR comparison did not complete.
 
@@ -307,7 +321,9 @@ shallow traversals responsive while reducing host round-trips on deep graphs.
 External integer or string IDs are mapped to dense user indices in
 `np.unique` order. Algorithm inputs and outputs use those user indices.
 Use `G.index_of(ids)` to map external IDs to indices and
-`G.external_ids[index]` to map back.
+`G.external_ids[index]` to map back. `G.external_ids` returns a detached,
+read-only NumPy snapshot, so changing a caller-owned copy cannot alter the
+graph's ID mapping.
 
 Graphs are immutable after construction. Duplicate edges and self-loops are
 kept, and PageRank counts them. Non-finite or negative weights are rejected.
@@ -363,7 +379,9 @@ boundaries. Top-k ties are resolved by ascending user index.
 `bench/run.py --suite v01` runs the full matrix against igraph, rustworkx,
 SciPy, and NetworkX. It uses synthetic RMAT and knowledge-graph-shaped data
 plus SHA-pinned SNAP datasets, which are downloaded only with `--fetch`.
-See [`bench/README.md`](bench/README.md) for commands and artifact format.
+See the
+[benchmark guide](https://github.com/tabulai/metal-graph/blob/main/bench/README.md)
+for commands and artifact format.
 
 New published performance claims require a matched, checked-in JSON and
 rendered-report pair from a physical run. The disclosed exception is the
@@ -372,11 +390,11 @@ has a matched pair for the later full-suite values.
 
 ## Project resources
 
-- [Example notebooks](notebooks/)
-- [Benchmark guide](bench/README.md)
-- [Contribution and development guide](CONTRIBUTING.md)
-- [C API](include/mg.h)
-- [v0.1 implementation and design rationale](docs/implementation-plan-v0.1.md)
+- [Example notebooks](https://github.com/tabulai/metal-graph/tree/main/notebooks)
+- [Benchmark guide](https://github.com/tabulai/metal-graph/blob/main/bench/README.md)
+- [Contribution and development guide](https://github.com/tabulai/metal-graph/blob/main/CONTRIBUTING.md)
+- [C API](https://github.com/tabulai/metal-graph/blob/main/include/mg.h)
+- [v0.1 implementation and design rationale](https://github.com/tabulai/metal-graph/blob/main/docs/implementation-plan-v0.1.md)
 
 ## Roadmap
 
@@ -387,6 +405,9 @@ longer-term candidates.
 
 ## License
 
-Apache-2.0 ([LICENSE](LICENSE)). The vendored
-[metal-cpp](third_party/metal-cpp/) library is Apache-2.0, © Apple Inc.; see
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Apache-2.0
+([LICENSE](https://github.com/tabulai/metal-graph/blob/main/LICENSE)). The
+vendored
+[metal-cpp](https://github.com/tabulai/metal-graph/tree/main/third_party/metal-cpp)
+library is Apache-2.0, © Apple Inc.; see
+[THIRD_PARTY_NOTICES.md](https://github.com/tabulai/metal-graph/blob/main/THIRD_PARTY_NOTICES.md).

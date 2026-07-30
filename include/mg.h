@@ -16,6 +16,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "mg_version.h"
+
 #ifndef MG_API
 #if defined(__GNUC__) || defined(__clang__)
 #define MG_API __attribute__((visibility("default")))
@@ -27,10 +29,6 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-#define MG_VERSION_MAJOR 0
-#define MG_VERSION_MINOR 1
-#define MG_VERSION_PATCH 0
 
 typedef enum mg_status {
   MG_OK = 0,

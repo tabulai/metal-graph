@@ -4,6 +4,33 @@ All notable changes to metal-graph are documented here.
 
 ## Unreleased
 
+## 0.1.0 — 2026-07-29
+
+- Added tag-only Trusted Publishing through isolated GitHub environments.
+  Release tags now build and validate once, publish the exact artifacts to
+  TestPyPI, install and exercise them on macOS 14 Apple Silicon, then publish
+  to PyPI and repeat the installation, CPU, and forced-GPU smoke tests.
+- Added production cibuildwheel builds for interpreter-specific CPython
+  3.10–3.14 wheels on macOS 14/arm64 only. Wheel builds now omit the standalone
+  C library and native test executables, use a pinned build toolchain, verify
+  binary deployment metadata, and retain Xcode, SDK, CMake, nanobind, and
+  scikit-build-core provenance with the artifacts. abi3, non-arm64, and
+  non-macOS variants remain deferred.
+- Strengthened release artifacts with per-wheel metadata, RECORD, license,
+  Apple-only linkage, code-signature, and embedded-Metal validation. Every
+  wheel is now installed outside the repository with `PYTHONPATH` unset,
+  checked by pip and strict Twine rendering, and exercised through forced CPU
+  and GPU operations on an actual macOS 14 Apple Silicon runner. Complete
+  notices for the statically linked nanobind runtime and its bundled
+  robin-map dependency are included.
+- Made `pyproject.toml` the single source of truth for the package, Python
+  extension, and C API version; CMake now generates the public version header.
+- Enforced native Apple Silicon/arm64 source builds at host, requested-target,
+  and compiler-target levels.
+- Made `Graph.external_ids` a detached, read-only NumPy snapshot so callers
+  cannot reach and invalidate the immutable graph's internal ID mapping.
+- Enabled GitHub private vulnerability reporting and corrected the security
+  policy to use the private advisory form.
 - Added `bench/run.py --dataset` for isolated single-dataset runs with
   unchanged artifact provenance, and checked in the isolated HippoRAG KG
   re-measurement (`bench-20260729T201007Z`): PPR B=16 batch 10.707 ms /
@@ -48,8 +75,6 @@ All notable changes to metal-graph are documented here.
   baseline predates the equivalent-work harness semantics. Removed
   unpublished candidate timings and clarified that documentation performance
   claims require a matched, checked-in JSON and rendered report.
-
-## 0.1.0 — 2026-07-28
 
 - Added Metal-native PageRank, batched personalized PageRank with top-k,
   direction-optimizing BFS, bounded k-hop extraction, and experimental WCC.

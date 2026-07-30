@@ -6,6 +6,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "metal-graph"
+# Single release-version source; numeric X.Y.Z is the project policy.
 version = "0.1.0"
 description = "Metal-native graph analytics for Apple Silicon"
 authors = [{ name = "TabulAI" }]
@@ -14,6 +15,8 @@ license = "Apache-2.0"
 license-files = [
   "LICENSE",
   "third_party/metal-cpp/LICENSE.txt",
+  "third_party/nanobind/LICENSE.txt",
+  "third_party/nanobind/robin_map/LICENSE.txt",
   "THIRD_PARTY_NOTICES.md",
 ]
 requires-python = ">=3.10,<3.15"
@@ -62,6 +65,43 @@ build-dir = "build/{wheel_tag}"
 # macosx_26_0 (uninstallable on supported macOS 14/15) while the binary's
 # real floor is 14.0.
 cmake.define.CMAKE_OSX_DEPLOYMENT_TARGET = "14.0"
+cmake.define.CMAKE_OSX_ARCHITECTURES = "arm64"
+# A wheel contains only the Python extension. The standalone C library and
+# native test executables remain available from normal CMake builds.
+cmake.define.MG_BUILD_TESTS = "OFF"
+
+[tool.cibuildwheel]
+# Deliberately narrow release matrix: standard CPython on Apple Silicon only.
+# abi3, Intel, universal2, Linux, Windows, PyPy, and free-threaded builds are
+# deferred. Keep the identifiers explicit so a new cibuildwheel default cannot
+# silently broaden the supported platform set.
+build = """
+cp310-macosx_arm64
+cp311-macosx_arm64
+cp312-macosx_arm64
+cp313-macosx_arm64
+cp314-macosx_arm64
+"""
+build-frontend = { name = "build", args = ["--no-isolation"] }
+build-verbosity = 1
+dependency-versions = "pinned"
+before-build = [
+  'python -m pip install --requirement "{package}/.github/wheel-build-requirements.txt"',
+  'bash "{package}/.github/scripts/record-wheel-environment.sh" "{package}/wheel-provenance/${CIBUILDWHEEL_BUILD_IDENTIFIER}.txt" "{package}"',
+]
+test-requires = ["twine==7.0.0", "readme-renderer[md]==45.0"]
+test-command = [
+  'env -u PYTHONPATH python -I -m pip install --force-reinstall --no-deps --only-binary=:all: "{wheel}"',
+  'env -u PYTHONPATH python -I -m pip check',
+  'env -u PYTHONPATH python -I -m twine check --strict "{wheel}"',
+  'env -u PYTHONPATH -u MG_REQUIRE_GPU -u MG_METALLIB MG_FORCE_CPU=1 python -I "{package}/tests/wheel_smoke.py" --expect cpu --project-root "{package}" --require-macos-major 14',
+  'env -u PYTHONPATH -u MG_FORCE_CPU -u MG_METALLIB MG_REQUIRE_GPU=1 python -I "{package}/tests/wheel_smoke.py" --expect gpu --project-root "{package}" --require-macos-major 14',
+]
+test-environment = { PYTHONSAFEPATH = "1" }
+
+[tool.cibuildwheel.macos]
+archs = ["arm64"]
+environment = { MACOSX_DEPLOYMENT_TARGET = "14.0" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -85,13 +85,7 @@ mg::BfsDir bfs_dir(mg_direction d) {
 
 extern "C" {
 
-#define MG_STR2(x) #x
-#define MG_STR(x) MG_STR2(x)
-
-const char* mg_version(void) {
-  return MG_STR(MG_VERSION_MAJOR) "." MG_STR(MG_VERSION_MINOR) "." MG_STR(
-      MG_VERSION_PATCH);
-}
+const char* mg_version(void) { return MG_VERSION_STRING; }
 
 const char* mg_last_error_message(void) { return t_last_error.c_str(); }
 
