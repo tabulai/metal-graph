@@ -7,12 +7,11 @@ branch.
 
 ## Reporting
 
-Do not disclose suspected vulnerabilities outside the private repository.
-Open a [private repository issue labeled `security`](https://github.com/tabulai/metal-graph/issues/new?labels=security)
-and include reproduction steps, affected versions, and the expected impact.
-You should receive an initial response within seven days. Private
-vulnerability reporting must be enabled before this repository is ever made
-public.
+Do not open a public issue for a suspected vulnerability. Use
+[GitHub's private vulnerability reporting form](https://github.com/tabulai/metal-graph/security/advisories/new)
+to send the report privately to the maintainers. Include reproduction steps,
+affected versions, and the expected impact. You should receive an initial
+response within seven days.
 
 Never include credentials, private datasets, or personally identifiable
 information in a report or reproduction.

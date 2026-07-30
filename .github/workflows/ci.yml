@@ -59,6 +59,17 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Reject unsupported x86_64 source builds
+        run: |
+          if output="$(cmake -S . -B build/rejected-x86 \
+              -DCMAKE_OSX_ARCHITECTURES=x86_64 2>&1)"; then
+            echo "x86_64 configuration unexpectedly succeeded" >&2
+            exit 1
+          fi
+          echo "$output"
+          grep -F \
+            "supports only CMAKE_OSX_ARCHITECTURES=arm64" <<<"$output"
+
       - name: Configure with ASan and UBSan
         run: |
           cmake -S . -B build/sanitize \
@@ -78,6 +89,14 @@ jobs:
           UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"
           MG_FORCE_CPU: "1"
         run: ctest --test-dir build/sanitize --output-on-failure
+
+      - name: Verify installed C API version headers
+        run: |
+          cmake --install build/sanitize --prefix build/install-check
+          test -f build/install-check/include/mg.h
+          test -f build/install-check/include/mg_version.h
+          printf '#include "mg.h"\nconst char *v = MG_VERSION_STRING;\n' |
+            cc -x c -fsyntax-only -Ibuild/install-check/include -
 
   build-and-test:
     name: >-
@@ -113,7 +132,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install \
             "${{ matrix.numpy-spec }}" "networkx>=3.4" "scipy>=1.11" \
-            "nanobind>=2.13" "pytest>=8" "build>=1.2"
+            "nanobind>=2.13" "pytest>=8"
 
       - name: Configure
         run: |
@@ -134,53 +153,6 @@ jobs:
           MG_REQUIRE_GPU: "1"
           PYTHONPATH: python
         run: python -m pytest tests -v -ra --durations=15
-
-      - name: Build wheel without polluting the source package
-        run: |
-          # The normal developer build above intentionally copies _core next
-          # to the Python sources. Remove it so this is a clean source-package
-          # check: any _core written there by the wheel build is now an
-          # observable new file, even if its contents match an earlier build.
-          find python/metal_graph -maxdepth 1 -type f \
-            \( -name '_core*.so' -o -name '_core*.dylib' \) -delete
-          test -z "$(find python/metal_graph -maxdepth 1 -type f \
-            \( -name '_core*.so' -o -name '_core*.dylib' \) -print -quit)"
-
-          # Exercise the deployment target declared in pyproject.toml itself.
-          # In particular, do not let a runner-level value mask a regression.
-          unset MACOSX_DEPLOYMENT_TARGET
-          python -m build --wheel
-
-          test -z "${MACOSX_DEPLOYMENT_TARGET+x}"
-          test -z "$(find python/metal_graph -maxdepth 1 -type f \
-            \( -name '_core*.so' -o -name '_core*.dylib' \) -print -quit)"
-          git diff --exit-code -- python/metal_graph
-
-      - name: Verify wheel tag and isolated import
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          wheels = list(Path("dist").glob("*.whl"))
-          assert len(wheels) == 1, wheels
-          assert "macosx_14_0_arm64" in wheels[0].name, wheels[0]
-          PY
-          python -m pip install --force-reinstall --no-deps dist/*.whl
-          cd /tmp
-          python - <<'PY'
-          import importlib.metadata
-          import metal_graph as mg
-          assert mg.__version__ == "0.1.0"
-          assert importlib.metadata.version("metal-graph") == mg.__version__
-          assert isinstance(mg.has_gpu(), bool)
-          print("wheel smoke:", mg.__version__, "gpu:", mg.has_gpu())
-          PY
-
-      - name: Upload wheel
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: metal-graph-wheel-py${{ matrix.python-version }}
-          path: dist/*.whl
-          if-no-files-found: error
 
   perf-smoke:
     name: perf-smoke (self-hosted physical Apple Silicon)

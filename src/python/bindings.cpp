@@ -21,6 +21,7 @@
 #include "../engines/bfs_batch_schedule.hpp"
 #include "../graph/graph.hpp"
 #include "../runtime/runtime.hpp"
+#include "mg_version.h"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -336,7 +337,7 @@ nb::dict debug_bfs_batch_schedule(uint32_t vertex_count, uint32_t max_levels,
 
 NB_MODULE(_core, m) {
   m.doc() = "metal-graph core bindings (dense user-index space)";
-  m.attr("__version__") = "0.1.0";
+  m.attr("__version__") = MG_VERSION_STRING;
 
   nb::register_exception_translator([](const std::exception_ptr& p, void*) {
     try {
@@ -391,5 +392,5 @@ NB_MODULE(_core, m) {
         "max_batches"_a = 8);
   m.def("has_gpu", [] { return mg::Runtime::instance().has_gpu(); },
         nb::call_guard<nb::gil_scoped_release>());
-  m.def("version", [] { return "0.1.0"; });
+  m.def("version", [] { return MG_VERSION_STRING; });
 }

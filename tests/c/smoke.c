@@ -18,7 +18,8 @@ static void check(int cond, const char* what) {
 }
 
 int main(void) {
-  check(strcmp(mg_version(), "0.1.0") == 0, "mg_version is 0.1.0");
+  check(strcmp(mg_version(), MG_VERSION_STRING) == 0,
+        "mg_version matches MG_VERSION_STRING");
   check(mg_set_execution(MG_EXEC_AUTO) == MG_OK, "set_execution(auto)");
 
   /* Oversized edge counts must fail before the core reads edge pointers. */

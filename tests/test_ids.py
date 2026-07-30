@@ -25,6 +25,45 @@ def test_int64_sparse_ids_roundtrip():
     np.testing.assert_array_equal(ext[dst_idx], dst)
 
 
+def test_external_ids_is_a_detached_read_only_snapshot_in_both_id_modes():
+    factorized = mg.Graph.from_edges(
+        np.array([30, 10], dtype=np.int64),
+        np.array([20, 30], dtype=np.int64),
+        directed=True,
+    )
+    identity = mg.Graph.from_edges(
+        np.array([0, 1], dtype=np.uint32),
+        np.array([1, 2], dtype=np.uint32),
+        directed=True,
+        num_vertices=5,
+    )
+
+    for graph in (factorized, identity):
+        external_ids = graph.external_ids
+        original = external_ids.copy()
+
+        assert external_ids.flags.writeable is False
+        assert external_ids.base is None
+        with pytest.raises(ValueError):
+            external_ids[0] = external_ids[-1]
+
+        # Owning NumPy arrays can have their write flag re-enabled. Even then,
+        # this detached result must not expose the graph's internal mapping.
+        external_ids.setflags(write=True)
+        external_ids[0] = external_ids[-1]
+
+        np.testing.assert_array_equal(graph.external_ids, original)
+        np.testing.assert_array_equal(
+            graph.index_of(original), np.arange(graph.num_vertices)
+        )
+
+        metadata_view = graph.external_ids
+        original_dtype = metadata_view.dtype
+        metadata_view.shape = (1, graph.num_vertices)
+        assert graph.external_ids.shape == (graph.num_vertices,)
+        assert graph.external_ids.dtype == original_dtype
+
+
 def test_int64_sparse_ids_algorithms_use_user_indices():
     # The same topology under sparse int64 ids and dense identity ids must
     # produce identical results after mapping through index_of.

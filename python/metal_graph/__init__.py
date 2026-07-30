@@ -19,7 +19,7 @@ except ImportError as _exc:
 
 from ._ids import factorize, index_in_sorted
 
-__version__ = "0.1.0"
+__version__ = _core.__version__
 
 __all__ = [
     "Graph",
@@ -95,6 +95,7 @@ class Graph:
     def _wrap(cls, core, external_ids, identity, src_ext, dst_ext, weights):
         self = object.__new__(cls)
         self._g = core
+        external_ids.setflags(write=False)
         self._external_ids = external_ids
         self._identity = identity
         # Kept for k_hop(as_graph=True): input edge id -> external endpoints.
@@ -195,7 +196,10 @@ class Graph:
 
     @property
     def external_ids(self):
-        return self._external_ids
+        """Detached, read-only snapshot of the graph's external IDs."""
+        external_ids = self._external_ids.copy()
+        external_ids.setflags(write=False)
+        return external_ids
 
     def index_of(self, ids):
         """Map external IDs back to user indices (scalar or array)."""
