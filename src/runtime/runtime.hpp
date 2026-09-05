@@ -48,7 +48,7 @@ enum class ExecPath : int { gpu = 0, cpu = 1 };
 struct RunInfo {
   std::string op;
   ExecPath path = ExecPath::cpu;
-  int iterations = 0;   // pagerank/wcc rounds; bfs levels
+  int iterations = 0;   // pagerank/HITS/WCC rounds; BFS levels
   double elapsed_ms = 0.0;
 };
 

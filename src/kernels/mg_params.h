@@ -388,6 +388,10 @@ typedef struct MGScanParams {
 // mg_fill_f32 — b0 MGFillParams; b1 dst (float)
 // mg_fill_u32 — b0 MGFillParams; b1 dst (uint32)
 // mg_iota_u32 — b0 MGFillParams; b1 dst (uint32)   dst[i] = i
+// mg_scale_f32_by_scalar — b0 MGFillParams (count); b1 values (float, count);
+//   b2 norm (const float, 1); values[i] /= norm[0]. A non-positive or
+//   non-finite norm writes zeros so the host can surface a deterministic
+//   degenerate-iteration error after the command batch completes.
 //
 // ======================= BFS (frontier.metal) ===============================
 // Shared buffers across the level loop (bound to every BFS kernel in this

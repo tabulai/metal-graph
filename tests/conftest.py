@@ -3,8 +3,10 @@
 #
 # Tests are written AGAINST the documented API (README.md and
 # src/algos/algos.hpp) — they are the acceptance bar for the implementation.
-# NetworkX is the only golden oracle. Everything here must COLLECT without
-# metal_graph installed: the module is imported lazily via
+# NetworkX is the primary external golden oracle. Narrow independent NumPy
+# recurrences are also used when duplicate-edge or audit-boundary semantics
+# are not directly representable by a NetworkX call. Everything here must
+# COLLECT without metal_graph installed: the module is imported lazily via
 # pytest.importorskip inside fixtures/helpers.
 #
 # All fixture graphs use identity-mode ids (integer ids 0..V-1 with
@@ -15,6 +17,7 @@ import os
 # Tests assume the documented default audit interval (5); pin before any
 # metal_graph import (conftest is imported before every test module).
 os.environ.setdefault("MG_PR_AUDIT_INTERVAL", "5")
+os.environ.setdefault("MG_HITS_AUDIT_INTERVAL", "5")
 
 import dataclasses
 import subprocess
@@ -39,6 +42,7 @@ def pytest_configure(config):
 def _audit_interval_guard():
     # Session guard: keep the documented default in place for every test.
     os.environ.setdefault("MG_PR_AUDIT_INTERVAL", "5")
+    os.environ.setdefault("MG_HITS_AUDIT_INTERVAL", "5")
     yield
 
 

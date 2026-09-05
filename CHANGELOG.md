@@ -4,6 +4,16 @@ All notable changes to metal-graph are documented here.
 
 ## Unreleased
 
+## 0.1.1 — 2026-09-04
+
+- Added Metal-native HITS hub/authority centrality with a threaded fp64 CPU
+  fallback, L1 normalization on-device, Python and C APIs, execution
+  telemetry, and forced CPU/GPU correctness coverage. Edge weights are
+  intentionally ignored; parallel edges retain their structural weight.
+- Added a focused, accuracy-gated HITS benchmark against the matching CPU
+  path, SciPy, NetworkX, rustworkx, and python-igraph, with graph setup and
+  warm algorithm timings reported separately.
+
 ## 0.1.0 — 2026-07-29
 
 - Added tag-only Trusted Publishing through isolated GitHub environments.

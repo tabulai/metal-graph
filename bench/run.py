@@ -5,8 +5,9 @@ Decomposed, honest reporting: build / transpose / pipeline warm / warm
 kernels / convergence iteration metadata / top-k / Python boundary are
 separate line items; every kernel cell is median + p95 over >= --runs runs.
 Baselines
-(NetworkX, SciPy, pure-python BFS, rustworkx/igraph BFS/WCC/PageRank when
-installed) are context, never the gate. Every line item carries
+(NetworkX, SciPy, pure-python BFS, and rustworkx/igraph when installed) are
+context, never the gate. HITS baselines must also pass a post-hoc score
+agreement check before a speedup ratio is emitted. Every line item carries
 t_start_utc/t_end_utc (powermetrics window alignment, bench/ENERGY.md) and
 peak-RSS bracketing; pagerank warm runs carry a modeled achieved_gb_s.
 Numbers belong in docs ONLY when they came from a physical run of this
@@ -14,6 +15,7 @@ script. See bench/README.md.
 
 Usage:
   PYTHONPATH=python python3 bench/run.py --suite smoke
+  PYTHONPATH=python python3 bench/run.py --suite smoke --algorithm hits
   PYTHONPATH=python python3 bench/run.py --suite v01 --fetch
 """
 
@@ -71,6 +73,10 @@ SNAP_DATASETS = {
 # NetworkX baseline caps (context only; keeps the loop sane)
 NX_MAX_EDGES = 2_500_000
 PY_BFS_MAX_EDGES = 5_000_000
+HITS_ABS_L1_TARGET = 1e-5
+HITS_MAX_ITER = 100
+HITS_MATCH_L1_TOL = 5e-3
+HITS_MATCH_MAX_ABS_TOL = 5e-5
 
 
 # ---------------------------------------------------------------------------
@@ -419,7 +425,7 @@ def stats_ms(fn, runs, warmup=2):
     samples.sort()
     p95 = samples[min(len(samples) - 1, int(round(0.95 * len(samples))) - 1)]
     return {"median_ms": statistics.median(samples), "p95_ms": p95,
-            "min_ms": samples[0], "runs": runs}
+            "min_ms": samples[0], "runs": runs, "samples_ms": samples}
 
 
 def optional_import(name):
@@ -487,7 +493,247 @@ def make_queries(v, batch=16, max_seeds=5, seed=3):
             np.asarray(offsets, dtype=np.uint64))
 
 
-def bench_dataset(mg, name, data, runs, rows):
+def normalized_hits_arrays(result, v):
+    """Convert a native HITS result to two sign-stable L1 arrays."""
+    if len(result) != 2:
+        raise ValueError("HITS result must contain hubs and authorities")
+
+    def dense(values):
+        if hasattr(values, "keys"):
+            out = np.fromiter(
+                (values[i] for i in range(v)), dtype=np.float64, count=v
+            )
+        else:
+            out = np.asarray(values, dtype=np.float64).reshape(-1).copy()
+        if out.size != v:
+            raise ValueError(f"HITS result has {out.size} values, expected {v}")
+        total = float(out.sum(dtype=np.float64))
+        # Eigen/SVD solvers may choose the negative representative of the
+        # same one-dimensional eigenspace. Make that sign ambiguity explicit.
+        if total < 0.0:
+            out *= -1.0
+            total *= -1.0
+        if not np.isfinite(total) or total <= 0.0:
+            raise ValueError("HITS result has a non-positive or non-finite sum")
+        out /= total
+        return out
+
+    return dense(result[0]), dense(result[1])
+
+
+def validate_hits_l1_output(result, v, *, atol=5e-5):
+    """Reject malformed native HITS output before scale-invariant comparison."""
+    if len(result) != 2:
+        raise ValueError("HITS result must contain hubs and authorities")
+    contract = {}
+    for name, values in zip(("hubs", "authorities"), result):
+        out = np.asarray(values, dtype=np.float64).reshape(-1)
+        if out.size != v:
+            raise ValueError(f"HITS {name} has {out.size} values, expected {v}")
+        if not np.isfinite(out).all() or np.min(out, initial=0.0) < -1e-7:
+            raise ValueError(f"HITS {name} is not finite and nonnegative")
+        total = float(out.sum(dtype=np.float64))
+        if not np.isclose(total, 1.0, rtol=0.0, atol=atol):
+            raise ValueError(
+                f"HITS {name} is not L1-normalized: sum={total!r}"
+            )
+        contract[f"raw_{name}_l1_norm"] = total
+    return contract
+
+
+def hits_agreement(reference, candidate, v):
+    """Return accuracy fields used to admit a baseline to speedup claims."""
+    ref_h, ref_a = normalized_hits_arrays(reference, v)
+    got_h, got_a = normalized_hits_arrays(candidate, v)
+    hub_l1 = float(np.abs(ref_h - got_h).sum(dtype=np.float64))
+    auth_l1 = float(np.abs(ref_a - got_a).sum(dtype=np.float64))
+    hub_max = float(np.max(np.abs(ref_h - got_h), initial=0.0))
+    auth_max = float(np.max(np.abs(ref_a - got_a), initial=0.0))
+    finite_nonnegative = bool(
+        np.isfinite(got_h).all()
+        and np.isfinite(got_a).all()
+        and np.min(got_h, initial=0.0) >= -1e-7
+        and np.min(got_a, initial=0.0) >= -1e-7
+    )
+    matches = bool(
+        finite_nonnegative
+        and hub_l1 <= HITS_MATCH_L1_TOL
+        and auth_l1 <= HITS_MATCH_L1_TOL
+        and hub_max <= HITS_MATCH_MAX_ABS_TOL
+        and auth_max <= HITS_MATCH_MAX_ABS_TOL
+    )
+    return {
+        "hub_l1_error": hub_l1,
+        "authority_l1_error": auth_l1,
+        "hub_max_abs_error": hub_max,
+        "authority_max_abs_error": auth_max,
+        "matches_reference": matches,
+        "match_criteria": (
+            f"L1<={HITS_MATCH_L1_TOL:g}, "
+            f"max_abs<={HITS_MATCH_MAX_ABS_TOL:g}"
+        ),
+    }
+
+
+def build_structural_adjacency(scipy_sparse, src, dst, v, directed):
+    """Build A for structural HITS, retaining multiplicity as values."""
+    rows = src.astype(np.int64, copy=False)
+    cols = dst.astype(np.int64, copy=False)
+    if not directed:
+        reverse = rows != cols
+        rows = np.concatenate([rows, cols[reverse]])
+        cols = np.concatenate([cols, src.astype(np.int64, copy=False)[reverse]])
+    adjacency = scipy_sparse.csr_matrix(
+        (np.ones(rows.size, dtype=np.float64), (rows, cols)),
+        shape=(v, v),
+    )
+    adjacency.sum_duplicates()
+    return adjacency
+
+
+def make_scipy_hits_runner(adjacency, tol, max_iter, audit_interval):
+    """Exact metal-graph recurrence over prebuilt SciPy CSR matrices."""
+    outgoing = adjacency.tocsr()
+    incoming = outgoing.T.tocsr()
+    v = outgoing.shape[0]
+    state = {"iterations": 0}
+
+    def run():
+        hubs = np.full(v, 1.0 / v, dtype=np.float64)
+        authorities = np.empty(v, dtype=np.float64)
+        previous = np.empty(v, dtype=np.float64)
+        done = 0
+        while done < max_iter:
+            authorities = np.asarray(incoming @ hubs)
+            authorities /= authorities.sum(dtype=np.float64)
+            previous[:] = hubs
+            hubs = np.asarray(outgoing @ authorities)
+            hubs /= hubs.sum(dtype=np.float64)
+            done += 1
+            audit = done % audit_interval == 0 or done == max_iter
+            if audit and np.abs(hubs - previous).sum() < v * tol:
+                break
+        state["iterations"] = done
+        return hubs, authorities
+
+    return run, state
+
+
+def bench_hits(mg, graph, runs, add):
+    """Measure time-to-accuracy on forced CPU and Metal execution paths."""
+    v = graph.num_vertices
+    options = {
+        "tol": HITS_ABS_L1_TARGET / max(v, 1),
+        "max_iter": HITS_MAX_ITER,
+    }
+    iteration_unit = (
+        "one authority update (A^T*h) plus one hub update (A*a), "
+        "including both L1 normalizations"
+    )
+    common = {
+        "tol": options["tol"],
+        "absolute_l1_target": HITS_ABS_L1_TARGET,
+        "max_iter": options["max_iter"],
+        "normalization": "l1",
+        "edge_weights": "ignored",
+        "iteration_unit": iteration_unit,
+        "cold_scope": (
+            "first HITS call on a prepared graph; process runtime and "
+            "reverse CSR are already warm"
+        ),
+    }
+
+    try:
+        mg.set_execution("cpu")
+        cpu_cold, cpu_result = timed(lambda: mg.hits(graph, **options))
+        cpu_timed_result = None
+
+        def run_cpu():
+            nonlocal cpu_timed_result
+            cpu_timed_result = mg.hits(graph, **options)
+            return cpu_timed_result
+
+        cpu_stats = stats_ms(run_cpu, runs)
+        cpu_info = mg.last_run_info()
+        if cpu_info["path"] != "cpu":
+            raise RuntimeError(f"forced CPU HITS reported {cpu_info!r}")
+        cpu_contract = validate_hits_l1_output(cpu_timed_result, v)
+        add(
+            "hits", "baseline_metal_cpu", cpu_stats, cold_ms=cpu_cold,
+            iterations=cpu_info["iterations"], path=cpu_info["path"],
+            engine_ms=cpu_info["ms"], solver="threaded fp64 recurrence",
+            eligible_for_speedup=True, **cpu_contract, **common,
+        )
+
+        if not mg.has_gpu():
+            add(
+                "hits", "warm_full_run",
+                {"median_ms": float("nan"), "p95_ms": float("nan"),
+                 "runs": 0},
+                note="no Metal device", eligible_for_speedup=False,
+                **common,
+            )
+            return {
+                "options": options,
+                "reference": cpu_result,
+                "gpu_median_ms": None,
+                "audit_interval": max(
+                    int(os.environ.get("MG_HITS_AUDIT_INTERVAL", "5")), 1
+                ),
+            }
+
+        mg.set_execution("gpu")
+        gpu_cold, gpu_result = timed(lambda: mg.hits(graph, **options))
+        gpu_timed_result = None
+
+        def run_gpu():
+            nonlocal gpu_timed_result
+            gpu_timed_result = mg.hits(graph, **options)
+            return gpu_timed_result
+
+        gpu_stats = stats_ms(run_gpu, runs)
+        gpu_info = mg.last_run_info()
+        if gpu_info["path"] != "gpu":
+            raise RuntimeError(f"forced GPU HITS reported {gpu_info!r}")
+        gpu_contract = validate_hits_l1_output(gpu_timed_result, v)
+        agreement = hits_agreement(cpu_timed_result, gpu_timed_result, v)
+        if not agreement["matches_reference"]:
+            raise RuntimeError(
+                "GPU HITS failed CPU agreement: " + repr(agreement)
+            )
+        cpu_speedup = cpu_stats["median_ms"] / gpu_stats["median_ms"]
+        add(
+            "hits", "warm_full_run", gpu_stats, cold_ms=gpu_cold,
+            iterations=gpu_info["iterations"], path=gpu_info["path"],
+            engine_ms=gpu_info["ms"], solver="Metal fp32 recurrence",
+            speedup_vs_metal_cpu=cpu_speedup,
+            eligible_for_speedup=True, **gpu_contract, **agreement, **common,
+        )
+        iterations = max(gpu_info["iterations"], 1)
+        add(
+            "hits", "per_iteration",
+            {
+                "median_ms": gpu_stats["median_ms"] / iterations,
+                "p95_ms": gpu_stats["p95_ms"] / iterations,
+                "min_ms": gpu_stats["min_ms"] / iterations,
+                "runs": runs,
+            },
+            iterations=iterations, path="gpu", iteration_unit=iteration_unit,
+        )
+        return {
+            "options": options,
+            "reference": cpu_timed_result,
+            "gpu_median_ms": gpu_stats["median_ms"],
+            "gpu_iterations": gpu_info["iterations"],
+            "audit_interval": max(
+                int(os.environ.get("MG_HITS_AUDIT_INTERVAL", "5")), 1
+            ),
+        }
+    finally:
+        mg.set_execution("auto")
+
+
+def bench_dataset(mg, name, data, runs, rows, hits_only=False):
     src, dst, w, v, directed = data
     e = len(src)
     out_degree = stored_out_degrees(src, dst, v, directed)
@@ -520,6 +766,13 @@ def bench_dataset(mg, name, data, runs, rows):
         {"median_ms": max(first - second, 0.0), "p95_ms": float("nan"),
          "runs": 1}, first_call_ms=first, second_call_ms=second)
 
+    if hits_only:
+        hits_context = bench_hits(mg, g, runs, add)
+        bench_baselines(
+            name, data, runs, add, hits_context, only_hits=True
+        )
+        return g
+
     # -- pagerank --------------------------------------------------------
     pr_kw = dict(alpha=0.85, tol=1e-6, max_iter=100)
     cold, _ = timed(lambda: mg.pagerank(g, **pr_kw))
@@ -547,6 +800,9 @@ def bench_dataset(mg, name, data, runs, rows):
         {"median_ms": st["median_ms"] / iters,
          "p95_ms": st["p95_ms"] / iters, "runs": runs},
         iterations=iters)
+
+    # -- HITS ------------------------------------------------------------
+    hits_context = bench_hits(mg, g, runs, add)
 
     # -- ppr_topk (flagship: B=16, k=64) ---------------------------------
     seeds, weights, offsets = make_queries(v, batch=16)
@@ -642,37 +898,186 @@ def bench_dataset(mg, name, data, runs, rows):
                                    max_edges=1_000_000), runs)
     add("k_hop", "warm_k2_capped", st)
 
-    bench_baselines(name, data, runs, add)
+    bench_baselines(name, data, runs, add, hits_context)
     return g
 
 
-def bench_baselines(name, data, runs, add):
+def bench_baselines(
+    name, data, runs, add, hits_context=None, only_hits=False
+):
     src, dst, w, v, directed = data
     e = len(src)
+
+    def nan_stats():
+        return {"median_ms": float("nan"), "p95_ms": float("nan"),
+                "runs": 0}
+
+    def add_hits_baseline(
+        item, fn, solver, *, tol_value="metal", **extra
+    ):
+        """Time, validate, and conditionally admit an external baseline."""
+        if hits_context is None:
+            return
+
+        def resolved_extra():
+            return {
+                key: value() if callable(value) else value
+                for key, value in extra.items()
+            }
+
+        try:
+            timed_result = None
+
+            def measured_fn():
+                nonlocal timed_result
+                timed_result = fn()
+                return timed_result
+
+            st = stats_ms(measured_fn, runs, warmup=1)
+            agreement = hits_agreement(
+                hits_context["reference"], timed_result, v
+            )
+        except Exception as err:
+            add(
+                "hits", item, nan_stats(), note=f"failed: {err}",
+                solver=solver, eligible_for_speedup=False,
+                **resolved_extra(),
+            )
+            return
+        gpu_ms = hits_context.get("gpu_median_ms")
+        eligible = agreement["matches_reference"] and gpu_ms is not None
+        speedup = st["median_ms"] / gpu_ms if eligible else None
+        reported_tol = (
+            hits_context["options"]["tol"]
+            if tol_value == "metal" else tol_value
+        )
+        target_metadata = (
+            {"absolute_l1_target": HITS_ABS_L1_TARGET}
+            if tol_value == "metal" else {}
+        )
+        add(
+            "hits", item, st, solver=solver,
+            speedup_vs_gpu=speedup,
+            eligible_for_speedup=eligible,
+            tol=reported_tol,
+            max_iter=hits_context["options"]["max_iter"],
+            normalization="l1", edge_weights="ignored",
+            **target_metadata, **agreement, **resolved_extra(),
+        )
+
+    scipy_sparse = optional_import("scipy.sparse")
+    hits_adjacency = None
+    if scipy_sparse is not None and hits_context is not None:
+        build_ms, hits_adjacency = timed(
+            lambda: build_structural_adjacency(
+                scipy_sparse, src, dst, v, directed
+            )
+        )
+        add(
+            "hits", "baseline_scipy_build",
+            {"median_ms": build_ms, "p95_ms": build_ms, "runs": 1},
+            solver="COO to structural CSR",
+            input_edges=e, matrix_nnz=int(hits_adjacency.nnz),
+            edge_weights="ignored; duplicate multiplicity stored as values",
+        )
+        scipy_hits, scipy_hits_state = make_scipy_hits_runner(
+            hits_adjacency,
+            tol=hits_context["options"]["tol"],
+            max_iter=hits_context["options"]["max_iter"],
+            audit_interval=hits_context["audit_interval"],
+        )
+        add_hits_baseline(
+            "baseline_scipy", scipy_hits,
+            solver="SciPy CSR exact recurrence",
+            iterations=lambda: scipy_hits_state["iterations"],
+            matrix_nnz=int(hits_adjacency.nnz),
+            comparison="same recurrence, audit cadence, and absolute target",
+            output_contract="two dense float64 arrays",
+        )
+    elif hits_context is not None:
+        add(
+            "hits", "baseline_scipy", nan_stats(),
+            note="scipy not installed", solver="SciPy CSR exact recurrence",
+            eligible_for_speedup=False,
+        )
 
     # NetworkX: context only, capped.
     if e <= NX_MAX_EDGES:
         import networkx as nx
-        gx = nx.DiGraph() if directed else nx.Graph()
-        gx.add_nodes_from(range(v))
-        if w is None:
-            gx.add_edges_from(zip(src.tolist(), dst.tolist()))
-        else:
-            gx.add_weighted_edges_from(
-                zip(src.tolist(), dst.tolist(),
-                    w.astype(np.float64).tolist()))
-        st = stats_ms(lambda: nx.pagerank(gx, alpha=0.85, tol=1e-6,
-                                          max_iter=100),
-                      max(3, runs // 5), warmup=1)
-        add("pagerank", "baseline_networkx", st)
+        if not only_hits:
+            gx = nx.DiGraph() if directed else nx.Graph()
+            gx.add_nodes_from(range(v))
+            if w is None:
+                gx.add_edges_from(zip(src.tolist(), dst.tolist()))
+            else:
+                gx.add_weighted_edges_from(
+                    zip(src.tolist(), dst.tolist(),
+                        w.astype(np.float64).tolist()))
+            st = stats_ms(lambda: nx.pagerank(
+                gx, alpha=0.85, tol=1e-6, max_iter=100
+            ), max(3, runs // 5), warmup=1)
+            add("pagerank", "baseline_networkx", st)
+
+        if hits_context is not None and scipy_sparse is not None:
+            def build_networkx_hits_graph():
+                matrix = build_structural_adjacency(
+                    scipy_sparse, src, dst, v, directed
+                )
+                graph_type = nx.DiGraph if directed else nx.Graph
+                return nx.from_scipy_sparse_array(
+                    matrix, create_using=graph_type,
+                    edge_attribute="weight",
+                )
+
+            nx_build_ms, gx_hits = timed(build_networkx_hits_graph)
+            add(
+                "hits", "baseline_networkx_build",
+                {"median_ms": nx_build_ms, "p95_ms": nx_build_ms,
+                 "runs": 1},
+                solver="structural CSR to NetworkX graph",
+                input_edges=e,
+                edge_weights="duplicate multiplicity encoded as weight",
+            )
+            nx_start = dict.fromkeys(range(v), 1.0 / v)
+            nx_tol = HITS_ABS_L1_TARGET
+            add_hits_baseline(
+                "baseline_networkx",
+                lambda: nx.hits(
+                    gx_hits,
+                    tol=nx_tol,
+                    max_iter=hits_context["options"]["max_iter"],
+                    nstart=nx_start,
+                    normalized=True,
+                ),
+                solver="NetworkX HITS (sparse SVD in recorded version)",
+                tol_value=nx_tol,
+                comparison="same mathematical result; different solver",
+                tolerance_semantics=(
+                    "sparse-SVD residual; admitted only after score agreement"
+                ),
+                output_contract="native tuple of node-score dictionaries",
+            )
+        elif hits_context is not None:
+            add(
+                "hits", "baseline_networkx", nan_stats(),
+                note="SciPy required by networkx.hits is not installed",
+                solver="NetworkX HITS", eligible_for_speedup=False,
+            )
     else:
-        add("pagerank", "baseline_networkx",
-            {"median_ms": float("nan"), "p95_ms": float("nan"), "runs": 0},
-            note=f"skipped: E={e:,} > cap {NX_MAX_EDGES:,}")
+        if not only_hits:
+            add(
+                "pagerank", "baseline_networkx", nan_stats(),
+                note=f"skipped: E={e:,} > cap {NX_MAX_EDGES:,}",
+            )
+        if hits_context is not None:
+            add(
+                "hits", "baseline_networkx", nan_stats(),
+                note=f"skipped: E={e:,} > cap {NX_MAX_EDGES:,}",
+                solver="NetworkX HITS", eligible_for_speedup=False,
+            )
 
     # SciPy sparse power iteration (if importable).
-    scipy_sparse = optional_import("scipy.sparse")
-    if scipy_sparse is not None:
+    if scipy_sparse is not None and not only_hits:
         data_w = np.ones(e, np.float32) if w is None else w
         adj = scipy_sparse.csr_matrix(
             (data_w, (src.astype(np.int64), dst.astype(np.int64))),
@@ -691,13 +1096,13 @@ def bench_baselines(name, data, runs, add):
 
         st = stats_ms(power_iter, max(3, runs // 5), warmup=1)
         add("pagerank", "baseline_scipy_20iter", st)
-    else:
+    elif not only_hits:
         add("pagerank", "baseline_scipy_20iter",
             {"median_ms": float("nan"), "p95_ms": float("nan"), "runs": 0},
             note="scipy not installed")
 
     # Pure-python BFS (deque) context.
-    if e <= PY_BFS_MAX_EDGES:
+    if e <= PY_BFS_MAX_EDGES and not only_hits:
         adj = [[] for _ in range(v)]
         for a, b in zip(src.tolist(), dst.tolist()):
             adj[a].append(b)
@@ -726,10 +1131,6 @@ def bench_baselines(name, data, runs, add):
     # explicit 'not installed' rows — never silently skipped.
     b_runs = max(3, runs // 5)
 
-    def nan_stats():
-        return {"median_ms": float("nan"), "p95_ms": float("nan"),
-                "runs": 0}
-
     def baseline(algo, item, fn, sample_runs=None, **extra):
         try:
             st = stats_ms(
@@ -742,116 +1143,210 @@ def bench_baselines(name, data, runs, add):
 
     rx = optional_import("rustworkx")
     if rx is None:
-        for algo in ("pagerank", "bfs", "wcc"):
-            add(algo, "baseline_rustworkx", nan_stats(),
-                note="not installed")
+        if not only_hits:
+            for algo in ("pagerank", "bfs", "wcc"):
+                add(algo, "baseline_rustworkx", nan_stats(),
+                    note="not installed")
+        if hits_context is not None:
+            add(
+                "hits", "baseline_rustworkx", nan_stats(),
+                note="not installed", solver="rustworkx.hits",
+                eligible_for_speedup=False,
+            )
     else:
-        gr, rx_weight = build_rustworkx_graph(
-            rx, src, dst, w, v, directed
+        rx_build_ms, rx_built = timed(
+            lambda: build_rustworkx_graph(
+                rx, src, dst, w, v, directed
+            )
         )
-        baseline("pagerank", "baseline_rustworkx",
-                 lambda: rx.pagerank(gr, alpha=0.85, tol=1e-6,
-                                     max_iter=100, weight_fn=rx_weight),
-                 weighted=w is not None)
-        degree = stored_out_degrees(src, dst, v, directed)
-        # A handful of samples cannot support a microsecond-scale p95.
-        # Calibrate from one traversal rather than source degree: a degree-1
-        # source can still enter a giant component on SNAP/RMAT.
-        def rx_bfs_noop():
-            return rx.bfs_search(gr, [0], rx.visit.BFSVisitor())
+        gr, rx_weight = rx_built
+        if hits_context is not None:
+            add(
+                "hits", "baseline_rustworkx_build",
+                {"median_ms": rx_build_ms, "p95_ms": rx_build_ms,
+                 "runs": 1},
+                solver="edge arrays to rustworkx graph", input_edges=e,
+                edge_weights="stored as payload; ignored by HITS",
+            )
+        if hits_context is not None:
+            rx_tol = HITS_ABS_L1_TARGET
+            add_hits_baseline(
+                "baseline_rustworkx",
+                lambda: rx.hits(
+                    gr, weight_fn=None, tol=rx_tol,
+                    max_iter=hits_context["options"]["max_iter"],
+                    normalized=True,
+                ),
+                solver="rustworkx.hits power iteration",
+                tol_value=rx_tol,
+                comparison="public CPU HITS API; graph prebuilt",
+                tolerance_semantics=(
+                    "raw L1 iterate difference in recorded version"
+                ),
+                output_contract="native tuple of node-score dictionaries",
+            )
+        if not only_hits:
+            baseline("pagerank", "baseline_rustworkx",
+                     lambda: rx.pagerank(
+                         gr, alpha=0.85, tol=1e-6, max_iter=100,
+                         weight_fn=rx_weight,
+                     ), weighted=w is not None)
+            degree = stored_out_degrees(src, dst, v, directed)
+            # A handful of samples cannot support a microsecond-scale p95.
+            # Calibrate from one traversal rather than source degree: a
+            # degree-1 source can still enter a giant component on SNAP/RMAT.
+            def rx_bfs_noop():
+                return rx.bfs_search(gr, [0], rx.visit.BFSVisitor())
 
-        rx_bfs_dense = make_rustworkx_dense_bfs(rx, gr, v, 0)
-        probe_ms, _ = timed(rx_bfs_dense)
-        bfs_runs = max(200, runs) if probe_ms < 2.0 else b_runs
-        baseline("bfs", "baseline_rustworkx", rx_bfs_dense, source=0,
-                 semantics="dense int32 dist+parent",
-                 sample_runs=bfs_runs)
-        baseline("bfs", "baseline_rustworkx_noop", rx_bfs_noop,
-                 source=0, semantics="traversal only; no returned result",
-                 sample_runs=bfs_runs)
-        baseline("bfs", "baseline_rustworkx_layers",
-                 lambda: rx.bfs_layers(gr, [0]), source=0,
-                 semantics="sparse layers; no parent array — different "
-                           "output contract, context only, excluded from "
-                           "gates",
-                 sample_runs=bfs_runs)
-        high_source = int(np.argmax(degree)) if v else 0
-        rx_bfs_high = make_rustworkx_dense_bfs(
-            rx, gr, v, high_source
-        )
-        baseline("bfs", "baseline_rustworkx_high_degree", rx_bfs_high,
-                 source=high_source,
-                 source_out_degree=int(degree[high_source]),
-                 semantics="dense int32 dist+parent")
-        rx_wcc = (rx.weakly_connected_components if directed
-                  else rx.connected_components)
-        baseline("wcc", "baseline_rustworkx", lambda: rx_wcc(gr))
+            rx_bfs_dense = make_rustworkx_dense_bfs(rx, gr, v, 0)
+            probe_ms, _ = timed(rx_bfs_dense)
+            bfs_runs = max(200, runs) if probe_ms < 2.0 else b_runs
+            baseline("bfs", "baseline_rustworkx", rx_bfs_dense, source=0,
+                     semantics="dense int32 dist+parent",
+                     sample_runs=bfs_runs)
+            baseline("bfs", "baseline_rustworkx_noop", rx_bfs_noop,
+                     source=0,
+                     semantics="traversal only; no returned result",
+                     sample_runs=bfs_runs)
+            baseline("bfs", "baseline_rustworkx_layers",
+                     lambda: rx.bfs_layers(gr, [0]), source=0,
+                     semantics="sparse layers; no parent array — different "
+                               "output contract, context only, excluded from "
+                               "gates",
+                     sample_runs=bfs_runs)
+            high_source = int(np.argmax(degree)) if v else 0
+            rx_bfs_high = make_rustworkx_dense_bfs(
+                rx, gr, v, high_source
+            )
+            baseline("bfs", "baseline_rustworkx_high_degree", rx_bfs_high,
+                     source=high_source,
+                     source_out_degree=int(degree[high_source]),
+                     semantics="dense int32 dist+parent")
+            rx_wcc = (rx.weakly_connected_components if directed
+                      else rx.connected_components)
+            baseline("wcc", "baseline_rustworkx", lambda: rx_wcc(gr))
 
     ig = optional_import("igraph")
     if ig is None:
-        for algo in ("pagerank", "bfs", "wcc"):
-            add(algo, "baseline_igraph", nan_stats(),
-                note="not installed")
+        if not only_hits:
+            for algo in ("pagerank", "bfs", "wcc"):
+                add(algo, "baseline_igraph", nan_stats(),
+                    note="not installed")
+        if hits_context is not None:
+            add(
+                "hits", "baseline_igraph", nan_stats(),
+                note="not installed", solver="python-igraph",
+                eligible_for_speedup=False,
+            )
     else:
-        gi, ig_weight = build_igraph_graph(ig, src, dst, w, v, directed)
-        baseline("pagerank", "baseline_igraph",
-                 lambda: gi.pagerank(damping=0.85, weights=ig_weight),
-                 weighted=w is not None)
-
-        ig_bfs_source_zero = make_igraph_dense_bfs(gi, v, 0)
-        probe_ms, _ = timed(ig_bfs_source_zero)
-        ig_bfs_runs = max(200, runs) if probe_ms < 2.0 else b_runs
-        baseline("bfs", "baseline_igraph", ig_bfs_source_zero, source=0,
-                 semantics="dense int32 dist+parent",
-                 sample_runs=ig_bfs_runs)
-        degree = stored_out_degrees(src, dst, v, directed)
-        high_source = int(np.argmax(degree)) if v else 0
-
-        ig_bfs_high_degree = make_igraph_dense_bfs(
-            gi, v, high_source
+        ig_build_ms, ig_built = timed(
+            lambda: build_igraph_graph(
+                ig, src, dst, w, v, directed
+            )
         )
-        probe_ms, _ = timed(ig_bfs_high_degree)
-        ig_high_runs = max(200, runs) if probe_ms < 2.0 else b_runs
-        baseline("bfs", "baseline_igraph_high_degree", ig_bfs_high_degree,
-                 source=high_source,
-                 source_out_degree=int(degree[high_source]),
-                 semantics="dense int32 dist+parent",
-                 sample_runs=ig_high_runs)
-        ig_wcc = getattr(gi, "connected_components", None) or gi.clusters
-        baseline("wcc", "baseline_igraph", lambda: ig_wcc(mode="weak"))
+        gi, ig_weight = ig_built
+        if hits_context is not None:
+            add(
+                "hits", "baseline_igraph_build",
+                {"median_ms": ig_build_ms, "p95_ms": ig_build_ms,
+                 "runs": 1},
+                solver="edge arrays to igraph graph", input_edges=e,
+                edge_weights="stored as attribute; ignored by HITS",
+            )
+        if hits_context is not None:
+            ig_tol = HITS_ABS_L1_TARGET
+            ig_arpack = ig.ARPACKOptions()
+            ig_arpack.maxiter = hits_context["options"]["max_iter"]
+            ig_arpack.tol = ig_tol
 
-        # Plan-§8 PPR-gate comparator: per-query personalized-PageRank loop
-        # with top-64 extraction over the SAME 16 queries as the
-        # warm_batch16_k64 line item (make_queries is seeded). igraph solves
-        # via PRPACK — an exact direct solver with no iteration-count
-        # control — so "identical iteration counts" is not achievable; the
-        # row notes the solver difference instead of pretending parity.
-        if v >= 64:
-            q_seeds, q_weights, q_offsets = make_queries(v, batch=16)
-            k_gate = min(64, v)
+            def igraph_hits_pair():
+                hubs = gi.hub_score(
+                    weights=None, scale=False, arpack_options=ig_arpack
+                )
+                authorities = gi.authority_score(
+                    weights=None, scale=False, arpack_options=ig_arpack
+                )
+                return normalized_hits_arrays((hubs, authorities), v)
 
-            def ig_ppr_loop():
-                out = []
-                reset = np.zeros(v, dtype=np.float64)
-                for qi in range(len(q_offsets) - 1):
-                    lo, hi = int(q_offsets[qi]), int(q_offsets[qi + 1])
-                    reset[q_seeds[lo:hi]] = q_weights[lo:hi]
-                    scores = np.asarray(
-                        gi.personalized_pagerank(
-                            damping=0.85,
-                            reset=reset,
-                            weights=ig_weight,
+            add_hits_baseline(
+                "baseline_igraph", igraph_hits_pair,
+                solver="two python-igraph ARPACK score calls",
+                tol_value=ig_tol,
+                comparison=(
+                    "two public calls plus L1 adapter; graph prebuilt"
+                ),
+                tolerance_semantics=(
+                    "ARPACK residual; admitted only after score agreement"
+                ),
+                output_contract="two dense float64 arrays after L1 adapter",
+            )
+        if not only_hits:
+            baseline("pagerank", "baseline_igraph",
+                     lambda: gi.pagerank(
+                         damping=0.85, weights=ig_weight
+                     ), weighted=w is not None)
+
+            ig_bfs_source_zero = make_igraph_dense_bfs(gi, v, 0)
+            probe_ms, _ = timed(ig_bfs_source_zero)
+            ig_bfs_runs = max(200, runs) if probe_ms < 2.0 else b_runs
+            baseline("bfs", "baseline_igraph", ig_bfs_source_zero, source=0,
+                     semantics="dense int32 dist+parent",
+                     sample_runs=ig_bfs_runs)
+            degree = stored_out_degrees(src, dst, v, directed)
+            high_source = int(np.argmax(degree)) if v else 0
+
+            ig_bfs_high_degree = make_igraph_dense_bfs(
+                gi, v, high_source
+            )
+            probe_ms, _ = timed(ig_bfs_high_degree)
+            ig_high_runs = max(200, runs) if probe_ms < 2.0 else b_runs
+            baseline("bfs", "baseline_igraph_high_degree",
+                     ig_bfs_high_degree, source=high_source,
+                     source_out_degree=int(degree[high_source]),
+                     semantics="dense int32 dist+parent",
+                     sample_runs=ig_high_runs)
+            ig_wcc = getattr(gi, "connected_components", None) or gi.clusters
+            baseline("wcc", "baseline_igraph", lambda: ig_wcc(mode="weak"))
+
+            # Plan-§8 PPR-gate comparator: per-query personalized-PageRank
+            # loop with top-64 extraction over the SAME 16 queries as the
+            # warm_batch16_k64 line item (make_queries is seeded). igraph
+            # solves via PRPACK — an exact direct solver with no
+            # iteration-count control — so "identical iteration counts" is
+            # not achievable; the row notes the solver difference.
+            if v >= 64:
+                q_seeds, q_weights, q_offsets = make_queries(v, batch=16)
+                k_gate = min(64, v)
+
+                def ig_ppr_loop():
+                    out = []
+                    reset = np.zeros(v, dtype=np.float64)
+                    for qi in range(len(q_offsets) - 1):
+                        lo = int(q_offsets[qi])
+                        hi = int(q_offsets[qi + 1])
+                        reset[q_seeds[lo:hi]] = q_weights[lo:hi]
+                        scores = np.asarray(
+                            gi.personalized_pagerank(
+                                damping=0.85,
+                                reset=reset,
+                                weights=ig_weight,
+                            )
                         )
-                    )
-                    top = np.argpartition(-scores, k_gate - 1)[:k_gate]
-                    out.append(top[np.argsort(-scores[top], kind="stable")])
-                    reset[q_seeds[lo:hi]] = 0.0
-                return out
+                        top = np.argpartition(
+                            -scores, k_gate - 1
+                        )[:k_gate]
+                        out.append(top[np.argsort(
+                            -scores[top], kind="stable"
+                        )])
+                        reset[q_seeds[lo:hi]] = 0.0
+                    return out
 
-            baseline("ppr_topk", "baseline_igraph_query_loop", ig_ppr_loop,
-                     note="B=16 sequential personalized_pagerank + top-64; "
-                          "PRPACK exact solver (no iteration-count control)",
-                     weighted=w is not None)
+                baseline(
+                    "ppr_topk", "baseline_igraph_query_loop", ig_ppr_loop,
+                    note="B=16 sequential personalized_pagerank + top-64; "
+                         "PRPACK exact solver (no iteration-count control)",
+                    weighted=w is not None,
+                )
 
 
 def build_rustworkx_graph(rx, src, dst, weights, v, directed):
@@ -956,6 +1451,7 @@ def collect_meta(mg, args):
         "git_dirty": bool(git_dirty.stdout.strip())
         if git_dirty.returncode == 0 else None,
         "xcode": xcode.stdout.strip() if xcode.returncode == 0 else "unknown",
+        "harness_sha256": file_sha256(Path(__file__)),
         "native_module_sha256": file_sha256(native_module),
         "snap_datasets": SNAP_DATASETS,
     }
@@ -1000,6 +1496,21 @@ def render_markdown(meta, rows):
             ])
         if "slo_ms" in r:
             note_keys.extend(["slo_ms", "slo_pass", "gate"])
+        # HITS was added after the canonical v0.1 artifacts. Keep rendering
+        # those artifacts byte-for-byte stable while making every new HITS
+        # row's workload and cold/core timing self-describing.
+        if r.get("algo") == "hits":
+            note_keys.extend([
+                "cold_ms", "engine_ms", "tol", "max_iter",
+                "absolute_l1_target", "normalization", "edge_weights",
+                "iteration_unit", "cold_scope", "solver",
+                "speedup_vs_metal_cpu", "speedup_vs_gpu",
+                "eligible_for_speedup", "matches_reference",
+                "hub_l1_error", "authority_l1_error",
+                "hub_max_abs_error", "authority_max_abs_error",
+                "match_criteria", "comparison", "tolerance_semantics",
+                "output_contract", "input_edges", "matrix_nnz",
+            ])
         for k in note_keys:
             if k in r and r[k] is not None:
                 val = r[k]
@@ -1208,6 +1719,10 @@ def build_suite(suite, only=None):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--suite", choices=["smoke", "v01"], default="smoke")
+    ap.add_argument(
+        "--algorithm", choices=["all", "hits"], default="all",
+        help="run the complete suite or only the HITS comparison",
+    )
     ap.add_argument("--dataset", default=None,
                     help="restrict the run to ONE dataset from the suite "
                          "(isolated re-measurement; artifact provenance is "
@@ -1288,7 +1803,10 @@ def main():
                     "note": "run bench/run.py --fetch",
                 })
                 continue
-            bench_dataset(mg, name, data, args.runs, rows)
+            bench_dataset(
+                mg, name, data, args.runs, rows,
+                hits_only=args.algorithm == "hits",
+            )
 
         if args.contention:
             run_contention(mg, args, rows)

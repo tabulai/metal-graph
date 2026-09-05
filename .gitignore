@@ -20,6 +20,8 @@ bench/results/*
 !bench/results/bench-20260729T000207Z.md
 !bench/results/bench-20260729T201007Z.json
 !bench/results/bench-20260729T201007Z.md
+!bench/results/bench-20260905T001339Z.json
+!bench/results/bench-20260905T001339Z.md
 dist/
 wheelhouse/
 wheelhouse-*/

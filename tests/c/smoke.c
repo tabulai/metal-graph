@@ -90,6 +90,28 @@ int main(void) {
     check(fabs(sum - 1.0) < 1e-3, "pagerank sums to ~1");
   }
 
+  /* HITS: structural hub/authority scores, each L1-normalized. */
+  {
+    float hubs[V], authorities[V];
+    int iters = -1;
+    double hub_sum = 0.0, authority_sum = 0.0;
+    int i;
+    check(mg_hits(g, 1e-5, 100, hubs, authorities, &iters) == MG_OK,
+          "hits");
+    check(iters >= 1, "hits iterations >= 1");
+    for (i = 0; i < V; ++i) {
+      check(isfinite((double)hubs[i]) && hubs[i] >= 0.0f,
+            "hits hub finite/non-negative");
+      check(isfinite((double)authorities[i]) && authorities[i] >= 0.0f,
+            "hits authority finite/non-negative");
+      hub_sum += (double)hubs[i];
+      authority_sum += (double)authorities[i];
+    }
+    check(fabs(hub_sum - 1.0) < 1e-3, "hits hubs sum to ~1");
+    check(fabs(authority_sum - 1.0) < 1e-3,
+          "hits authorities sum to ~1");
+  }
+
   /* telemetry: path is 0 (gpu) or 1 (cpu); no GPU assertion */
   {
     int path = -1, iters = -1;

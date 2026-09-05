@@ -1,8 +1,8 @@
 // reduce_engine.hpp — host dispatch driver for the list-sum reduce pattern
 // (reduce.metal): per-threadgroup partial sums over a vertex list, then a
 // one-threadgroup finalize into a scalar slot. Used for the per-iteration
-// dangling-mass reduction of PageRank / batched PPR. Bindings follow the
-// tables in src/kernels/mg_params.h.
+// dangling-mass reduction of PageRank / batched PPR and L1 normalization in
+// HITS. Bindings follow the tables in src/kernels/mg_params.h.
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 

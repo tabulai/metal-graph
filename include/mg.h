@@ -82,6 +82,13 @@ MG_API mg_status mg_pagerank(mg_graph* g, double alpha, double tol,
                             int max_iter, const float* personalization,
                             float* out_rank, int* out_iterations);
 
+/* HITS hub/authority centrality. Edge weights are ignored; duplicate edges
+ * count as separate links. out_hubs/out_authorities: caller-allocated
+ * float[V], L1-normalized for nonempty graphs with edges. */
+MG_API mg_status mg_hits(mg_graph* g, double tol, int max_iter,
+                        float* out_hubs, float* out_authorities,
+                        int* out_iterations);
+
 /* Batched personalized PageRank with top-k. Queries packed CSR-style:
  * query q owns seeds[offsets[q]..offsets[q+1]). out_ids: int32[B*k]
  * (row-major, -1 padded), out_scores: float[B*k]. Seed weights must be
