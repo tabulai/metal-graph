@@ -26,15 +26,14 @@ documentation. Other local runs remain ignored.
   (10.707 ms per batch, 0.669 ms/query) and the first artifact measuring
   KG high-degree BFS against the corrected equivalent-output igraph
   adapter.
-- `bench-20260904T235705Z.{json,md}` is the focused HITS comparison on an
+- `bench-20260905T001339Z.{json,md}` is the focused HITS comparison on an
   Apple M4 Max running macOS 26.6.2 and Python 3.13.3. It contains 20 warm
   calls per implementation on RMAT-18 and the HippoRAG-shape graph, explicit
   CPU/GPU paths, an absolute L1 convergence target, post-hoc answer checks,
   retained per-call samples, raw native-output normalization checks, and
-  separate construction costs. It records source commit `0fd0dc590313`
-  with `git_dirty=true`: this is a pre-commit feature measurement, not a
-  clean-release artifact. Native-module and benchmark-harness SHA-256 values
-  in the JSON identify the exact measured binary and harness.
+  separate construction costs. It records metal-graph 0.1.1 at clean source
+  commit `b230664837ef`. Native-module and benchmark-harness SHA-256 values in
+  the JSON identify the exact measured binary and harness.
 
 Where a completed pair exists, JSON is the machine-readable source of truth
 and Markdown is the rendered view produced by `bench/run.py`. The

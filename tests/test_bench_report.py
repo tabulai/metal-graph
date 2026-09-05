@@ -360,9 +360,9 @@ def test_structural_scipy_hits_preserves_multiplicity_and_recurrence():
             False,
         ),
         (
-            "bench-20260904T235705Z",
-            "0fd0dc590313395a49979498caaa54ed3701b29d",
-            True,
+            "bench-20260905T001339Z",
+            "b230664837ef06c107f6a4f2068857500836b2e7",
+            False,
         ),
     ],
 )
@@ -390,9 +390,10 @@ def test_checked_in_artifact_pairs_are_strict_and_reproducible(
 def test_checked_in_hits_artifact_has_verified_speedup_rows():
     results = Path(__file__).resolve().parents[1] / "bench/results"
     data = json.loads(
-        (results / "bench-20260904T235705Z.json").read_text()
+        (results / "bench-20260905T001339Z.json").read_text()
     )
     assert data["meta"]["argv"][2:4] == ["--algorithm", "hits"]
+    assert data["meta"]["versions"]["metal_graph"] == "0.1.1"
     harness = Path(__file__).resolve().parents[1] / "bench/run.py"
     assert data["meta"]["harness_sha256"] == hashlib.sha256(
         harness.read_bytes()

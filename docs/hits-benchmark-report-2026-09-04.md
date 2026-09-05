@@ -3,16 +3,16 @@
 ## Technical summary
 
 The new Metal HITS implementation completed the two measured graphs in
-**1.518–2.337 ms per warm call** on an Apple M4 Max. Against the matching
-threaded fp64 implementation, Metal was **6.75–8.06× faster**. Against
+**1.470–2.650 ms per warm call** on an Apple M4 Max. Against the matching
+threaded fp64 implementation, Metal was **7.06–7.34× faster**. Against
 rustworkx—the fastest completed installed public CPU HITS baseline—it
-was **32.99× faster** on the 2.0M-edge knowledge-graph shape and **217.09×
+was **36.93× faster** on the 2.0M-edge knowledge-graph shape and **202.88×
 faster** on the 4.19M-edge RMAT graph.
 
 The most conservative independent comparison is the prebuilt SciPy CSR
 recurrence in the benchmark harness. It performs the same updates, uses the
 same audit cadence, and stops at the same absolute L1 target. Metal was
-**2.40× faster** on the duplicate-heavy knowledge graph and **14.24× faster**
+**2.67× faster** on the duplicate-heavy knowledge graph and **13.16× faster**
 on RMAT-18. Every result admitted to a ratio passed the recorded pointwise and
 aggregate agreement checks against the fp64 reference.
 
@@ -32,8 +32,8 @@ CPU implementation's slowdown relative to Metal. Lower is better.
 
 | Dataset | Metal | Matching fp64 CPU | Prebuilt SciPy recurrence | NetworkX `hits` | rustworkx `hits` | python-igraph pair |
 |---|---:|---:|---:|---:|---:|---:|
-| RMAT-18, 262k vertices / 4.19M edges | **2.337 ms** | 18.834 ms (8.06×) | 33.280 ms (14.24×) | capped | 507.428 ms (217.09×) | 640.071 ms (273.84×) |
-| KG shape, 100k vertices / 2.0M edges | **1.518 ms** | 10.251 ms (6.75×) | 3.650 ms (2.40×) | 136.503 ms (89.93×) | 50.072 ms (32.99×) | 207.297 ms (136.58×) |
+| RMAT-18, 262k vertices / 4.19M edges | **2.650 ms** | 19.443 ms (7.34×) | 34.881 ms (13.16×) | capped | 537.627 ms (202.88×) | 683.515 ms (257.93×) |
+| KG shape, 100k vertices / 2.0M edges | **1.470 ms** | 10.376 ms (7.06×) | 3.927 ms (2.67×) | 145.285 ms (98.85×) | 54.275 ms (36.93×) | 220.828 ms (150.25×) |
 
 The public-library ratios are end-to-end API comparisons, not kernel-only
 comparisons. NetworkX converts its graph to a SciPy matrix inside each call;
@@ -42,8 +42,8 @@ python-igraph API requires separate hub and authority calls. Those behaviors
 are part of the measured public APIs but explain why their ratios are much
 larger than the prebuilt SciPy comparison.
 
-The p95 Metal times were 2.844 ms on RMAT-18 and 3.881 ms on the KG shape.
-The latter has visible timing variance around a 1.518 ms median, so the
+The p95 Metal times were 3.216 ms on RMAT-18 and 2.275 ms on the KG shape.
+The latter has visible timing variance around a 1.470 ms median, so the
 median is the appropriate steady-state headline while p95 should remain
 visible in latency-sensitive use cases.
 
@@ -54,11 +54,11 @@ They are separate rows in the source artifact:
 
 | Dataset | metal-graph build | Reverse CSR | SciPy CSR | NetworkX graph | rustworkx graph | igraph graph |
 |---|---:|---:|---:|---:|---:|---:|
-| RMAT-18 | 61.581 ms | 31.217 ms | 108.901 ms | capped | 354.463 ms | 1,032.843 ms |
-| KG shape | 41.939 ms | 59.274 ms | 33.587 ms | 220.284 ms | 261.213 ms | 211.564 ms |
+| RMAT-18 | 66.583 ms | 34.701 ms | 112.388 ms | capped | 376.837 ms | 1,608.849 ms |
+| KG shape | 41.638 ms | 59.402 ms | 35.534 ms | 238.668 ms | 277.903 ms | 230.210 ms |
 
-Metal's first HITS call on an already prepared graph took 6.828 ms for RMAT-18
-and 6.360 ms for the KG shape. These are algorithm-cold measurements after the
+Metal's first HITS call on an already prepared graph took 13.124 ms for RMAT-18
+and 8.012 ms for the KG shape. These are algorithm-cold measurements after the
 process runtime and reverse CSR were warmed; they are not process-startup or
 graph-build measurements.
 
@@ -90,7 +90,8 @@ largest observed elementwise difference was `7.551e-8`.
 
 ## Methodology and environment
 
-The benchmark used an optimized Release build (`-O3`) on an Apple M4 Max
+The benchmark used metal-graph 0.1.1 from an optimized Release build (`-O3`)
+on an Apple M4 Max
 MacBook Pro with 16 CPU cores and 128 GB unified memory, running macOS 26.6.2,
 Xcode 26.4, and CPython 3.13.3 while connected to AC power. Recorded package
 versions were NumPy 2.5.2, SciPy 1.18.1, NetworkX 3.4.2, rustworkx 0.18.0, and
@@ -121,27 +122,27 @@ post-hoc rather than assumed equivalent.
 - The SciPy recurrence is the strongest algorithm-matched baseline, but it is
   harness code rather than a named public HITS function. The public-library
   rows answer the practical API question and perform different internal work.
-- The source artifact records `git_dirty=true` at commit `0fd0dc590313`.
+- The source artifact records `git_dirty=false` at commit `b230664837ef`.
   Its native-module SHA-256 is
-  `c9f023f5be2db53cd29f42588511616d0772d37631cbceda95d92a450134b764`.
+  `e2905938136cf5ea3e0003d94e50e8ad0e2199a45c6a4b3491cd637b9ba296b4`.
   The benchmark-harness SHA-256 is
   `141fe9cc40547a8e9ee5bd31c2220e704130cc2d6feab1c9a6537576f7b5a774`.
-  The result is suitable for reviewing this working-tree feature, but a clean
-  post-commit rerun is required before treating it as a release artifact.
+  The subsequent results commit adds the artifacts and updates documentation,
+  ignore rules, and artifact-validation tests; it does not change the measured
+  implementation, native module, or harness.
 - The warning emitted by igraph for many zero scores on these sparse graphs did
   not invalidate its result: both vectors still agreed with the fp64 reference
   well inside the recorded thresholds.
 
 ## Recommended next steps
 
-Use the **6.75–8.06× fp64 CPU speedup** as the implementation-matched
+Use the **7.06–7.34× fp64 CPU speedup** as the implementation-matched
 CPU/GPU claim. Across all valid baselines, the lowest observed speedup was the
-**2.40× prebuilt-SciPy comparison** on the duplicate-heavy KG shape.
-Use the **32.99–217.09× rustworkx comparison** only with the end-to-end API
-qualification above. Before release, rerun the focused command from a clean
-commit and add at least one real directed web or citation graph. Measurements
-on an M-series base chip and an M-series Pro chip would establish the useful
-hardware range and the CPU/GPU crossover.
+**2.67× prebuilt-SciPy comparison** on the duplicate-heavy KG shape.
+Use the **36.93–202.88× rustworkx comparison** only with the end-to-end API
+qualification above. A future benchmark should add at least one real directed
+web or citation graph. Measurements on an M-series base chip and an M-series
+Pro chip would establish the useful hardware range and CPU/GPU crossover.
 
 ## Further questions
 
@@ -153,8 +154,8 @@ hardware range and the CPU/GPU crossover.
 
 ## Reproducible artifacts
 
-- [Machine-readable benchmark JSON](../bench/results/bench-20260904T235705Z.json)
-- [Harness-rendered benchmark table](../bench/results/bench-20260904T235705Z.md)
+- [Machine-readable benchmark JSON](../bench/results/bench-20260905T001339Z.json)
+- [Harness-rendered benchmark table](../bench/results/bench-20260905T001339Z.md)
 - [Benchmark methodology and focused command](../bench/README.md)
 - [NVIDIA cuGraph HITS reference](https://docs.rapids.ai/api/cugraph/stable/api_docs/api/cugraph/cugraph.hits/)
 - [NetworkX HITS API](https://networkx.org/documentation/stable/reference/algorithms/generated/networkx.algorithms.link_analysis.hits_alg.hits.html)

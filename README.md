@@ -148,7 +148,8 @@ core API, batched PPR retrieval, and low-latency BFS.
 
 ## Performance
 
-The results below were measured on an Apple M4 Max running macOS 26.2.
+Unless stated otherwise, the results below were measured on an Apple M4 Max
+running macOS 26.2.
 Timings cover the Python call through the returned result, so they include
 normal API overhead. Lower is better.
 
@@ -179,17 +180,17 @@ Every baseline shown below passed a score-agreement check against the fp64
 reference. The complete
 [HITS benchmark report](https://github.com/tabulai/metal-graph/blob/main/docs/hits-benchmark-report-2026-09-04.md)
 includes p95 and cold timings, setup costs, package versions, methodology, and
-the pre-commit source-state caveat.
+source provenance.
 
 | Dataset | Metal HITS | Matching fp64 CPU | Prebuilt SciPy recurrence | rustworkx public HITS API |
 |---|---:|---:|---:|---:|
-| RMAT-18 (V=262k, E=4.2M) | **2.337 ms** | 18.834 ms (8.06×) | 33.280 ms (14.24×) | rustworkx 507.428 ms (217.09×) |
-| HippoRAG-shape KG (V=100k, E=2M) | **1.518 ms** | 10.251 ms (6.75×) | 3.650 ms (2.40×) | rustworkx 50.072 ms (32.99×) |
+| RMAT-18 (V=262k, E=4.2M) | **2.650 ms** | 19.443 ms (7.34×) | 34.881 ms (13.16×) | rustworkx 537.627 ms (202.88×) |
+| HippoRAG-shape KG (V=100k, E=2M) | **1.470 ms** | 10.376 ms (7.06×) | 3.927 ms (2.67×) | rustworkx 54.275 ms (36.93×) |
 
 SciPy's matrix coalesces the KG's 2.0M repeated input links into 305,667
 weighted nonzero positions, while metal-graph retains every parallel link.
 This gives SciPy a substantial workload advantage on that row and makes its
-2.40× result the most conservative comparison.
+2.67× result the most conservative comparison.
 
 ### Comparison with CPU graph libraries
 
