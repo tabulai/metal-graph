@@ -99,6 +99,20 @@ nb::ndarray<nb::numpy, float> pagerank(GraphHandle& h, double alpha, double tol,
   return take_1d(rank, g.V);
 }
 
+nb::tuple hits(GraphHandle& h, double tol, int max_iter) {
+  mg::Graph& g = *h.g;
+  std::unique_ptr<float[]> hubs(new float[g.V]);
+  std::unique_ptr<float[]> authorities(new float[g.V]);
+  {
+    nb::gil_scoped_release rel;
+    mg::HitsOpts o;
+    o.tol = tol;
+    o.max_iter = max_iter;
+    mg::hits(g, o, hubs.get(), authorities.get());
+  }
+  return nb::make_tuple(take_1d(hubs, g.V), take_1d(authorities, g.V));
+}
+
 nb::tuple ppr_topk(GraphHandle& h, ArrU32 seeds, ArrF32 seed_weights,
                    ArrU64 offsets, uint32_t k, double alpha, double tol,
                    int max_iter) {
@@ -375,6 +389,7 @@ NB_MODULE(_core, m) {
         nb::call_guard<nb::gil_scoped_release>());
   m.def("pagerank", &pagerank, "graph"_a, "alpha"_a, "tol"_a, "max_iter"_a,
         "personalization"_a.none());
+  m.def("hits", &hits, "graph"_a, "tol"_a, "max_iter"_a);
   m.def("ppr_topk", &ppr_topk, "graph"_a, "seeds"_a, "seed_weights"_a,
         "offsets"_a, "k"_a, "alpha"_a, "tol"_a, "max_iter"_a);
   m.def("bfs", &bfs, "graph"_a, "sources"_a, "direction"_a);

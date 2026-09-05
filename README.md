@@ -6,8 +6,9 @@
 
 metal-graph is a Python and C library for ranking, searching, and exploring
 graphs on a Mac. Build a graph once from NumPy arrays, then run PageRank,
-batched personalized PageRank, breadth-first search, neighborhood extraction,
-and connected-components analysis through one consistent API.
+HITS hub/authority scoring, batched personalized PageRank, breadth-first
+search, neighborhood extraction, and connected-components analysis through
+one consistent API.
 
 The library uses the Metal GPU for work that benefits from it and a threaded
 CPU path for smaller jobs. That choice is automatic by default, so using
@@ -24,9 +25,9 @@ It is particularly useful for:
 
 - **A small, practical API.** Inputs and outputs are NumPy arrays, and integer
   or string IDs are supported.
-- **Useful graph operations included.** PageRank, batched PPR with top-k, BFS,
-  sparse BFS, bounded k-hop extraction, and weakly connected components are
-  available today.
+- **Useful graph operations included.** PageRank, HITS, batched PPR with
+  top-k, BFS, sparse BFS, bounded k-hop extraction, and weakly connected
+  components are available today.
 - **Good performance across different query sizes.** Large traversals can use
   the GPU, while tiny reachable components can stay on the CPU and avoid GPU
   launch overhead.
@@ -83,6 +84,7 @@ G = mg.Graph.from_edges(
 
 # Rank every vertex.
 rank = mg.pagerank(G)
+hubs, authorities = mg.hits(G)
 
 # Explore from vertex 0.
 dist, parent = mg.bfs(G, sources=[0], direction="out")
@@ -136,6 +138,7 @@ core API, batched PPR retrieval, and low-latency BFS.
 
 - `Graph.from_edges(...)` builds an immutable weighted or unweighted graph.
 - `pagerank(...)` returns a score for every vertex.
+- `hits(...)` returns L1-normalized hub and authority scores.
 - `ppr_topk(...)` answers a batch of personalized PageRank queries and returns
   only the highest-scoring vertices.
 - `bfs(...)` returns dense distances and parents, or compact results with
@@ -167,6 +170,26 @@ contains p95 values, package versions, and methodology.
 | RMAT-24 (V=16.8M, E=268M) | 14.7 ms | 556 ms | 46.1 ms | 119.8 ms |
 | soc-LiveJournal1 (V=4.8M, E=69M) | 4.0 ms | 174 ms | 13.4 ms | 24.9 ms |
 | com-orkut (V=3.1M, E=117M) | 7.9 ms | 257 ms | 8.3 ms | 55.9 ms |
+
+### HITS on Apple Metal
+
+The focused HITS run used the same Apple M4 Max on macOS 26.6.2, with an
+absolute L1 convergence target of `1e-5` and 20 warm calls per implementation.
+Every baseline shown below passed a score-agreement check against the fp64
+reference. The complete
+[HITS benchmark report](https://github.com/tabulai/metal-graph/blob/main/docs/hits-benchmark-report-2026-09-04.md)
+includes p95 and cold timings, setup costs, package versions, methodology, and
+the pre-commit source-state caveat.
+
+| Dataset | Metal HITS | Matching fp64 CPU | Prebuilt SciPy recurrence | rustworkx public HITS API |
+|---|---:|---:|---:|---:|
+| RMAT-18 (V=262k, E=4.2M) | **2.337 ms** | 18.834 ms (8.06×) | 33.280 ms (14.24×) | rustworkx 507.428 ms (217.09×) |
+| HippoRAG-shape KG (V=100k, E=2M) | **1.518 ms** | 10.251 ms (6.75×) | 3.650 ms (2.40×) | rustworkx 50.072 ms (32.99×) |
+
+SciPy's matrix coalesces the KG's 2.0M repeated input links into 305,667
+weighted nonzero positions, while metal-graph retains every parallel link.
+This gives SciPy a substantial workload advantage on that row and makes its
+2.40× result the most conservative comparison.
 
 ### Comparison with CPU graph libraries
 
@@ -303,6 +326,7 @@ shallow traversals responsive while reducing host round-trips on deep graphs.
 |---|---|---|
 | `MG_E_GPU_MIN` | 1000000 | auto-planner GPU threshold (stored edges) |
 | `MG_PR_AUDIT_INTERVAL` | 5 | iterations per GPU command batch / fp64 audit |
+| `MG_HITS_AUDIT_INTERVAL` | 5 | HITS iterations per GPU command batch / fp64 audit |
 | `MG_BFS_LEVELS_PER_BATCH` | adaptive 8,8,16,32,64… | BFS levels per command buffer; an integer pins a fixed size (clamped 1–256) |
 | `MG_BFS_SPARSE_MAX_VERTICES` | 1024 | auto/CPU BFS latency-path vertex cap (0 disables) |
 | `MG_BFS_SPARSE_MAX_EDGES` | 8192 | auto/CPU BFS latency-path scanned-edge cap (0 disables) |
@@ -335,6 +359,9 @@ The most important result conventions are:
 - PageRank follows NetworkX-compatible weighted normalization and dangling
   mass handling. `max_iter` is a budget: metal-graph returns the current
   result when it is reached, while NetworkX raises.
+- HITS returns `(hubs, authorities)` with separate L1-normalized float32
+  vectors. It ignores edge weights, counts parallel edges separately, and
+  returns zeros for edgeless graphs. `max_iter` is a budget.
 - `ppr_topk` normalizes seed weights, combines duplicate seeds, returns
   deterministic top-k ordering, and pads with `id=-1, score=0` when `k > V`.
 - BFS supports `direction="out"`, `"in"`, or `"both"`. Unreachable distances
@@ -359,11 +386,24 @@ boundaries. Top-k ties are resolved by ascending user index.
 
 </details>
 
+<details>
+<summary>Exact HITS convergence behavior</summary>
+
+Starting from uniform hubs, HITS alternates `authority = A.T @ hubs` and
+`hubs = A @ authority`, L1-normalizing after each multiplication. Convergence
+is `L1(hubs_new - hubs_old) < V * tol`, audited every
+`MG_HITS_AUDIT_INTERVAL` iterations. Iteration counts therefore land on audit
+boundaries.
+
+</details>
+
 ## Current limits
 
 - The library currently supports `V, E < 2^31`; graph values are fp32 and
   graph IDs are int32 internally.
 - Graphs are immutable snapshots rather than streaming or mutable graphs.
+- HITS materializes and caches the reverse CSR for directed graphs, so its
+  first call adds a second adjacency-sized structure to the graph snapshot.
 - `direction="both"` BFS on directed graphs and capped `k_hop` run on the
   deterministic CPU path.
 - Batched GPU PPR keeps the CSR plus an eight-query tile in memory. The
@@ -398,7 +438,7 @@ has a matched pair for the later full-suite values.
 
 ## Roadmap
 
-Possible v0.2 additions include label propagation, core number, similarity
+Possible future additions include label propagation, core number, similarity
 top-k, typed and temporal neighborhood filters, MLX device-resident results,
 and a NetworkX backend preview. Louvain and Leiden community detection are
 longer-term candidates.

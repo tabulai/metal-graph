@@ -175,10 +175,12 @@ add_library(mgcore STATIC
   src/engines/frontier_engine.cpp
   src/engines/scan_engine.cpp
   src/algos/pagerank.cpp
+  src/algos/hits.cpp
   src/algos/bfs.cpp
   src/algos/khop.cpp
   src/algos/wcc.cpp
   src/algos/cpu/cpu_pagerank.cpp
+  src/algos/cpu/cpu_hits.cpp
   src/algos/cpu/cpu_bfs.cpp
   src/algos/cpu/cpu_khop.cpp
   src/algos/cpu/cpu_wcc.cpp

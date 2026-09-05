@@ -67,40 +67,54 @@ void SpmvEngine::encode_iteration(CommandBatch& cb, const Orientation& in_o,
   cb.dispatch(prepare_, &p, sizeof(p), {rank_cur, out_weight_sum, contrib},
               tg_count(p.count), MG_TG_SIZE);
 
+  encode_prepared_gather(cb, in_o, base, contrib, rank_next, iter_scalars,
+                         pvec, weights);
+}
+
+void SpmvEngine::encode_prepared_gather(
+    CommandBatch& cb, const Orientation& orientation, MGPrParams base,
+    Buffer* contrib, Buffer* output, Buffer* iter_scalars, Buffer* pvec,
+    Buffer* weights) {
+  MGPrParams p = base;
+
   auto gather = [&](MTL::ComputePipelineState* pso, Buffer* wl, uint32_t n,
                     uint32_t tgs) {
     if (n == 0) return;
     p.count = n;
     cb.dispatch(pso, &p, sizeof(p),
-                {wl, in_o.row_offsets.get(), in_o.col_indices.get(), contrib,
-                 rank_next, iter_scalars, pvec, weights},
+                {wl, orientation.row_offsets.get(),
+                 orientation.col_indices.get(), contrib, output, iter_scalars,
+                 pvec, weights},
                 tgs, MG_TG_SIZE);
   };
-  gather(gather_tg_, in_o.wl_high.get(), in_o.n_high, in_o.n_high);
-  gather(gather_sg_, in_o.wl_mid.get(), in_o.n_mid,
-         ceil_div_u32(in_o.n_mid, sgs_per_tg_));
-  gather(gather_th_, in_o.wl_low.get(), in_o.n_low, tg_count(in_o.n_low));
+  gather(gather_tg_, orientation.wl_high.get(), orientation.n_high,
+         orientation.n_high);
+  gather(gather_sg_, orientation.wl_mid.get(), orientation.n_mid,
+         ceil_div_u32(orientation.n_mid, sgs_per_tg_));
+  gather(gather_th_, orientation.wl_low.get(), orientation.n_low,
+         tg_count(orientation.n_low));
 
-  if (in_o.n_huge) {
-    Buffer* partials = huge_scratch(in_o, /*batched=*/false);
-    p.count = in_o.n_tiles;
+  if (orientation.n_huge) {
+    Buffer* partials = huge_scratch(orientation, /*batched=*/false);
+    p.count = orientation.n_tiles;
     cb.dispatch(huge_partials_, &p, sizeof(p),
-                {in_o.tile_owner.get(), in_o.tile_first_edge.get(),
-                 in_o.wl_huge.get(), in_o.row_offsets.get(),
-                 in_o.col_indices.get(), contrib, weights, partials},
-                in_o.n_tiles, MG_TG_SIZE);
-    p.count = in_o.n_huge;
+                {orientation.tile_owner.get(),
+                 orientation.tile_first_edge.get(),
+                 orientation.wl_huge.get(), orientation.row_offsets.get(),
+                 orientation.col_indices.get(), contrib, weights, partials},
+                orientation.n_tiles, MG_TG_SIZE);
+    p.count = orientation.n_huge;
     cb.dispatch(huge_finalize_, &p, sizeof(p),
-                {in_o.wl_huge.get(), in_o.huge_tile_off.get(), partials,
-                 rank_next, iter_scalars, pvec},
-                tg_count(in_o.n_huge), MG_TG_SIZE);
+                {orientation.wl_huge.get(), orientation.huge_tile_off.get(),
+                 partials, output, iter_scalars, pvec},
+                tg_count(orientation.n_huge), MG_TG_SIZE);
   }
 
-  if (in_o.n_zero) {
-    p.count = in_o.n_zero;
+  if (orientation.n_zero) {
+    p.count = orientation.n_zero;
     cb.dispatch(zero_fill_, &p, sizeof(p),
-                {in_o.zero_list.get(), rank_next, iter_scalars, pvec},
-                tg_count(in_o.n_zero), MG_TG_SIZE);
+                {orientation.zero_list.get(), output, iter_scalars, pvec},
+                tg_count(orientation.n_zero), MG_TG_SIZE);
   }
 }
 

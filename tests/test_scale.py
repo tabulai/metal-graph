@@ -1,8 +1,8 @@
 # test_scale.py — medium-scale GPU-vs-CPU agreement (RMAT-shape, ~2M edges).
 #
 # The small-fixture matrix cannot reach several GPU code paths: the
-# bottom-up BFS switch, multi-block reduce/finalize, scan recursion depth
-# > 1, and >65k-thread dispatches. This module runs one seeded power-law
+# bottom-up BFS switch, HITS normalization, multi-block reduce/finalize, scan
+# recursion depth > 1, and >65k-thread dispatches. This module runs one seeded
 # graph big enough to hit them and cross-checks the paths against each
 # other (CPU implementations are the oracles).
 import numpy as np
@@ -63,6 +63,18 @@ def test_scale_pagerank_agreement(big_graph):
     assert np.isfinite(gpu).all()
     np.testing.assert_allclose(gpu.sum(), 1.0, atol=1e-3)
     np.testing.assert_allclose(gpu, cpu, atol=1e-6, rtol=5e-3)
+
+
+def test_scale_hits_agreement(big_graph):
+    # Exercises both CSR orientations, multi-block L1 reduction/finalize,
+    # on-device normalization, and huge-row scratch on a 2M-edge graph.
+    (hubs_c, auth_c), (hubs_g, auth_g) = _both(
+        lambda: tuple(np.asarray(x) for x in mg.hits(
+            big_graph, tol=1e-8, max_iter=64)))
+    np.testing.assert_allclose(hubs_g.sum(), 1.0, atol=1e-3)
+    np.testing.assert_allclose(auth_g.sum(), 1.0, atol=1e-3)
+    np.testing.assert_allclose(hubs_g, hubs_c, atol=1e-6, rtol=5e-3)
+    np.testing.assert_allclose(auth_g, auth_c, atol=1e-6, rtol=5e-3)
 
 
 def test_scale_bfs_agreement(big_graph):

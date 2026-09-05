@@ -71,7 +71,7 @@ The tag must exactly match the version in `pyproject.toml`, which is the
 project's single source of truth.
 
 After the release changes have passed pull-request checks and landed on
-`main`, push that exact tag (for example, `v0.1.0`). The production-wheel
+`main`, push that exact tag (for example, `v0.1.1`). The production-wheel
 workflow then:
 
 1. builds, validates, and CPU-smoke-tests all five wheels on macOS 14 Apple

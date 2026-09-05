@@ -164,6 +164,20 @@ mg_status mg_pagerank(mg_graph* g, double alpha, double tol, int max_iter,
   });
 }
 
+mg_status mg_hits(mg_graph* g, double tol, int max_iter, float* out_hubs,
+                  float* out_authorities, int* out_iterations) {
+  return wrap([&] {
+    mg::Graph& gr = deref(g);
+    require((out_hubs != nullptr && out_authorities != nullptr) || gr.V == 0,
+            "out_hubs/out_authorities: must not be NULL");
+    mg::HitsOpts o;
+    o.tol = tol;
+    o.max_iter = max_iter;
+    int iters = mg::hits(gr, o, out_hubs, out_authorities);
+    if (out_iterations) *out_iterations = iters;
+  });
+}
+
 mg_status mg_ppr_topk(mg_graph* g, const uint32_t* seeds,
                       const float* seed_weights, const uint64_t* offsets,
                       uint32_t num_queries, uint32_t k, double alpha,

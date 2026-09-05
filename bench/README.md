@@ -18,11 +18,10 @@
 4. Baselines are context: NetworkX (capped, because it is not the
    competition), SciPy sparse power iteration, a pure-python deque BFS.
    rustworkx / igraph are feature-detected line items for **BFS, WCC,
-   and PageRank** (the plan-§10 gate shapes) and reported as
-   `not installed` when absent — never silently skipped. Both BFS gate
-   baselines construct dense `int32[V]` distance and parent arrays like
-   metal-graph; rustworkx's no-output visitor and sparse-layers APIs are
-   labeled separately as non-equivalent context.
+   PageRank, and HITS** and reported as `not installed` when absent — never
+   silently skipped. Both BFS gate baselines construct dense `int32[V]`
+   distance and parent arrays like metal-graph; rustworkx's no-output visitor
+   and sparse-layers APIs are labeled separately as non-equivalent context.
 5. Every line item records `t_start_utc`/`t_end_utc` (ISO-8601, for
    powermetrics window alignment — see `ENERGY.md`) and peak-RSS
    bracketing: `peak_rss_mb` is the process high-water mark at the end of
@@ -39,6 +38,9 @@
 ```bash
 # quick smoke (RMAT-18 + HippoRAG-shape KG)
 PYTHONPATH=python python3 bench/run.py --suite smoke
+
+# focused HITS comparison on the same two graphs
+PYTHONPATH=python python3 bench/run.py --suite smoke --algorithm hits
 
 # full v0.1 suite (adds RMAT-22, RMAT-24 and the SNAP datasets if fetched)
 PYTHONPATH=python python3 bench/run.py --suite v01
@@ -62,6 +64,13 @@ markdown table. Result files use an explicit schema version and strict JSON.
 | `pipeline / first_op_vs_second` | first tiny op in the process vs second: pipeline-compile + runtime init |
 | `pagerank / warm_full_run` | full converged run, median/p95; `iterations`, executed `path`, and modeled `achieved_gb_s` attached |
 | `pagerank / per_iteration` | warm run divided by executed iterations |
+| `hits / baseline_metal_cpu` | forced threaded-fp64 path, with the same recurrence, audit cadence, and absolute convergence target as Metal |
+| `hits / warm_full_run` | forced Metal full run, median/p95; first-call `cold_ms`, last-call core `engine_ms`, iterations, accuracy fields, and speedup versus the CPU path attached |
+| `hits / per_iteration` | warm run divided by executed iterations; one iteration is `A^T·h` plus `A·a`, including both L1 normalizations |
+| `hits / baseline_scipy` | prebuilt-CSR implementation of the exact recurrence; CSR construction is a separate row |
+| `hits / baseline_networkx` | public HITS API using the recorded NetworkX version; graph construction is separate and the installed solver's result is checked against the fp64 reference |
+| `hits / baseline_rustworkx` | public power-iteration HITS API on a prebuilt graph; recorded-version tolerance semantics are stated |
+| `hits / baseline_igraph` | both public score calls plus L1 adaptation; this requires two ARPACK solves in the Python API |
 | `ppr_topk / warm_batch16_k64` | the flagship gate shape: B=16, k=64, from Python call to NumPy result |
 | `ppr_topk / python_boundary` | wall median minus `last_run_info()["ms"]` (engine time) |
 | `ppr_topk / topk_selection_estimate` | median(k=1024) − median(k=1): selection cost estimate |
@@ -78,6 +87,18 @@ Every row additionally carries `t_start_utc` / `t_end_utc`,
 `peak_rss_mb`, and `peak_rss_delta_mb` (honesty rule 5); the markdown
 table shows the peak-RSS delta per line item.
 
+HITS rows always benchmark the public structural contract: input edge weights
+are ignored, parallel edges count individually, and both returned vectors use
+L1 normalization. Because `metal_graph.hits` stops at `V * tol`, the Metal,
+fp64, and matched SciPy rows use `tol = 1e-5 / V` so every dataset has the same
+absolute L1 target. A baseline is eligible for a speedup claim only when its
+hub and authority vectors pass the recorded post-hoc agreement criteria
+against the threaded fp64 path. NetworkX and igraph use different eigensolver
+stopping rules, so they are labeled as solver-different comparisons even when
+their answers agree. Every timed sample is retained in JSON, and correctness
+is checked on an actual timed result. cuGraph is a design reference, not an
+executable Mac baseline.
+
 The tiny-component SLO is reporting metadata on the measured
 `warm_single_source` row. `slo_pass=false` is visible in JSON/Markdown but
 does not currently make the benchmark command fail.
@@ -86,10 +107,11 @@ The v0.1 suite includes `rmat24` (V≈16.8M, E≈268M — the ship-gate scale
 point); smoke deliberately does not, so it stays fast.
 
 Attached iteration counts expose audit cadence and convergence overshoot:
-iterations land on `MG_PR_AUDIT_INTERVAL` boundaries by design. The harness
-does not separately time the fp64 convergence audit; reported wall minus
-engine time is aggregate boundary overhead and must not be labeled as audit
-time alone.
+PageRank and HITS iterations land on their respective
+`MG_PR_AUDIT_INTERVAL` and `MG_HITS_AUDIT_INTERVAL` boundaries by design.
+The harness does not separately time the fp64 convergence audit; reported wall
+minus engine time is aggregate boundary overhead and must not be labeled as
+audit time alone.
 
 ## Contention scenario (`--contention`)
 

@@ -1,5 +1,5 @@
 // reduce.metal — dangling/residual partial reductions (single + batched),
-// reduce finalize, fills, iota.
+// reduce finalize, fills, iota, scalar normalization.
 // Binding tables: src/kernels/mg_params.h (authoritative).
 // SPDX-License-Identifier: Apache-2.0
 
@@ -162,4 +162,18 @@ kernel void mg_iota_u32(
     device uint* dst         [[buffer(1)]],
     uint gid [[thread_position_in_grid]]) {
   if (gid < p.count) dst[gid] = gid;
+}
+
+// Divide every value by a positive device-resident scalar.  HITS places the
+// L1 norm in norm[0] with mg_reduce_finalize, then normalizes without a host
+// round trip.  A zero/non-finite norm produces zeros; the host reports the
+// degenerate iteration after the command batch completes.
+kernel void mg_scale_f32_by_scalar(
+    constant MGFillParams& p [[buffer(0)]],
+    device float* values     [[buffer(1)]],
+    device const float* norm [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid >= p.count) return;
+  const float d = norm[0];
+  values[gid] = (d > 0.0f && isfinite(d)) ? values[gid] / d : 0.0f;
 }

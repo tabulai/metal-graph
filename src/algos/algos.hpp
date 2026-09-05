@@ -46,6 +46,15 @@
 //   comp[user_idx] = component id; components numbered by first occurrence
 //   in USER index order (canonical-partition semantics).
 //
+// HITS: unweighted hyperlink-induced topic search. Starting from uniform
+//   hubs, each iteration computes authority = A^T * hubs followed by
+//   hubs = A * authority; both vectors are L1-normalized. Edge weights are
+//   intentionally ignored (cuGraph-compatible); parallel edges contribute
+//   once each and self-loops are retained. Convergence is the L1 hub-vector
+//   difference < V * tol, checked at audit boundaries (default 5 via
+//   MG_HITS_AUDIT_INTERVAL). Hitting max_iter returns the current iterate.
+//   Empty/edgeless graphs return all-zero vectors in 0 iterations.
+//
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
@@ -126,6 +135,17 @@ KhopResult k_hop(Graph& g, const uint32_t* seeds, uint32_t n_seeds,
 // out_comp: caller-allocated int32[V], USER order. Returns #components.
 int wcc(Graph& g, int32_t* out_comp);
 
+struct HitsOpts {
+  double tol = 1e-5;
+  int max_iter = 100;
+};
+
+// out_hubs/out_authorities: caller-allocated float[V], USER order. Both
+// vectors are L1-normalized when the graph has at least one stored edge.
+// Returns iterations executed.
+int hits(Graph& g, const HitsOpts& o, float* out_hubs,
+         float* out_authorities);
+
 // ---------------------------------------------------------------------------
 // CPU implementations (threaded; oracles + planner fallback).
 // They operate in CANONICAL space and entry points translate, except the
@@ -191,6 +211,9 @@ std::vector<uint32_t> khop_vertices(Graph& g, const uint32_t* seeds_canon,
 
 int wcc(Graph& g, uint32_t* labels_canon);  // labels = canonical min-id per comp
 
+int hits(Graph& g, double tol, int max_iter, int audit_interval,
+         double* hubs_canon, double* authorities_canon);
+
 }  // namespace cpu
 
 // GPU implementations (engines layer). Same canonical-space contracts as
@@ -223,6 +246,9 @@ std::vector<uint32_t> khop_edges(Graph& g,
                                  const std::vector<uint32_t>& reached_canon);
 
 int wcc(Graph& g, uint32_t* labels_canon);
+
+int hits(Graph& g, double tol, int max_iter, int audit_interval,
+         double* hubs_canon, double* authorities_canon);
 
 }  // namespace gpu
 

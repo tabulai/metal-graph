@@ -1,10 +1,10 @@
 // spmv_engine.hpp — host dispatch driver for the PageRank / batched-PPR
-// gather pipelines (spmv.metal). Encodes one full power iteration per call
-// (prepare -> degree-binned gather over the IN worklists -> zero-fill, plus
-// seed scatter on the batched tile path); the dangling reduce is
-// ReduceEngine's job. Internal engine layer: algo entry points own buffers,
-// ping-pong, and iteration/audit policy. Bindings follow the tables in
-// src/kernels/mg_params.h (params at buffer 0, listed buffers from 1).
+// gather pipelines (spmv.metal). Encodes either a full PageRank power
+// iteration (prepare -> degree-binned gather -> zero-fill), a prepared raw
+// gather for HITS, or the corresponding batched-PPR path. The dangling
+// reduce is ReduceEngine's job. Internal engine layer: algo entry points own
+// buffers, ping-pong, and iteration/audit policy. Bindings follow the tables
+// in src/kernels/mg_params.h (params at buffer 0, listed buffers from 1).
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
@@ -32,6 +32,14 @@ class SpmvEngine {
                         MGPrParams base, Buffer* rank_cur, Buffer* contrib,
                         Buffer* rank_next, Buffer* iter_scalars, Buffer* pvec,
                         Buffer* out_weight_sum, Buffer* weights);
+
+  // Degree-binned single-query gather without mg_pr_prepare. `contrib` is
+  // already the per-source value to sum. This is the raw adjacency-vector
+  // primitive used by HITS; the engine must be constructed non-batched.
+  void encode_prepared_gather(CommandBatch& cb, const Orientation& orientation,
+                              MGPrParams base, Buffer* contrib,
+                              Buffer* output, Buffer* iter_scalars,
+                              Buffer* pvec, Buffer* weights);
 
   // One batched tile iteration: mg_pr_prepare_b -> gather _b bins ->
   // mg_pr_zero_fill_b -> mg_pr_seed_scatter_b. `base` carries alpha/

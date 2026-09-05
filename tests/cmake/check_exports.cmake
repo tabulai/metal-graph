@@ -27,6 +27,7 @@ set(expected
   _mg_graph_destroy
   _mg_graph_num_edges
   _mg_graph_num_vertices
+  _mg_hits
   _mg_khop
   _mg_last_error_message
   _mg_last_run

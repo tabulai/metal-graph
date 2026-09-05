@@ -70,6 +70,16 @@ def main() -> None:
     )
     assert mg.last_run_info()["path"] == args.expect
 
+    hubs, authorities = mg.hits(graph, tol=1e-8, max_iter=100)
+    np.testing.assert_allclose(hubs, np.full(3, 1.0 / 3.0), atol=1e-6)
+    np.testing.assert_allclose(
+        authorities,
+        np.full(3, 1.0 / 3.0),
+        atol=1e-6,
+    )
+    assert mg.last_run_info()["op"] == "hits"
+    assert mg.last_run_info()["path"] == args.expect
+
     distance, parent = mg.bfs(graph, sources=[0], direction="out")
     np.testing.assert_array_equal(distance, np.array([0, 1, 2]))
     np.testing.assert_array_equal(parent, np.array([-1, 0, 1]))

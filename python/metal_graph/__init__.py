@@ -1,7 +1,7 @@
 # metal_graph — Metal-native graph analytics for Apple Silicon (v0.1).
 #
-# Public API per README: Graph.from_edges, pagerank, ppr_topk, bfs, k_hop,
-# experimental.wcc, set_execution, last_run_info. All algorithm inputs and
+# Public API per README: Graph.from_edges, pagerank, hits, ppr_topk, bfs,
+# k_hop, experimental.wcc, set_execution, last_run_info. All inputs and
 # outputs use dense USER indices (0..V-1); external-ID mapping lives here.
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
@@ -24,6 +24,7 @@ __version__ = _core.__version__
 __all__ = [
     "Graph",
     "pagerank",
+    "hits",
     "ppr_topk",
     "bfs",
     "k_hop",
@@ -247,6 +248,16 @@ def pagerank(G, alpha=0.85, tol=1e-6, max_iter=100, personalization=None):
                     "personalization: must be 1-D of length num_vertices"
                 )
     return _core.pagerank(core, float(alpha), float(tol), int(max_iter), p)
+
+
+def hits(G, tol=1e-5, max_iter=100):
+    """Return HITS hub and authority scores as ``(hubs, authorities)``.
+
+    Both arrays are float32 in user-index order and L1-normalized. HITS is
+    structural: edge weights are ignored, while parallel edges count as
+    separate links. An empty or edgeless graph returns two all-zero arrays.
+    """
+    return _core.hits(_core_graph(G), float(tol), int(max_iter))
 
 
 def ppr_topk(G, seeds, seed_weights, seed_offsets, k=64, alpha=0.85, tol=1e-6,
