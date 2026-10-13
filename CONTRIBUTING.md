@@ -102,6 +102,35 @@ cmake --install build/c-api --prefix build/prefix
 This installs `include/mg.h`, `lib/libmetalgraph.dylib`, and license notices.
 The C smoke test and exported-symbol allowlist run through CTest.
 
+HITS keeps its existing output arrays and return status: reaching `max_iter`
+still returns `MG_OK` with the current scores. Read its convergence metadata
+on the same thread immediately after the successful call, before another
+algorithm replaces it:
+
+```c
+/* g and caller-allocated float[V] arrays hubs/authorities already exist. */
+int iterations, converged;
+double final_delta_l1;
+mg_stop_reason reason;
+mg_status status = mg_hits(g, 1e-5, 100, hubs, authorities, &iterations);
+if (status == MG_OK) {
+    mg_last_run_convergence(&converged, &reason, &final_delta_l1);
+    if (reason == MG_STOP_MAX_ITER) {
+        /* Scores are available, but the convergence test did not pass. */
+    }
+}
+```
+
+`mg_last_run_convergence()` reads the last recorded algorithm run on
+the calling thread. All three output pointers are optional (`NULL` is
+allowed). For HITS, `converged` is 1 or 0 and `reason` is
+`MG_STOP_CONVERGED`, `MG_STOP_MAX_ITER`, or `MG_STOP_EMPTY_GRAPH`.
+`final_delta_l1` is the final measured L1 change in hubs. Convergence on the
+last allowed iteration is still `MG_STOP_CONVERGED`. Empty/edgeless graphs
+report 1, `MG_STOP_EMPTY_GRAPH`, zero delta, and zero iterations. Other
+operations, or no previous run, report -1, `MG_STOP_NOT_APPLICABLE`, and
+`NAN`; these fields do not report PageRank or PPR convergence.
+
 ## Benchmarks
 
 Performance claims must come from `bench/run.py` on physical Apple Silicon.

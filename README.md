@@ -126,7 +126,7 @@ By default, metal-graph chooses the execution path for each call:
 
 ```python
 mg.set_execution("auto")       # "auto", "gpu", or "cpu"
-mg.last_run_info()             # op, path, iterations, and engine time
+mg.last_run_info()             # op, path, iterations, engine time, HITS status
 ```
 
 The
@@ -314,8 +314,29 @@ mg.set_execution("cpu")   # require the CPU path
 mg.set_execution("auto")  # restore automatic selection
 ```
 
-`mg.last_run_info()` reports the operation, chosen path, iteration count, and
-engine time. Forced GPU mode raises an error if no device is available.
+`mg.last_run_info()` returns a snapshot of the last recorded algorithm run
+on the calling thread, including its chosen path, iteration count,
+and engine time. After HITS, it also distinguishes convergence from exhaustion
+of the iteration budget:
+
+```python
+hubs, authorities = mg.hits(G, tol=1e-5, max_iter=100)
+info = mg.last_run_info()  # Read before running another algorithm.
+if info["stop_reason"] == "max_iter":
+    print("Iteration budget reached; scores may need more iterations.")
+print(info["converged"], info["stop_reason"], info["final_delta_l1"])
+```
+
+`converged` is a boolean for HITS, `stop_reason` is `"converged"`,
+`"max_iter"`, or `"empty_graph"`, and `final_delta_l1` is the last measured
+L1 change in the hub vector. Other operations, and the initial state before
+an operation, report `None`, `"not_applicable"`, and `None` respectively;
+these fields do not report PageRank or PPR convergence. A later recorded
+run replaces the current metadata, but a previously returned dictionary
+remains unchanged. The C API exposes the same status through
+`mg_last_run_convergence()`; see the
+[C example](https://github.com/tabulai/metal-graph/blob/main/CONTRIBUTING.md#c-abi).
+Forced GPU mode raises an error if no device is available.
 
 <details>
 <summary>Advanced environment settings</summary>
@@ -362,7 +383,9 @@ The most important result conventions are:
   result when it is reached, while NetworkX raises.
 - HITS returns `(hubs, authorities)` with separate L1-normalized float32
   vectors. It ignores edge weights, counts parallel edges separately, and
-  returns zeros for edgeless graphs. `max_iter` is a budget.
+  returns zeros for edgeless graphs. `max_iter` is a budget: scores are
+  returned even when it is exhausted; inspect `last_run_info()` for the
+  stopping reason.
 - `ppr_topk` normalizes seed weights, combines duplicate seeds, returns
   deterministic top-k ordering, and pads with `id=-1, score=0` when `k > V`.
 - BFS supports `direction="out"`, `"in"`, or `"both"`. Unreachable distances
@@ -393,8 +416,16 @@ boundaries. Top-k ties are resolved by ascending user index.
 Starting from uniform hubs, HITS alternates `authority = A.T @ hubs` and
 `hubs = A @ authority`, L1-normalizing after each multiplication. Convergence
 is `L1(hubs_new - hubs_old) < V * tol`, audited every
-`MG_HITS_AUDIT_INTERVAL` iterations. Iteration counts therefore land on audit
-boundaries.
+`MG_HITS_AUDIT_INTERVAL` iterations (default 5) and on the final allowed
+iteration. `final_delta_l1` reports this hub change, not a spectral residual.
+Convergence on the final allowed iteration is reported as `"converged"`,
+even when `iterations == max_iter`; otherwise exhausting the budget reports
+`converged=False` and `stop_reason="max_iter"`.
+
+For empty or edgeless graphs, HITS returns zero scores with `converged=True`,
+`stop_reason="empty_graph"`, `final_delta_l1=0.0`, and zero iterations. This
+is a convention for the trivial result rather than an iterative convergence
+test.
 
 </details>
 

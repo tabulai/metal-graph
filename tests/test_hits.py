@@ -1,4 +1,6 @@
 # test_hits.py — HITS contract, NumPy oracle, and CPU/GPU parity.
+from concurrent.futures import ThreadPoolExecutor
+
 import networkx as nx
 import numpy as np
 import pytest
@@ -215,6 +217,67 @@ def test_hits_one_iteration_returns_the_completed_iteration(exec_path,
     np.testing.assert_allclose(authorities, expected_authorities, **tolerance)
 
 
+@pytest.mark.parametrize(
+    "cycle,audit_interval,max_iter,tol,iterations,converged,delta",
+    [
+        pytest.param(False, 1, 20, 1e-6, 2, True, 0.0,
+                     id="converged-before-budget"),
+        pytest.param(False, 1, 2, 1e-6, 2, True, 0.0,
+                     id="converged-on-final-iteration"),
+        pytest.param(False, 5, 2, 1e-6, 2, True, 0.0,
+                     id="converged-on-final-partial-audit"),
+        pytest.param(True, 1, 1, 1e-6, 1, True, 0.0,
+                     id="fixed-point-with-one-iteration"),
+        pytest.param(True, 3, 20, 1e-6, 3, True, 0.0,
+                     id="converged-at-first-scheduled-audit"),
+        pytest.param(False, 1, 1, 1e-6, 1, False, 1.0,
+                     id="max-iter"),
+        pytest.param(False, 1, 1, 0.5, 1, False, 1.0,
+                     id="strict-tolerance-boundary"),
+    ],
+)
+def test_hits_convergence_reason(cycle, audit_interval, max_iter, tol,
+                                 iterations, converged, delta, exec_path,
+                                 assert_path, monkeypatch):
+    monkeypatch.setenv("MG_HITS_AUDIT_INTERVAL", str(audit_interval))
+    graph = mg.Graph.from_edges(
+        np.asarray([0, 1] if cycle else [0], dtype=np.uint32),
+        np.asarray([1, 0] if cycle else [1], dtype=np.uint32),
+        directed=True, num_vertices=2,
+    )
+    hubs, authorities = _assert_score_pair(
+        mg.hits(graph, tol=tol, max_iter=max_iter), 2, normalized=True)
+    assert_path(exec_path)
+    info = mg.last_run_info()
+    assert info["iterations"] == iterations
+    assert info["converged"] is converged
+    assert info["stop_reason"] == ("converged" if converged else "max_iter")
+    assert info["final_delta_l1"] == pytest.approx(delta, abs=1e-7)
+    np.testing.assert_array_equal(hubs, [0.5, 0.5] if cycle else [1.0, 0.0])
+    np.testing.assert_array_equal(
+        authorities, [0.5, 0.5] if cycle else [0.0, 1.0])
+
+
+def test_hits_final_delta_uses_last_iteration_not_previous_audit(
+        exec_path, assert_path, monkeypatch):
+    monkeypatch.setenv("MG_HITS_AUDIT_INTERVAL", "3")
+    # The first hub coordinate evolves as 1/2, 3/5, 8/13, 21/34,
+    # 55/89. The fourth update's L1 change is 1/1513, versus 1/221
+    # at the preceding scheduled audit; both remain above the threshold.
+    graph = mg.Graph.from_edges(
+        np.asarray([0, 0, 1], dtype=np.uint32),
+        np.asarray([0, 1, 1], dtype=np.uint32),
+        directed=True, num_vertices=2,
+    )
+    mg.hits(graph, tol=1e-9, max_iter=4)
+    assert_path(exec_path)
+    info = mg.last_run_info()
+    assert info["iterations"] == 4
+    assert info["converged"] is False
+    assert info["stop_reason"] == "max_iter"
+    assert info["final_delta_l1"] == pytest.approx(1.0 / 1513.0, abs=1e-6)
+
+
 def test_hits_empty_graph_short_circuits_to_cpu(exec_path):
     case = ALL_CASES["empty"]
     pair = mg.hits(build_mg(case), tol=1e-5, max_iter=10)
@@ -224,6 +287,9 @@ def test_hits_empty_graph_short_circuits_to_cpu(exec_path):
     assert info["path"] == "cpu"
     assert info["iterations"] == 0
     assert info["ms"] >= 0.0
+    assert info["converged"] is True
+    assert info["stop_reason"] == "empty_graph"
+    assert info["final_delta_l1"] == 0.0
 
 
 def test_hits_edgeless_graph_returns_zeros(exec_path, assert_path):
@@ -239,7 +305,62 @@ def test_hits_edgeless_graph_returns_zeros(exec_path, assert_path):
     assert np.array_equal(hubs, np.zeros(7, dtype=np.float32))
     assert np.array_equal(authorities, np.zeros(7, dtype=np.float32))
     assert_path(exec_path)
-    assert mg.last_run_info()["iterations"] == 0
+    info = mg.last_run_info()
+    assert info["iterations"] == 0
+    assert info["converged"] is True
+    assert info["stop_reason"] == "empty_graph"
+    assert info["final_delta_l1"] == 0.0
+
+
+@pytest.mark.parametrize("operation", ["pagerank", "bfs", "wcc", "ppr", "khop"])
+def test_other_operations_clear_hits_convergence(operation, exec_path):
+    graph = build_mg(ALL_CASES["gnp_dir"])
+    mg.hits(graph, tol=1e-6, max_iter=1)
+    assert mg.last_run_info()["converged"] is False
+    if operation == "pagerank":
+        mg.pagerank(graph)
+    elif operation == "bfs":
+        mg.bfs(graph, sources=[0])
+    elif operation == "wcc":
+        mg.experimental.wcc(graph)
+    elif operation == "ppr":
+        mg.ppr_topk(graph, np.array([0], np.uint32),
+                    np.array([1.0], np.float32), np.array([0, 1], np.uint64),
+                    k=4)
+    else:
+        mg.k_hop(graph, seeds=[0], k=1)
+    info = mg.last_run_info()
+    assert info["converged"] is None
+    assert info["stop_reason"] == "not_applicable"
+    assert info["final_delta_l1"] is None
+
+
+def test_hits_convergence_metadata_is_thread_local(exec_path, monkeypatch):
+    monkeypatch.setenv("MG_HITS_AUDIT_INTERVAL", "1")
+    graph = mg.Graph.from_edges(
+        np.asarray([0], dtype=np.uint32),
+        np.asarray([1], dtype=np.uint32),
+        directed=True, num_vertices=2,
+    )
+    mg.hits(graph, tol=1e-6, max_iter=2)
+    caller_info = mg.last_run_info()
+    assert caller_info["converged"] is True
+
+    def worker():
+        before = mg.last_run_info()
+        mg.hits(graph, tol=1e-6, max_iter=1)
+        return before, mg.last_run_info()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        initial, result = pool.submit(worker).result(timeout=30)
+    assert initial["converged"] is None
+    assert initial["stop_reason"] == "not_applicable"
+    assert initial["final_delta_l1"] is None
+    assert result["path"] == exec_path
+    assert result["converged"] is False
+    assert result["stop_reason"] == "max_iter"
+    assert result["final_delta_l1"] == pytest.approx(1.0)
+    assert mg.last_run_info() == caller_info
 
 
 @pytest.mark.parametrize("bad_tol", [0.0, -1.0, np.nan, np.inf, -np.inf])

@@ -256,6 +256,16 @@ def hits(G, tol=1e-5, max_iter=100):
     Both arrays are float32 in user-index order and L1-normalized. HITS is
     structural: edge weights are ignored, while parallel edges count as
     separate links. An empty or edgeless graph returns two all-zero arrays.
+
+    Scores are returned even if ``max_iter`` is exhausted. Read
+    ``last_run_info()`` immediately after this call for ``converged``,
+    ``stop_reason``, and ``final_delta_l1``. Convergence requires the strict
+    hub-change test ``L1(hubs_new - hubs_old) < G.num_vertices * tol``,
+    audited every ``MG_HITS_AUDIT_INTERVAL`` iterations (default 5) and at
+    the final allowed iteration. Passing the test at ``max_iter`` still
+    reports ``stop_reason="converged"``. Empty/edgeless graphs report
+    ``converged=True``, ``stop_reason="empty_graph"``, zero delta, and zero
+    iterations.
     """
     return _core.hits(_core_graph(G), float(tol), int(max_iter))
 
@@ -360,7 +370,20 @@ def set_execution(mode="auto"):
 
 
 def last_run_info():
-    """Telemetry for the last operation: {'op', 'path', 'iterations', 'ms'}."""
+    """Return a snapshot of the last recorded algorithm run on this thread.
+
+    Keys include ``op``, ``path``, ``iterations``, ``ms``, ``converged``,
+    ``stop_reason``, and ``final_delta_l1``. For HITS, ``converged`` is a
+    boolean, ``stop_reason`` is ``"converged"``, ``"max_iter"``, or
+    ``"empty_graph"``, and ``final_delta_l1`` is the final measured L1 hub
+    change. Empty/edgeless graphs have true convergence, zero delta, and
+    zero iterations by convention. Other operations, or no previous run,
+    report ``None``, ``"not_applicable"``, and ``None`` for these three
+    fields; they do not expose PageRank/PPR convergence.
+
+    Read immediately after HITS before another algorithm replaces the
+    metadata. A returned dictionary remains unchanged by later runs.
+    """
     return _core.last_run_info()
 
 

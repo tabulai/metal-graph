@@ -51,6 +51,13 @@ typedef enum mg_direction {
   MG_DIR_BOTH = 2,
 } mg_direction;
 
+typedef enum mg_stop_reason {
+  MG_STOP_NOT_APPLICABLE = 0,
+  MG_STOP_CONVERGED = 1,
+  MG_STOP_MAX_ITER = 2,
+  MG_STOP_EMPTY_GRAPH = 3,
+} mg_stop_reason;
+
 typedef struct mg_graph mg_graph; /* opaque */
 
 MG_API const char* mg_version(void);
@@ -62,6 +69,19 @@ MG_API mg_status mg_set_execution(mg_exec_mode mode);
 /* Telemetry for the last operation on this thread: path 0=gpu 1=cpu. */
 MG_API mg_status mg_last_run(int* out_path, int* out_iterations,
                             double* out_ms);
+
+/* Convergence of the last recorded algorithm run on this thread.
+ * Currently only HITS reports it. Read before another algorithm overwrites
+ * the telemetry. HITS argument-validation failures preserve the prior record.
+ * All output pointers may be NULL. out_converged is 1 (yes), 0 (no), or -1
+ * (not applicable). out_final_delta_l1 is the last audited L1 hub change.
+ * Before any run and after operations other than HITS: NOT_APPLICABLE, -1,
+ * and NaN. Empty/edgeless HITS: EMPTY_GRAPH, 1, and 0 (by convention).
+ * Convergence on the final allowed iteration reports CONVERGED, not MAX_ITER.
+ * This accessor leaves the existing mg_last_run ABI unchanged. */
+MG_API mg_status mg_last_run_convergence(int* out_converged,
+                                        mg_stop_reason* out_stop_reason,
+                                        double* out_final_delta_l1);
 
 /* Build an immutable snapshot from COO. weights may be NULL (unweighted).
  * Duplicate edges and self-loops are kept; non-finite/negative weights
@@ -84,7 +104,11 @@ MG_API mg_status mg_pagerank(mg_graph* g, double alpha, double tol,
 
 /* HITS hub/authority centrality. Edge weights are ignored; duplicate edges
  * count as separate links. out_hubs/out_authorities: caller-allocated
- * float[V], L1-normalized for nonempty graphs with edges. */
+ * float[V], L1-normalized for nonempty graphs with edges. Both convergence
+ * and max_iter exhaustion return MG_OK with the current scores; inspect
+ * mg_last_run_convergence() to distinguish them. Convergence is a strict
+ * L1 hub change < num_vertices * tol, checked every MG_HITS_AUDIT_INTERVAL
+ * iterations (default 5) and always on the final permitted iteration. */
 MG_API mg_status mg_hits(mg_graph* g, double tol, int max_iter,
                         float* out_hubs, float* out_authorities,
                         int* out_iterations);

@@ -47,14 +47,14 @@ double l1_diff(const double* a, const double* b, uint32_t count) {
 
 }  // namespace
 
-int hits(Graph& g, double tol, int max_iter, int audit_interval,
-         double* hubs_canon, double* authorities_canon) {
+HitsResult hits(Graph& g, double tol, int max_iter, int audit_interval,
+                double* hubs_canon, double* authorities_canon) {
   const uint32_t V = g.V;
-  if (V == 0) return 0;
+  if (V == 0) return {};
   if (g.stored_edges() == 0) {
     std::fill_n(hubs_canon, V, 0.0);
     std::fill_n(authorities_canon, V, 0.0);
-    return 0;
+    return {};
   }
   audit_interval = std::max(audit_interval, 1);
 
@@ -67,6 +67,8 @@ int hits(Graph& g, double tol, int max_iter, int audit_interval,
 
   int cur = 0;
   int done = 0;
+  HitsResult result;
+  result.stop_reason = StopReason::max_iter;
   while (done < max_iter) {
     gather(in_o, hubs[cur].data(), authorities.data(), V);
     normalize_l1(authorities.data(), V);
@@ -79,12 +81,19 @@ int hits(Graph& g, double tol, int max_iter, int audit_interval,
                            ? l1_diff(hubs[cur ^ 1].data(), hubs[cur].data(), V)
                            : 0.0;
     cur ^= 1;
-    if (audit && err < static_cast<double>(V) * tol) break;
+    if (audit) {
+      result.final_delta_l1 = err;
+      if (err < static_cast<double>(V) * tol) {
+        result.stop_reason = StopReason::converged;
+        break;
+      }
+    }
   }
 
   std::copy_n(hubs[cur].data(), V, hubs_canon);
   std::copy_n(authorities.data(), V, authorities_canon);
-  return done;
+  result.iterations = done;
+  return result;
 }
 
 }  // namespace mg::cpu

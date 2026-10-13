@@ -297,6 +297,28 @@ nb::dict last_run_info() {
   d["path"] = (info.path == mg::ExecPath::gpu) ? "gpu" : "cpu";
   d["iterations"] = info.iterations;
   d["ms"] = info.elapsed_ms;
+  if (info.stop_reason == mg::StopReason::not_applicable) {
+    d["converged"] = nb::none();
+    d["final_delta_l1"] = nb::none();
+  } else {
+    d["converged"] = info.stop_reason == mg::StopReason::converged ||
+                     info.stop_reason == mg::StopReason::empty_graph;
+    d["final_delta_l1"] = info.final_delta_l1;
+  }
+  switch (info.stop_reason) {
+    case mg::StopReason::not_applicable:
+      d["stop_reason"] = "not_applicable";
+      break;
+    case mg::StopReason::converged:
+      d["stop_reason"] = "converged";
+      break;
+    case mg::StopReason::max_iter:
+      d["stop_reason"] = "max_iter";
+      break;
+    case mg::StopReason::empty_graph:
+      d["stop_reason"] = "empty_graph";
+      break;
+  }
   return d;
 }
 

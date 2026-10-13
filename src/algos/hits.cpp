@@ -62,17 +62,17 @@ double l1_diff(const float* a, const float* b, uint32_t count) {
 
 namespace gpu {
 
-int hits(Graph& g, double tol, int max_iter, int audit_interval,
-         double* hubs_canon, double* authorities_canon) {
+HitsResult hits(Graph& g, double tol, int max_iter, int audit_interval,
+                double* hubs_canon, double* authorities_canon) {
   Runtime& rt = Runtime::instance();
   if (!rt.has_gpu())
     throw Error(ErrorCode::no_gpu, "gpu::hits requires a Metal device");
   const uint32_t V = g.V;
-  if (V == 0) return 0;
+  if (V == 0) return {};
   if (g.stored_edges() == 0) {
     std::fill_n(hubs_canon, V, 0.0);
     std::fill_n(authorities_canon, V, 0.0);
-    return 0;
+    return {};
   }
   audit_interval = std::max(audit_interval, 1);
 
@@ -129,6 +129,8 @@ int hits(Graph& g, double tol, int max_iter, int audit_interval,
 
   int cur = 0;
   int done = 0;
+  HitsResult result;
+  result.stop_reason = StopReason::max_iter;
   while (done < max_iter) {
     const int batch =
         boundary::next_audit_batch(done, max_iter, audit_interval);
@@ -149,7 +151,11 @@ int hits(Graph& g, double tol, int max_iter, int audit_interval,
                   "hits: encountered a degenerate normalization");
     const double err =
         l1_diff(hubs[cur]->as<float>(), hubs[cur ^ 1]->as<float>(), V);
-    if (err < static_cast<double>(V) * tol) break;
+    result.final_delta_l1 = err;
+    if (err < static_cast<double>(V) * tol) {
+      result.stop_reason = StopReason::converged;
+      break;
+    }
   }
 
   const float* final_hubs = hubs[cur]->as<float>();
@@ -160,7 +166,8 @@ int hits(Graph& g, double tol, int max_iter, int audit_interval,
       authorities_canon[i] = static_cast<double>(final_authorities[i]);
     }
   });
-  return done;
+  result.iterations = done;
+  return result;
 }
 
 }  // namespace gpu
@@ -178,6 +185,8 @@ int hits(Graph& g, const HitsOpts& o, float* out_hubs,
   if (g.V == 0) {
     info.path = ExecPath::cpu;
     info.iterations = 0;
+    info.stop_reason = StopReason::empty_graph;
+    info.final_delta_l1 = 0.0;
     info.elapsed_ms = elapsed_ms(start);
     rt.record_run(info);
     return 0;
@@ -189,22 +198,24 @@ int hits(Graph& g, const HitsOpts& o, float* out_hubs,
   const int audit_interval = audit_interval_env();
   std::vector<double> hubs_canon(g.V, 0.0);
   std::vector<double> authorities_canon(g.V, 0.0);
-  int iterations = 0;
+  HitsResult result;
   if (path == ExecPath::gpu) {
-    iterations = gpu::hits(g, o.tol, o.max_iter, audit_interval,
-                           hubs_canon.data(), authorities_canon.data());
+    result = gpu::hits(g, o.tol, o.max_iter, audit_interval,
+                       hubs_canon.data(), authorities_canon.data());
   } else {
-    iterations = cpu::hits(g, o.tol, o.max_iter, audit_interval,
-                           hubs_canon.data(), authorities_canon.data());
+    result = cpu::hits(g, o.tol, o.max_iter, audit_interval,
+                       hubs_canon.data(), authorities_canon.data());
   }
   boundary::canon_to_user(g, hubs_canon.data(), out_hubs);
   boundary::canon_to_user(g, authorities_canon.data(), out_authorities);
 
   info.path = path;
-  info.iterations = iterations;
+  info.iterations = result.iterations;
+  info.stop_reason = result.stop_reason;
+  info.final_delta_l1 = result.final_delta_l1;
   info.elapsed_ms = elapsed_ms(start);
   rt.record_run(info);
-  return iterations;
+  return result.iterations;
 }
 
 }  // namespace mg

@@ -38,6 +38,16 @@ mg_status status_of(mg::ErrorCode c) {
   return MG_INTERNAL_ERROR;
 }
 
+mg_stop_reason stop_reason_of(mg::StopReason reason) {
+  switch (reason) {
+    case mg::StopReason::not_applicable: return MG_STOP_NOT_APPLICABLE;
+    case mg::StopReason::converged: return MG_STOP_CONVERGED;
+    case mg::StopReason::max_iter: return MG_STOP_MAX_ITER;
+    case mg::StopReason::empty_graph: return MG_STOP_EMPTY_GRAPH;
+  }
+  return MG_STOP_NOT_APPLICABLE;
+}
+
 template <typename Fn>
 mg_status wrap(Fn&& fn) {
   try {
@@ -112,6 +122,21 @@ mg_status mg_last_run(int* out_path, int* out_iterations, double* out_ms) {
     if (out_path) *out_path = static_cast<int>(info.path);  // 0=gpu 1=cpu
     if (out_iterations) *out_iterations = info.iterations;
     if (out_ms) *out_ms = info.elapsed_ms;
+  });
+}
+
+mg_status mg_last_run_convergence(int* out_converged,
+                                  mg_stop_reason* out_stop_reason,
+                                  double* out_final_delta_l1) {
+  return wrap([&] {
+    const mg::RunInfo info = mg::Runtime::instance().last_run();
+    const mg_stop_reason reason = stop_reason_of(info.stop_reason);
+    if (out_stop_reason) *out_stop_reason = reason;
+    if (out_converged) {
+      *out_converged = reason == MG_STOP_NOT_APPLICABLE ? -1
+          : (reason == MG_STOP_CONVERGED || reason == MG_STOP_EMPTY_GRAPH);
+    }
+    if (out_final_delta_l1) *out_final_delta_l1 = info.final_delta_l1;
   });
 }
 
