@@ -31,6 +31,7 @@ set(expected
   _mg_khop
   _mg_last_error_message
   _mg_last_run
+  _mg_last_run_convergence
   _mg_pagerank
   _mg_ppr_topk
   _mg_set_execution

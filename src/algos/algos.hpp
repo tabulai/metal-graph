@@ -53,7 +53,10 @@
 //   once each and self-loops are retained. Convergence is the L1 hub-vector
 //   difference < V * tol, checked at audit boundaries (default 5 via
 //   MG_HITS_AUDIT_INTERVAL). Hitting max_iter returns the current iterate.
-//   Empty/edgeless graphs return all-zero vectors in 0 iterations.
+//   The final iteration is always audited, and convergence at max_iter is
+//   reported as converged. Telemetry retains the final audited hub delta.
+//   Empty/edgeless graphs return all-zero vectors in 0 iterations, with
+//   stop_reason=empty_graph and delta=0 (converged by convention).
 //
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
@@ -140,6 +143,13 @@ struct HitsOpts {
   int max_iter = 100;
 };
 
+// Internal solver outcome; public score and iteration returns are unchanged.
+struct HitsResult {
+  int iterations = 0;
+  StopReason stop_reason = StopReason::empty_graph;
+  double final_delta_l1 = 0.0;
+};
+
 // out_hubs/out_authorities: caller-allocated float[V], USER order. Both
 // vectors are L1-normalized when the graph has at least one stored edge.
 // Returns iterations executed.
@@ -211,8 +221,8 @@ std::vector<uint32_t> khop_vertices(Graph& g, const uint32_t* seeds_canon,
 
 int wcc(Graph& g, uint32_t* labels_canon);  // labels = canonical min-id per comp
 
-int hits(Graph& g, double tol, int max_iter, int audit_interval,
-         double* hubs_canon, double* authorities_canon);
+HitsResult hits(Graph& g, double tol, int max_iter, int audit_interval,
+                double* hubs_canon, double* authorities_canon);
 
 }  // namespace cpu
 
@@ -247,8 +257,8 @@ std::vector<uint32_t> khop_edges(Graph& g,
 
 int wcc(Graph& g, uint32_t* labels_canon);
 
-int hits(Graph& g, double tol, int max_iter, int audit_interval,
-         double* hubs_canon, double* authorities_canon);
+HitsResult hits(Graph& g, double tol, int max_iter, int audit_interval,
+                double* hubs_canon, double* authorities_canon);
 
 }  // namespace gpu
 

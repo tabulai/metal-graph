@@ -1,5 +1,6 @@
-// smoke.c — C-ABI smoke test. Uses include/mg.h ONLY; makes no GPU
-// assertions, so it can also run under MG_FORCE_CPU=1.
+// smoke.c — C-ABI smoke test. Uses include/mg.h ONLY. HITS convergence is
+// checked on forced CPU and on GPU when available; MG_REQUIRE_GPU=1 makes
+// missing GPU support a failure. Also runs under MG_FORCE_CPU=1.
 // SPDX-License-Identifier: Apache-2.0
 #include <math.h>
 #include <stdint.h>
@@ -17,10 +18,140 @@ static void check(int cond, const char* what) {
   }
 }
 
+static void check_convergence(int expected_converged,
+                              mg_stop_reason expected_reason,
+                              double expected_delta) {
+  int converged = -2;
+  mg_stop_reason reason = MG_STOP_NOT_APPLICABLE;
+  double delta = -1.0;
+  check(mg_last_run_convergence(&converged, &reason, &delta) == MG_OK,
+        "last_run_convergence");
+  check(converged == expected_converged, "convergence status");
+  check(reason == expected_reason, "convergence stop reason");
+  if (isnan(expected_delta)) {
+    check(isnan(delta), "non-HITS delta is NaN");
+  } else {
+    check(isfinite(delta) && fabs(delta - expected_delta) < 1e-6,
+          "final hub L1 delta");
+  }
+}
+
+static void check_hits_convergence(mg_exec_mode mode) {
+  const uint32_t src = 0, dst = 1;
+  mg_graph* graph = NULL;
+  float hubs[2], authorities[2];
+  int iterations = -1, path = -1;
+  mg_status status;
+  check(mg_graph_create_from_coo(&src, &dst, NULL, 1, 2, 1, &graph) == MG_OK,
+        "single-edge HITS graph");
+  check(mg_set_execution(mode) == MG_OK, "force HITS execution path");
+  check(setenv("MG_HITS_AUDIT_INTERVAL", "1", 1) == 0, "set HITS audit");
+  status = mg_hits(graph, 1e-6, 1, hubs, authorities, &iterations);
+  if (mode == MG_EXEC_GPU && status == MG_NO_GPU) {
+    const char* require_gpu = getenv("MG_REQUIRE_GPU");
+    check(!require_gpu || strcmp(require_gpu, "1") != 0,
+          "forced GPU convergence tests require a Metal device");
+    mg_graph_destroy(graph);
+    check(mg_set_execution(MG_EXEC_AUTO) == MG_OK, "restore auto after no GPU");
+    return;
+  }
+  check(status == MG_OK, "HITS max_iter still returns scores with MG_OK");
+  check(iterations == 1, "HITS exhausted one-iteration budget");
+  check(hubs[0] == 1.0f && hubs[1] == 0.0f &&
+        authorities[0] == 0.0f && authorities[1] == 1.0f,
+        "HITS max_iter scores remain compatible");
+  check(mg_last_run(&path, NULL, NULL) == MG_OK, "HITS execution telemetry");
+  check(path == (mode == MG_EXEC_GPU ? 0 : 1), "HITS forced execution path");
+  check_convergence(0, MG_STOP_MAX_ITER, 1.0);
+
+  /* Every combination of nullable output pointers is accepted. */
+  {
+    int mask, converged;
+    mg_stop_reason reason;
+    double delta;
+    for (mask = 0; mask < 8; ++mask) {
+      converged = -2;
+      reason = MG_STOP_NOT_APPLICABLE;
+      delta = -1.0;
+      check(mg_last_run_convergence(mask & 1 ? &converged : NULL,
+                                    mask & 2 ? &reason : NULL,
+                                    mask & 4 ? &delta : NULL) == MG_OK,
+            "nullable convergence outputs");
+      check(!(mask & 1) || converged == 0, "optional converged output");
+      check(!(mask & 2) || reason == MG_STOP_MAX_ITER,
+            "optional stop reason output");
+      check(!(mask & 4) || fabs(delta - 1.0) < 1e-6,
+            "optional final delta output");
+    }
+  }
+
+  check(mg_hits(graph, 0.5, 1, hubs, authorities, &iterations) == MG_OK,
+        "HITS exact tolerance boundary");
+  check_convergence(0, MG_STOP_MAX_ITER, 1.0); /* delta < V*tol, not <= */
+  check(mg_hits(graph, 1e-6, 20, hubs, authorities, &iterations) == MG_OK,
+        "HITS converged before budget");
+  check(iterations == 2, "HITS converges on second iteration");
+  check_convergence(1, MG_STOP_CONVERGED, 0.0);
+  check(mg_hits(graph, 1e-6, 2, hubs, authorities, &iterations) == MG_OK,
+        "HITS converged on final allowed iteration");
+  check(iterations == 2, "HITS used full converged budget");
+  check_convergence(1, MG_STOP_CONVERGED, 0.0);
+  check(setenv("MG_HITS_AUDIT_INTERVAL", "3", 1) == 0, "set HITS audit to 3");
+  check(mg_hits(graph, 1e-6, 20, hubs, authorities, &iterations) == MG_OK,
+        "HITS converged at scheduled audit");
+  check(iterations == 3, "HITS observes audit cadence");
+  check_convergence(1, MG_STOP_CONVERGED, 0.0);
+  check(mg_hits(graph, 1e-6, 2, hubs, authorities, &iterations) == MG_OK,
+        "HITS final partial audit converges");
+  check(iterations == 2, "HITS partial audit iteration count");
+  check_convergence(1, MG_STOP_CONVERGED, 0.0);
+  mg_graph_destroy(graph);
+
+  /* Fourth-update delta is 1/1513, not the third-audit delta 1/221. */
+  {
+    const uint32_t sources[3] = {0, 0, 1}, targets[3] = {0, 1, 1};
+    check(mg_graph_create_from_coo(sources, targets, NULL, 3, 2, 1,
+                                   &graph) == MG_OK, "residual graph");
+    check(mg_hits(graph, 1e-9, 4, hubs, authorities, &iterations) == MG_OK,
+          "HITS partial final audit exceeds tolerance");
+    check(iterations == 4, "HITS used four iterations");
+    check_convergence(0, MG_STOP_MAX_ITER, 1.0 / 1513.0);
+    mg_graph_destroy(graph);
+  }
+
+  {
+    uint32_t vertices;
+    for (vertices = 0; vertices <= 2; vertices += 2) {
+      check(mg_graph_create_from_coo(NULL, NULL, NULL, 0, vertices, 1,
+                                     &graph) == MG_OK, "empty HITS graph");
+      hubs[0] = hubs[1] = authorities[0] = authorities[1] = -1.0f;
+      check(mg_hits(graph, 1e-6, 10, vertices ? hubs : NULL,
+                    vertices ? authorities : NULL, &iterations) == MG_OK,
+            "empty or edgeless HITS");
+      check(iterations == 0, "empty HITS uses no iterations");
+      check_convergence(1, MG_STOP_EMPTY_GRAPH, 0.0);
+      check(mg_last_run(&path, NULL, NULL) == MG_OK, "empty HITS path");
+      check(path == (vertices && mode == MG_EXEC_GPU ? 0 : 1),
+            "zero vertices short-circuits to CPU");
+      if (vertices) {
+        check(hubs[0] == 0.0f && hubs[1] == 0.0f &&
+              authorities[0] == 0.0f && authorities[1] == 0.0f,
+              "edgeless HITS returns zero scores");
+      }
+      mg_graph_destroy(graph);
+    }
+  }
+  check(mg_set_execution(MG_EXEC_AUTO) == MG_OK, "restore auto after HITS");
+}
+
 int main(void) {
   check(strcmp(mg_version(), MG_VERSION_STRING) == 0,
         "mg_version matches MG_VERSION_STRING");
   check(mg_set_execution(MG_EXEC_AUTO) == MG_OK, "set_execution(auto)");
+  check_convergence(-1, MG_STOP_NOT_APPLICABLE, NAN);
+  check_hits_convergence(MG_EXEC_CPU);
+  check_hits_convergence(MG_EXEC_GPU);
+  check(setenv("MG_HITS_AUDIT_INTERVAL", "5", 1) == 0, "restore HITS audit");
 
   /* Oversized edge counts must fail before the core reads edge pointers. */
   {
@@ -88,6 +219,7 @@ int main(void) {
       sum += (double)rank[i];
     }
     check(fabs(sum - 1.0) < 1e-3, "pagerank sums to ~1");
+    check_convergence(-1, MG_STOP_NOT_APPLICABLE, NAN);
   }
 
   /* HITS: structural hub/authority scores, each L1-normalized. */
@@ -130,6 +262,7 @@ int main(void) {
     check(parent[0] == -1, "bfs source parent -1");
     check(dist[1] == 1 && dist[2] == 1, "bfs level-1 dists");
     check(dist[9] == 2, "bfs dist[9] == 2 (0->1->9)");
+    check_convergence(-1, MG_STOP_NOT_APPLICABLE, NAN);
   }
 
   /* wcc: graph is weakly connected -> one component, ids all 0 */

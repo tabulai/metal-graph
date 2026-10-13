@@ -44,6 +44,10 @@ def main() -> None:
     )
     assert version("metal-graph") == mg.__version__
     assert mg.__version__ == mg._core.__version__ == mg._core.version()
+    initial = mg.last_run_info()
+    assert initial["converged"] is None
+    assert initial["stop_reason"] == "not_applicable"
+    assert initial["final_delta_l1"] is None
 
     if args.expect == "cpu":
         assert os.environ.get("MG_FORCE_CPU") == "1"
@@ -77,13 +81,56 @@ def main() -> None:
         np.full(3, 1.0 / 3.0),
         atol=1e-6,
     )
-    assert mg.last_run_info()["op"] == "hits"
-    assert mg.last_run_info()["path"] == args.expect
+    info = mg.last_run_info()
+    assert info["op"] == "hits"
+    assert info["path"] == args.expect
+    assert info["converged"] is True
+    assert info["stop_reason"] == "converged"
+    assert 0.0 <= info["final_delta_l1"] < 3e-8
+
+    edge = mg.Graph.from_edges(
+        np.array([0], dtype=np.uint32),
+        np.array([1], dtype=np.uint32),
+        directed=True,
+        num_vertices=2,
+    )
+    for budget, converged, reason, delta in (
+            (1, False, "max_iter", 1.0),
+            (2, True, "converged", 0.0)):
+        hubs, authorities = mg.hits(edge, tol=1e-6, max_iter=budget)
+        np.testing.assert_array_equal(hubs, [1.0, 0.0])
+        np.testing.assert_array_equal(authorities, [0.0, 1.0])
+        info = mg.last_run_info()
+        assert info["path"] == args.expect
+        assert info["iterations"] == budget
+        assert info["converged"] is converged
+        assert info["stop_reason"] == reason
+        assert info["final_delta_l1"] == delta
+
+    for vertices in (0, 2):
+        empty = mg.Graph.from_edges(
+            np.array([], dtype=np.uint32),
+            np.array([], dtype=np.uint32),
+            directed=True,
+            num_vertices=vertices,
+        )
+        hubs, authorities = mg.hits(empty)
+        np.testing.assert_array_equal(hubs, np.zeros(vertices))
+        np.testing.assert_array_equal(authorities, np.zeros(vertices))
+        info = mg.last_run_info()
+        assert info["path"] == (args.expect if vertices else "cpu")
+        assert info["iterations"] == 0
+        assert info["converged"] is True
+        assert info["stop_reason"] == "empty_graph"
+        assert info["final_delta_l1"] == 0.0
 
     distance, parent = mg.bfs(graph, sources=[0], direction="out")
     np.testing.assert_array_equal(distance, np.array([0, 1, 2]))
     np.testing.assert_array_equal(parent, np.array([-1, 0, 1]))
     assert mg.last_run_info()["path"] == args.expect
+    assert mg.last_run_info()["converged"] is None
+    assert mg.last_run_info()["stop_reason"] == "not_applicable"
+    assert mg.last_run_info()["final_delta_l1"] is None
 
     print(
         f"installed wheel smoke passed: version={mg.__version__} "

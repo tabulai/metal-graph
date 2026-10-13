@@ -11,6 +11,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 
@@ -44,12 +45,18 @@ using BufferPtr = std::shared_ptr<Buffer>;
 enum class ExecMode : int { autom = 0, gpu = 1, cpu = 2 };
 enum class ExecPath : int { gpu = 0, cpu = 1 };
 
+enum class StopReason { not_applicable, converged, max_iter, empty_graph };
+
 // Telemetry for the last executed operation (planner assertion in tests).
 struct RunInfo {
   std::string op;
   ExecPath path = ExecPath::cpu;
   int iterations = 0;   // pagerank/HITS/WCC rounds; BFS levels
   double elapsed_ms = 0.0;
+  // Only HITS reports convergence so far. Each operation starts with these
+  // defaults so an unrelated run cannot retain a previous HITS outcome.
+  StopReason stop_reason = StopReason::not_applicable;
+  double final_delta_l1 = std::numeric_limits<double>::quiet_NaN();
 };
 
 // ---------------------------------------------------------------------------

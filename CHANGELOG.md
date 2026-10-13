@@ -4,6 +4,12 @@ All notable changes to metal-graph are documented here.
 
 ## Unreleased
 
+- Exposed HITS convergence status and final hub L1 change through Python's
+  `last_run_info()` and the additive C accessor `mg_last_run_convergence()`.
+  Callers can distinguish convergence (including on the final allowed
+  iteration), an exhausted iteration budget, and empty/edgeless graphs;
+  existing score returns and C function signatures are unchanged.
+
 ## 0.1.1 — 2026-09-04
 
 - Added Metal-native HITS hub/authority centrality with a threaded fp64 CPU
