@@ -86,3 +86,32 @@ def test_khop_extraction_paths_match_oracle(big_graph, mode, monkeypatch):
                                                           err_msg=str(ctx))
     finally:
         mg.set_execution("auto")
+
+
+@pytest.mark.parametrize("max_vertices", [50, 5000])
+def test_khop_capped_discovery_thread_invariant(big_graph, max_vertices,
+                                                monkeypatch):
+    """Edge-balanced frontier expansion splits hub rows across threads;
+    with max_vertices binding mid-level, admission must still keep the
+    same lowest-user-index candidates at every thread count."""
+    g, src, dst, v, _ = big_graph
+    deg = np.bincount(src, minlength=v) + np.bincount(dst, minlength=v)
+    order = np.argsort(-deg, kind="stable")
+    mg.set_execution("cpu")
+    try:
+        for seeds in ([int(order[0])], [int(order[40])],
+                      [int(x) for x in order[[1, 500, 4000]]]):
+            for direction in ("out", "in", "both"):
+                n_all = mg.k_hop(g, seeds, k=2, direction=direction)[0].size
+                outs = []
+                for threads in ("1", "3", "16"):
+                    monkeypatch.setenv("MG_THREADS", threads)
+                    vs, es = mg.k_hop(g, seeds, k=2, direction=direction,
+                                      max_vertices=max_vertices)
+                    outs.append((np.asarray(vs).copy(), np.asarray(es).copy()))
+                assert outs[0][0].size == min(max_vertices, n_all)
+                for vs, es in outs[1:]:
+                    np.testing.assert_array_equal(vs, outs[0][0])
+                    np.testing.assert_array_equal(es, outs[0][1])
+    finally:
+        mg.set_execution("auto")

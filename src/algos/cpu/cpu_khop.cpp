@@ -89,13 +89,35 @@ std::vector<uint32_t> khop_vertices(Graph& g, const uint32_t* seeds_canon,
     if (frontier.empty()) break;
     std::vector<uint32_t> cand;
     std::mutex mtx;
+    // Edge-balanced partition: each thread owns an equal slice of the
+    // frontier's concatenated edge ranges (fwd then rev per vertex), so hub
+    // rows and degree-skewed frontiers (canonical order is degree-descending)
+    // are split across threads. The per-level candidate SET is partition-
+    // invariant (seen[] is claimed once); only within-level order varies.
+    const std::size_t F = frontier.size();
+    std::vector<uint64_t> pre(F + 1);
+    pre[0] = 0;
+    for (std::size_t i = 0; i < F; ++i) {
+      const uint32_t v = frontier[i];
+      uint64_t d = fwd.row[v + 1] - fwd.row[v];
+      if (two_sided) d += rev.row[v + 1] - rev.row[v];
+      pre[i + 1] = pre[i] + d;
+    }
+    const uint64_t total = pre[F];
+    // Below this many frontier edges: one inline slice. Each extra slice
+    // costs a thread spawn, which outweighs splitting 8k-65k-edge levels.
+    constexpr uint64_t kSliceEdges = 65536;
+    std::size_t chunks = static_cast<std::size_t>(std::min<uint64_t>(
+        num_threads(), (total + kSliceEdges - 1) / kSliceEdges));
+    if (chunks == 0) chunks = 1;
+    const uint64_t per = (total + chunks - 1) / chunks;
     parallel_for(
-        frontier.size(),
-        [&](std::size_t b, std::size_t e) {
+        chunks,
+        [&](std::size_t cb, std::size_t ce) {
           std::vector<uint32_t> local;
-          auto expand = [&](const Csr& c, uint32_t v) {
-            for (uint32_t j = c.row[v]; j < c.row[v + 1]; ++j) {
-              const uint32_t u = c.col[j];
+          auto scan = [&](const uint32_t* col, uint32_t lo, uint32_t hi) {
+            for (uint32_t j = lo; j < hi; ++j) {
+              const uint32_t u = col[j];
               uint8_t expect = 0;
               if (seen[u].load(std::memory_order_relaxed) == 0 &&
                   seen[u].compare_exchange_strong(
@@ -103,16 +125,38 @@ std::vector<uint32_t> khop_vertices(Graph& g, const uint32_t* seeds_canon,
                 local.push_back(u);
             }
           };
-          for (std::size_t i = b; i < e; ++i) {
-            expand(fwd, frontier[i]);
-            if (two_sided) expand(rev, frontier[i]);
+          for (std::size_t c = cb; c < ce; ++c) {
+            uint64_t cur = c * per;
+            const uint64_t hi = std::min(total, cur + per);
+            if (cur >= hi) continue;
+            // Last frontier slot whose edge range starts at or before cur.
+            std::size_t i = static_cast<std::size_t>(
+                std::upper_bound(pre.begin(), pre.end(), cur) - pre.begin() -
+                1);
+            for (; cur < hi && i < F; ++i) {
+              const uint32_t v = frontier[i];
+              const uint64_t a = cur - pre[i];                  // slice start
+              const uint64_t b = std::min(hi, pre[i + 1]) - pre[i];  // end
+              const uint32_t f0 = fwd.row[v];
+              const uint64_t dfwd = fwd.row[v + 1] - f0;
+              if (a < dfwd)
+                scan(fwd.col, static_cast<uint32_t>(f0 + a),
+                     static_cast<uint32_t>(f0 + std::min(b, dfwd)));
+              if (two_sided && b > dfwd) {
+                const uint32_t r0 = rev.row[v];
+                scan(rev.col,
+                     static_cast<uint32_t>(r0 + (std::max(a, dfwd) - dfwd)),
+                     static_cast<uint32_t>(r0 + (b - dfwd)));
+              }
+              cur = pre[i] + b;
+            }
           }
           if (!local.empty()) {
             std::lock_guard<std::mutex> lk(mtx);
             cand.insert(cand.end(), local.begin(), local.end());
           }
         },
-        1024);
+        1);
     const bool stop = admit(cand);
     frontier.swap(cand);
     if (stop) break;

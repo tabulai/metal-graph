@@ -213,8 +213,9 @@ int bfs_sparse_user(Graph& g, const uint32_t* sources_canon,
                     int32_t* parent_user);
 
 // Truncated multi-source BFS honoring caps; returns reached canonical ids
-// in discovery order (deterministic: level by level; when max_vertices
-// binds mid-level, candidates are admitted in ascending USER index order).
+// level by level (the reached SET is deterministic; order within a level is
+// unspecified); when max_vertices binds mid-level, candidates are admitted
+// in ascending USER index order.
 std::vector<uint32_t> khop_vertices(Graph& g, const uint32_t* seeds_canon,
                                     uint32_t n_seeds, uint32_t k, BfsDir dir,
                                     uint32_t max_vertices);
