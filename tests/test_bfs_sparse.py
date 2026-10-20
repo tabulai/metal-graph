@@ -107,3 +107,43 @@ def test_bfs_output_kwarg_validated():
     g = build_mg(ALL_CASES["ring"])
     with pytest.raises(ValueError):
         mg.bfs(g, 0, direction="out", output="csr")
+
+
+@pytest.mark.parametrize("mode", ["cpu", pytest.param("gpu",
+                                                      marks=pytest.mark.gpu)])
+@pytest.mark.parametrize("threads", ["1", "16"])
+def test_sparse_fallback_compaction_large_v(mode, threads, monkeypatch):
+    """Dense-fallback compaction runs chunked in parallel from V = 2**18:
+    output must be ascending user ids equal to the dense result's reached
+    set and dist, with structurally valid parents, at any thread count."""
+    if mode == "gpu" and not mg.has_gpu():
+        pytest.skip("no Metal device")
+    rng = np.random.default_rng(8)
+    v = (1 << 18) + 4321  # last chunk partial
+    e = 600_000
+    src = rng.integers(0, v, e).astype(np.uint32)
+    dst = rng.integers(0, v, e).astype(np.uint32)
+    perm = rng.permutation(v).astype(np.uint32)  # user order != canonical
+    g = mg.Graph.from_edges(perm[src], perm[dst], directed=True,
+                            num_vertices=v)
+    monkeypatch.setenv("MG_BFS_SPARSE_MAX_VERTICES", "0")  # force fallback
+    monkeypatch.setenv("MG_THREADS", threads)
+    mg.set_execution(mode)
+    try:
+        sources = np.asarray(perm[[0, 1]], np.uint32)
+        vs, dist, parent = mg.bfs(g, sources, output="sparse")
+        assert mg.last_run_info()["op"] == "bfs"
+        dense, _ = mg.bfs(g, sources)
+    finally:
+        mg.set_execution("auto")
+    vs, dist, parent = (np.asarray(a) for a in (vs, dist, parent))
+    dense = np.asarray(dense)
+    np.testing.assert_array_equal(vs, np.flatnonzero(dense >= 0))
+    np.testing.assert_array_equal(dist, dense[vs])
+    assert vs.size > 100_000
+    child = dist > 0
+    assert (parent[~child] == -1).all()
+    p, c = parent[child].astype(np.int64), vs[child].astype(np.int64)
+    assert (dense[p] == dist[child] - 1).all()
+    keys = perm[src].astype(np.int64) * v + perm[dst]
+    assert np.isin(p * v + c, keys).all()

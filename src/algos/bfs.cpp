@@ -47,25 +47,30 @@ int bfs(Graph& g, const uint32_t* sources_canon, uint32_t n_sources,
 
 namespace {
 
-// Full (threaded CPU or GPU) traversal in canonical space, translated to
-// dense USER-order outputs — the shared fallback behind both the dense
-// entry and the sparse-output entry.
+// Full (threaded CPU or GPU) traversal in canonical space — the shared
+// fallback behind both the dense entry and the sparse-output entry.
+int run_dense_canon(Graph& g, const std::vector<uint32_t>& src_canon,
+                    BfsDir dir, ExecPath path, std::vector<int32_t>& dist_c,
+                    std::vector<int32_t>& parent_c) {
+  const uint32_t V = g.V;
+  dist_c.assign(V, -1);
+  parent_c.assign(V, -1);
+  if (V == 0) return 0;
+  if (path == ExecPath::gpu)
+    return gpu::bfs(g, src_canon.data(),
+                    static_cast<uint32_t>(src_canon.size()), dir,
+                    dist_c.data(), parent_c.data(), 0);
+  return cpu::bfs(g, src_canon.data(), static_cast<uint32_t>(src_canon.size()),
+                  dir, dist_c.data(), parent_c.data());
+}
+
+// Dense traversal translated to dense USER-order outputs.
 int run_dense_user(Graph& g, const std::vector<uint32_t>& src_canon,
                    BfsDir dir, ExecPath path, int32_t* out_dist,
                    int32_t* out_parent) {
   const uint32_t V = g.V;
-  int levels = 0;
-  std::vector<int32_t> dist_c(V, -1), parent_c(V, -1);
-  if (V > 0) {
-    if (path == ExecPath::gpu)
-      levels = gpu::bfs(g, src_canon.data(),
-                        static_cast<uint32_t>(src_canon.size()), dir,
-                        dist_c.data(), parent_c.data(), 0);
-    else
-      levels = cpu::bfs(g, src_canon.data(),
-                        static_cast<uint32_t>(src_canon.size()), dir,
-                        dist_c.data(), parent_c.data());
-  }
+  std::vector<int32_t> dist_c, parent_c;
+  const int levels = run_dense_canon(g, src_canon, dir, path, dist_c, parent_c);
   parallel_for(V, [&](std::size_t b, std::size_t e) {
     for (std::size_t u = b; u < e; ++u) {
       const uint32_t c = g.canon_of_user[u];
@@ -197,23 +202,66 @@ int bfs_sparse(Graph& g, const uint32_t* sources, uint32_t n_sources,
   }
 
   if (!collected && V > 0) {
-    // Cap overflow or forced GPU: run the full machinery densely, then
-    // compact — naturally ascending in user order.
-    std::vector<int32_t> dist_u(V), parent_u(V);
-    levels = run_dense_user(g, src_canon, dir, path, dist_u.data(),
-                            parent_u.data());
-    std::size_t reached = 0;
-    for (uint32_t u = 0; u < V; ++u) reached += (dist_u[u] >= 0);
-    out.vertices.reserve(reached);
-    out.dist.reserve(reached);
-    out.parent.reserve(reached);
-    for (uint32_t u = 0; u < V; ++u) {
-      if (dist_u[u] >= 0) {
-        out.vertices.push_back(u);
-        out.dist.push_back(dist_u[u]);
-        out.parent.push_back(parent_u[u]);
-      }
-    }
+    // Cap overflow or forced GPU: run the full machinery densely in
+    // canonical space, then compact straight into USER order (no dense
+    // USER-order intermediate). Two passes over fixed USER-index chunks —
+    // per-chunk reached counts, an exclusive prefix, one resize, then each
+    // chunk fills its own slice — so the output is ascending in user order
+    // and independent of the thread count (chunking depends only on V).
+    std::vector<int32_t> dist_c, parent_c;
+    levels = run_dense_canon(g, src_canon, dir, path, dist_c, parent_c);
+    const uint32_t* cou = g.canon_of_user.data();
+    const int32_t* dc = dist_c.data();
+    const int32_t* pc = parent_c.data();
+    constexpr std::size_t kChunk = 16384;  // user indices per chunk
+    const std::size_t nchunks =
+        (static_cast<std::size_t>(V) + kChunk - 1) / kChunk;
+    // Thread spawn (~0.15-0.3 ms per parallel_for) only pays off once the
+    // two O(V) gathers are large; below the threshold run both inline
+    // (measured: serial wins at V=100k, parallel wins from V=2^18).
+    constexpr std::size_t kParMinV = std::size_t{1} << 18;
+    const std::size_t pgrain = V >= kParMinV ? 1 : nchunks;
+    std::vector<std::size_t> off(nchunks + 1, 0);
+    parallel_for(
+        nchunks,
+        [&](std::size_t b, std::size_t e) {
+          for (std::size_t c = b; c < e; ++c) {
+            const std::size_t lo = c * kChunk;
+            const std::size_t hi = std::min<std::size_t>(V, lo + kChunk);
+            std::size_t n = 0;
+            for (std::size_t u = lo; u < hi; ++u) n += (dc[cou[u]] >= 0);
+            off[c + 1] = n;
+          }
+        },
+        pgrain);
+    for (std::size_t c = 0; c < nchunks; ++c) off[c + 1] += off[c];
+    const std::size_t reached = off[nchunks];
+    out.vertices.resize(reached);
+    out.dist.resize(reached);
+    out.parent.resize(reached);
+    uint32_t* ov = out.vertices.data();
+    int32_t* od = out.dist.data();
+    int32_t* op = out.parent.data();
+    parallel_for(
+        nchunks,
+        [&](std::size_t b, std::size_t e) {
+          for (std::size_t c = b; c < e; ++c) {
+            const std::size_t lo = c * kChunk;
+            const std::size_t hi = std::min<std::size_t>(V, lo + kChunk);
+            std::size_t w = off[c];
+            for (std::size_t u = lo; u < hi; ++u) {
+              const uint32_t cv = cou[u];
+              const int32_t d = dc[cv];
+              if (d >= 0) {
+                ov[w] = static_cast<uint32_t>(u);
+                od[w] = d;
+                op[w] = boundary::canon_value_to_user(g, pc[cv]);
+                ++w;
+              }
+            }
+          }
+        },
+        pgrain);
   }
 
   const double ms = std::chrono::duration<double, std::milli>(
