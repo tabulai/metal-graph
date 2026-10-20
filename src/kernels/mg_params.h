@@ -42,6 +42,8 @@ typedef int32_t mg_i32;
 //   huge: degree >= MG_BIN_HUGE_MIN      -> fixed edge TILES across many
 //                                           threadgroups (see below)
 //   high: MG_BIN_HIGH_MIN <= d < HUGE    -> one threadgroup per vertex
+//                                           (GPU BFS: up to K per vertex,
+//                                           split by mg_bfs_decide)
 //   mid:  MG_BIN_MID_MIN <= d < HIGH_MIN -> one simdgroup per vertex
 //   low:  1 <= d < MG_BIN_MID_MIN        -> one thread per vertex
 //   zero: d == 0                          -> zero-fill list (per orientation)
@@ -160,8 +162,8 @@ typedef struct MGBfsControl {
   mg_u32 bin_count_low;
   mg_u32 frontier_edges;  // sum of degrees over current frontier (atomic)
   mg_u32 unvisited;       // V - #visited so far (maintained by decide)
-  mg_u32 pad0;
-  mg_u32 pad1;
+  mg_u32 max_high_deg;    // max degree in the high bin this level (atomic max)
+  mg_u32 high_split;      // threadgroups per high-bin vertex (decide)
 } MGBfsControl;
 
 typedef struct MGBfsParams {
@@ -172,13 +174,19 @@ typedef struct MGBfsParams {
   mg_u32 alpha_cut;       // bottom-up when frontier_edges * alpha_cut > e_unvisited... see decide
   mg_u32 beta_cut;        // bottom-up density guard: frontier_count * beta_cut > V
   mg_u32 enable_bottomup; // 0 disables bottom-up entirely
-  mg_u32 pad0;
+  mg_u32 high_split_max;  // cap on threadgroups per high-bin vertex (>= 1;
+                          // MG_BFS_HIGH_SPLIT_MAX, 1 = unsplit)
 } MGBfsParams;
+
+// BFS high-bin split target: mg_bfs_decide picks high_split so the high-bin
+// expand grid has about this many threadgroups (never splitting below
+// ~MG_BIN_HIGH_MIN edges per slice).
+#define MG_BFS_HIGH_SPLIT_TARGET_TGS 2048u
 
 // Indirect dispatch argument slots (MTLDispatchThreadgroupsIndirectArguments
 // = 3 x uint32). The BFS args buffer holds MG_BFS_ARGS_SLOTS slots:
 #define MG_BFS_ARG_BIN 0u       // mg_bfs_frontier_bin dispatch
-#define MG_BFS_ARG_EXPAND_TG 1u // mg_bfs_expand_tg (one tg per high vertex)
+#define MG_BFS_ARG_EXPAND_TG 1u // mg_bfs_expand_tg ({high vertices, split, 1})
 #define MG_BFS_ARG_EXPAND_SG 2u // mg_bfs_expand_sg
 #define MG_BFS_ARG_EXPAND_TH 3u // mg_bfs_expand_thread
 #define MG_BFS_ARG_BOTTOMUP 4u  // mg_bfs_bottomup_probe (covers all V)
@@ -418,12 +426,13 @@ typedef struct MGScanParams {
 // Level sequence (encoded per level; encoder breaks marked |):
 //   mg_bfs_prepare_level  (1 tg): frontier_count = next_count;
 //       next_count = 0; if (frontier_count == 0) done = 1; level += 1;
-//       zero bin counts & frontier_edges; write args[BIN] =
+//       zero bin counts, frontier_edges & max_high_deg; write args[BIN] =
 //       ceil(frontier_count / tg_size). (Host swaps the frontier/next
 //       buffer BINDINGS each level — kernels always read b4, append to b5.)
 //   | mg_bfs_frontier_bin (indirect ARG_BIN): thread i < frontier_count reads
 //       v = frontier[i], d = degree(v), appends v to the right bin (atomic
-//       bin counters in control), atomically adds d to frontier_edges.
+//       bin counters in control), atomically adds d to frontier_edges and
+//       atomic-maxes high-bin degrees into max_high_deg.
 //       Must no-op entirely when control.done == 1.
 //   mg_bfs_decide (1 tg): unvisited -= frontier_count; mode = BOTTOMUP iff
 //       enable_bottomup && frontier_edges * alpha_cut > e_count AND
@@ -431,9 +440,13 @@ typedef struct MGScanParams {
 //       guard prevents a single high-degree hub from triggering a full
 //       reverse-CSR scan. Write args[EXPAND_*] from bin counts
 //       (0 groups for the unused path), args[BOTTOMUP] = ceil(V/tg_size) or
-//       0. All args 0 when done == 1.
+//       0. All args 0 when done == 1. Top-down args[EXPAND_TG] = {bh, K, 1},
+//       high_split = K = min(ceil(max_high_deg / MG_BIN_HIGH_MIN),
+//       max(1, MG_BFS_HIGH_SPLIT_TARGET_TGS / bh), high_split_max).
 //   | mg_bfs_expand_tg / _sg / _thread (indirect): top-down expansion of the
-//       matching bin; claim neighbors via visited-bitmap atomic_fetch_or;
+//       matching bin (expand_tg: threadgroup (x, y) takes slice y of
+//       high_split slices of vertex bins[x]'s edges);
+//       claim neighbors via visited-bitmap atomic_fetch_or;
 //       append to next via simd-compaction (sg/tg variants) or per-discovery
 //       atomic (thread variant); dist[nbr] = level; parent[nbr] = v.
 //   mg_bfs_bottomup_probe (indirect): thread per vertex v: if dist[v] == -1,

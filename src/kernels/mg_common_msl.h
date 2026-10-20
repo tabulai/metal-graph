@@ -64,8 +64,8 @@ typedef struct MGBfsControlDev {
   atomic_uint bin_count_low;   // atomic (frontier_bin)
   atomic_uint frontier_edges;  // atomic (frontier_bin)
   uint unvisited;              // single-writer (decide)
-  uint pad0;
-  uint pad1;
+  atomic_uint max_high_deg;    // atomic (frontier_bin)
+  uint high_split;             // single-writer (decide)
 } MGBfsControlDev;
 
 #endif  // MG_COMMON_MSL_H

@@ -375,6 +375,7 @@ shallow traversals responsive while reducing host round-trips on deep graphs.
 | `MG_WCC_CPU_PAR_MIN_EDGES` | 131072 | CPU WCC uses the threaded union-find at or above this many stored edges (serial below it, or when `MG_THREADS=1`) |
 | `MG_GPU_TOPK` | 1 | GPU radix-select for `ppr_topk` (0 = CPU oracle) |
 | `MG_BFS_BOTTOMUP` | 1 | direction-optimizing bottom-up switch |
+| `MG_BFS_HIGH_SPLIT_MAX` | 64 | GPU BFS: max threadgroups per high-degree frontier vertex (1 = unsplit; clamped 1–1024) |
 | `MG_REQUIRE_GPU` | 0 | hard-fail when no Metal device |
 | `MG_FORCE_CPU` | 0 | disable the GPU entirely |
 | `MG_THREADS` | all cores | CPU-path thread count |

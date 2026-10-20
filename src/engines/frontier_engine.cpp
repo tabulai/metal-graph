@@ -100,6 +100,10 @@ int FrontierEngine::run_bfs(Graph& g,
   p.alpha_cut = 14;
   p.beta_cut = 24;
   p.enable_bottomup = enable_bottomup ? 1u : 0u;
+  // Max threadgroups per high-bin frontier vertex (1 = one threadgroup per
+  // vertex, the pre-split behavior); decide adapts K below this cap.
+  p.high_split_max = static_cast<uint32_t>(
+      std::clamp<long>(env_long("MG_BFS_HIGH_SPLIT_MAX", 64), 1, 1024));
 
   Buffer* row = fwd.row_offsets.get();
   Buffer* col = fwd.col_indices.get();

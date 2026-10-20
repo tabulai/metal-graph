@@ -339,3 +339,61 @@ def test_bfs_deep_chain_crosses_many_batches(monkeypatch):
     par = np.asarray(parent)
     assert par[0] == -1
     np.testing.assert_array_equal(par[1:], np.arange(v - 1, dtype=np.int32))
+
+
+def _multi_hub_graph():
+    """Source 0 -> hubs 1..3 (out-degrees 70k, 40k, 2k, so one level's high
+    bin mixes split and unsplit rows); hub edges overlap on shared leaves so
+    slices of different hubs race to claim the same vertices, and a second
+    level fans out of a 1.5k-degree leaf."""
+    rng = np.random.default_rng(17)
+    n_leaves = 90_000
+    leaf0 = 4
+    src = [np.zeros(3, np.int64)]
+    dst = [np.array([1, 2, 3])]
+    for hub, deg in ((1, 70_000), (2, 40_000), (3, 2_000)):
+        src.append(np.full(deg, hub))
+        dst.append(leaf0 + rng.choice(n_leaves, deg, replace=False))
+    deep = leaf0 + n_leaves
+    src.append(np.full(1_500, dst[1][0]))  # a leaf of hub 1
+    dst.append(np.arange(deep, deep + 1_500))
+    src = np.concatenate(src).astype(np.uint32)
+    dst = np.concatenate(dst).astype(np.uint32)
+    return src, dst, deep + 1_500
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("split_max", ["1", "2", "64"])
+@pytest.mark.parametrize("direction", ["out", "in"])
+def test_bfs_gpu_high_degree_split_matches_cpu(monkeypatch, split_max,
+                                               direction):
+    """GPU BFS splits a high-degree frontier row across up to
+    MG_BFS_HIGH_SPLIT_MAX threadgroups; dist must equal the CPU oracle and
+    every parent must be a real edge one level closer, at every cap."""
+    if not mg_core.has_gpu():
+        pytest.skip("no Metal device")
+    src, dst, v = _multi_hub_graph()
+    # direction="in" walks the IN orientation of the reversed graph, which
+    # has the same hub rows as the OUT orientation of the original.
+    gs, gd = (src, dst) if direction == "out" else (dst, src)
+    g = mg.Graph.from_edges(gs, gd, directed=True, num_vertices=v)
+    source = [0]
+    mg.set_execution("cpu")
+    try:
+        ref, _ = mg.bfs(g, source, direction=direction)
+        monkeypatch.setenv("MG_BFS_HIGH_SPLIT_MAX", split_max)
+        mg.set_execution("gpu")
+        dist, parent = mg.bfs(g, source, direction=direction)
+        assert mg.last_run_info()["path"] == "gpu"
+    finally:
+        mg.set_execution("auto")
+    dist = np.asarray(dist)
+    parent = np.asarray(parent)
+    np.testing.assert_array_equal(dist, np.asarray(ref))
+    assert dist.max() >= 2
+    child = np.flatnonzero(dist > 0)
+    par = parent[child]
+    assert (par >= 0).all()
+    np.testing.assert_array_equal(dist[par], dist[child] - 1)
+    edges = set(zip(src.tolist(), dst.tolist()))  # traversal edges p -> c
+    assert all((int(p), int(c)) in edges for p, c in zip(par, child))
