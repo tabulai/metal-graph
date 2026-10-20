@@ -1,6 +1,6 @@
-// wcc.cpp — mg::wcc entry point and mg::gpu::wcc (hook + pointer-jump
-// rounds over the OUT-orientation worklists; labels converge to the
-// minimum canonical id per component).
+// wcc.cpp — mg::wcc entry point and mg::gpu::wcc (one concurrent
+// union-find link pass over the OUT-orientation worklists plus one compress
+// pass; labels are the minimum canonical id per component).
 // SPDX-License-Identifier: Apache-2.0
 #include <algorithm>
 #include <chrono>
@@ -24,85 +24,63 @@ int wcc(Graph& g, uint32_t* labels_canon) {
 
   const Orientation& out_o = g.orientation(Dir::out);
   MTL::ComputePipelineState* pso_iota = rt.pipeline("mg_iota_u32");
-  MTL::ComputePipelineState* pso_fill = rt.pipeline("mg_fill_u32");
-  MTL::ComputePipelineState* pso_hook_tg = rt.pipeline("mg_wcc_hook_tg");
-  MTL::ComputePipelineState* pso_hook_sg = rt.pipeline("mg_wcc_hook_sg");
-  MTL::ComputePipelineState* pso_hook_th = rt.pipeline("mg_wcc_hook_thread");
-  MTL::ComputePipelineState* pso_hook_huge = rt.pipeline("mg_wcc_hook_huge");
-  MTL::ComputePipelineState* pso_jump = rt.pipeline("mg_wcc_jump");
+  MTL::ComputePipelineState* pso_link_tg = rt.pipeline("mg_wcc_link_tg");
+  MTL::ComputePipelineState* pso_link_sg = rt.pipeline("mg_wcc_link_sg");
+  MTL::ComputePipelineState* pso_link_th = rt.pipeline("mg_wcc_link_thread");
+  MTL::ComputePipelineState* pso_link_huge = rt.pipeline("mg_wcc_link_huge");
+  MTL::ComputePipelineState* pso_compress = rt.pipeline("mg_wcc_compress");
 
   BufferPtr labels = rt.alloc(std::size_t(V) * sizeof(uint32_t),
                               "wcc.labels");
-  BufferPtr changed = rt.alloc(sizeof(uint32_t), "wcc.changed");
 
   const uint32_t sgs_per_tg =
-      std::max(1u, MG_TG_SIZE / std::max(1u, rt.exec_width(pso_hook_sg)));
-  // Default 4 (was 8): convergence is only observable at batch granularity,
-  // and on skewed graphs each wasted post-convergence round costs real
-  // milliseconds — one extra sync is cheaper.
-  const long rpb = env_long("MG_WCC_ROUNDS_PER_BATCH", 4);
-  const int rounds_per_batch = rpb < 1 ? 1 : static_cast<int>(rpb);
-
-  {
-    CommandBatch cb(rt);
-    MGFillParams ip{0.0f, 0u, V, 0u};
-    cb.dispatch(pso_iota, &ip, sizeof(ip), {labels.get()},
-                ceil_div_u32(V, MG_TG_SIZE), MG_TG_SIZE);
-    cb.commit_and_wait();
-  }
-
-  const MGFillParams zero{0.0f, 0u, 1u, 0u};
-  const MGWccParams p_high{V, out_o.n_high, 0u, 0u};
-  const MGWccParams p_mid{V, out_o.n_mid, 0u, 0u};
-  const MGWccParams p_low{V, out_o.n_low, 0u, 0u};
-  const MGWccParams p_huge{V, out_o.n_tiles, 0u, 0u};
+      std::max(1u, MG_TG_SIZE / std::max(1u, rt.exec_width(pso_link_sg)));
+  // Undirected graphs store every u != v edge both ways; one copy suffices.
+  const uint32_t flags = g.directed ? 0u : MG_WCC_SKIP_TWINS;
+  const MGWccParams p_high{V, out_o.n_high, flags, 0u};
+  const MGWccParams p_mid{V, out_o.n_mid, flags, 0u};
+  const MGWccParams p_low{V, out_o.n_low, flags, 0u};
+  const MGWccParams p_huge{V, out_o.n_tiles, flags, 0u};
   const MGWccParams p_all{V, V, 0u, 0u};
 
-  const uint32_t* changed_host = changed->as<uint32_t>();
-  int total_rounds = 0;
-  for (;;) {
-    // Serial encoder, no indirect args -> no encoder breaks needed. Each
-    // round re-zeroes the flag, so after the batch it reflects the LAST
-    // round only.
-    CommandBatch cb(rt);
-    for (int r = 0; r < rounds_per_batch; ++r) {
-      cb.dispatch(pso_fill, &zero, sizeof(zero), {changed.get()}, 1u,
-                  MG_TG_SIZE);
-      if (out_o.n_high != 0)
-        cb.dispatch(pso_hook_tg, &p_high, sizeof(p_high),
-                    {out_o.wl_high.get(), out_o.row_offsets.get(),
-                     out_o.col_indices.get(), labels.get(), changed.get()},
-                    out_o.n_high, MG_TG_SIZE);
-      if (out_o.n_mid != 0)
-        cb.dispatch(pso_hook_sg, &p_mid, sizeof(p_mid),
-                    {out_o.wl_mid.get(), out_o.row_offsets.get(),
-                     out_o.col_indices.get(), labels.get(), changed.get()},
-                    ceil_div_u32(out_o.n_mid, sgs_per_tg), MG_TG_SIZE);
-      if (out_o.n_low != 0)
-        cb.dispatch(pso_hook_th, &p_low, sizeof(p_low),
-                    {out_o.wl_low.get(), out_o.row_offsets.get(),
-                     out_o.col_indices.get(), labels.get(), changed.get()},
-                    ceil_div_u32(out_o.n_low, MG_TG_SIZE), MG_TG_SIZE);
-      if (out_o.n_huge != 0)
-        cb.dispatch(pso_hook_huge, &p_huge, sizeof(p_huge),
-                    {out_o.tile_owner.get(), out_o.tile_first_edge.get(),
-                     out_o.wl_huge.get(), out_o.row_offsets.get(),
-                     out_o.col_indices.get(), labels.get(), changed.get()},
-                    out_o.n_tiles, MG_TG_SIZE);
-      cb.dispatch(pso_jump, &p_all, sizeof(p_all),
-                  {labels.get(), changed.get()},
-                  ceil_div_u32(V, MG_TG_SIZE), MG_TG_SIZE);
-    }
-    cb.commit_and_wait();
-    total_rounds += rounds_per_batch;
-    if (*changed_host == 0u) break;
-    if (static_cast<uint64_t>(total_rounds) > uint64_t(V) + 64u)
-      throw Error(ErrorCode::internal, "gpu::wcc failed to converge");
-  }
+  // Single batch, serial encoder (each dispatch sees the previous one's
+  // writes): iota -> one union-find link pass over every stored edge ->
+  // one compress pass. Concurrent union-find needs no convergence rounds:
+  // after the link pass every edge's endpoints share a tree rooted at the
+  // component's minimum canonical id, and compress flattens each vertex to
+  // that root. (MG_WCC_ROUNDS_PER_BATCH no longer applies; it is ignored.)
+  CommandBatch cb(rt);
+  const MGFillParams ip{0.0f, 0u, V, 0u};
+  cb.dispatch(pso_iota, &ip, sizeof(ip), {labels.get()},
+              ceil_div_u32(V, MG_TG_SIZE), MG_TG_SIZE);
+  if (out_o.n_huge != 0)
+    cb.dispatch(pso_link_huge, &p_huge, sizeof(p_huge),
+                {out_o.tile_owner.get(), out_o.tile_first_edge.get(),
+                 out_o.wl_huge.get(), out_o.row_offsets.get(),
+                 out_o.col_indices.get(), labels.get()},
+                out_o.n_tiles, MG_TG_SIZE);
+  if (out_o.n_high != 0)
+    cb.dispatch(pso_link_tg, &p_high, sizeof(p_high),
+                {out_o.wl_high.get(), out_o.row_offsets.get(),
+                 out_o.col_indices.get(), labels.get()},
+                out_o.n_high, MG_TG_SIZE);
+  if (out_o.n_mid != 0)
+    cb.dispatch(pso_link_sg, &p_mid, sizeof(p_mid),
+                {out_o.wl_mid.get(), out_o.row_offsets.get(),
+                 out_o.col_indices.get(), labels.get()},
+                ceil_div_u32(out_o.n_mid, sgs_per_tg), MG_TG_SIZE);
+  if (out_o.n_low != 0)
+    cb.dispatch(pso_link_th, &p_low, sizeof(p_low),
+                {out_o.wl_low.get(), out_o.row_offsets.get(),
+                 out_o.col_indices.get(), labels.get()},
+                ceil_div_u32(out_o.n_low, MG_TG_SIZE), MG_TG_SIZE);
+  cb.dispatch(pso_compress, &p_all, sizeof(p_all), {labels.get()},
+              ceil_div_u32(V, MG_TG_SIZE), MG_TG_SIZE);
+  cb.commit_and_wait();
 
   std::memcpy(labels_canon, labels->data(),
               std::size_t(V) * sizeof(uint32_t));
-  return total_rounds;
+  return 1;  // one link + compress pass
 }
 
 }  // namespace gpu

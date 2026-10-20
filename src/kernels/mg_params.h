@@ -54,7 +54,7 @@ typedef int32_t mg_i32;
 // MG_BIN_HUGE_MIN leave the high bin; their edge ranges are decomposed AT
 // BUILD TIME into fixed tiles of MG_HUGE_TILE_EDGES edges. PageRank gathers
 // them in a deterministic two-pass (per-tile threadgroup partials, then a
-// per-vertex finalize summing tiles in fixed order); WCC hooks tiles
+// per-vertex finalize summing tiles in fixed order); WCC links tiles
 // directly (no reduction needed). Fixed decomposition + ordered finalize
 // preserve the determinism guarantee at fixed iteration counts.
 #define MG_BIN_HUGE_MIN 16384u
@@ -194,10 +194,12 @@ typedef struct MGKhopParams {
 } MGKhopParams;
 
 // --- WCC ---
+// MGWccParams.flags bits (link kernels)
+#define MG_WCC_SKIP_TWINS 1u  // undirected storage: link only (v, u > v)
 typedef struct MGWccParams {
   mg_u32 v_count;
-  mg_u32 count;  // worklist length for this dispatch
-  mg_u32 pad0;
+  mg_u32 count;  // worklist length (link) or V (compress) for this dispatch
+  mg_u32 flags;  // MG_WCC_* bits
   mg_u32 pad1;
 } MGWccParams;
 
@@ -378,11 +380,11 @@ typedef struct MGScanParams {
 //   b5 rank_cur_b
 //   batched write contract: active lanes ASSIGN alpha*acc, inactive COPY.
 //
-// mg_wcc_hook_huge — grid: n_tiles tgs of MG_TG_SIZE
+// mg_wcc_link_huge — grid: n_tiles tgs of MG_TG_SIZE
 //   b0 MGWccParams (count = n_tiles)
 //   b1 tile_owner; b2 tile_first_edge; b3 wl_huge; b4 row_offsets;
-//   b5 col_indices; b6 labels (atomic_uint, V); b7 changed (atomic_uint, 1)
-//   per-edge hook over the tile; conditional changed store per thread.
+//   b5 col_indices; b6 labels (atomic_uint, V)
+//   per-edge union-find link over the tile (see WCC section).
 //
 // ======================= utilities (reduce.metal) ==========================
 // mg_fill_f32 — b0 MGFillParams; b1 dst (float)
@@ -462,17 +464,24 @@ typedef struct MGScanParams {
 //   deterministic: edges of reached_list[i] written at offsets[i..], in CSR order.
 //
 // ======================= WCC (wcc.metal) ====================================
-// mg_wcc_hook_{tg,sg,thread} — gridding like the gather variants, worklists
+// One batch: mg_iota_u32 (labels[i] = i), the link kernels (huge, high,
+// mid, low), then mg_wcc_compress — a single pass each, no rounds.
+// labels is a union-find parent array with labels[x] <= x at all times, so
+// each tree is rooted at its component's minimum canonical id.
+// mg_wcc_link_{tg,sg,thread} — gridding like the gather variants, worklists
 // are the OUT orientation bins.
-//   b0 MGWccParams (count = worklist len); b1 worklist; b2 row_off; b3 col_idx;
-//   b4 labels (atomic_uint, V); b5 changed (atomic_uint, 1)
-//   For each edge (v,u): lv = load(labels[v]), lu = load(labels[u]),
-//   m = min(lv, lu); atomic_min(labels[u], m); atomic_min(labels[v], m);
-//   set *changed = 1 if either min actually lowered a label.
-// mg_wcc_jump — grid ceil(V / MG_TG_SIZE)
-//   b0 MGWccParams (count = V); b1 labels (atomic_uint, V); b2 changed
-//   l = load(labels[v]); gp = load(labels[l]); if gp < l:
-//   atomic_min(labels[v], gp); *changed = 1.
+//   b0 MGWccParams (count = worklist len; flags MG_WCC_SKIP_TWINS for
+//   undirected graphs); b1 worklist; b2 row_off; b3 col_idx;
+//   b4 labels (atomic_uint, V)
+//   For each edge (v,u): rv = find(v) (hoisted per thread), ru = find(u)
+//   (non-atomic parent loads — stale values are ancestors, so harmless;
+//   path halving stores a grandparent into non-roots); if ru != rv:
+//   CAS(labels[max], expected = max, desired = min) — succeeds only while
+//   max is still a root; on failure re-find and retry.
+// mg_wcc_compress — grid ceil(V / MG_TG_SIZE)
+//   b0 MGWccParams (count = V); b1 labels (atomic_uint, V)
+//   labels[v] = root(v) (full walk; after it labels[r] == r for roots and
+//   labels[v] == root for all v).
 //
 // ======================= top-k select (select.metal) ========================
 // GPU radix-select (plan M3, behind the same API as the CPU oracle): per

@@ -9,9 +9,10 @@
 #    permutations are inverse bijections.
 # 2. Repeated-run determinism (gpu): BFS dist and WCC labels must be
 #    bit-identical across 25 runs on a ~50k-edge random directed graph —
-#    hammers the atomic claim (visited bitmap) and hook (atomic_min label)
-#    paths for lost-update bugs. Min-label convergence and BFS levels are
-#    order-independent, so ANY run-to-run difference is a real atomics bug.
+#    hammers the atomic claim (visited bitmap) and union-find link (CAS on
+#    labels) paths for lost-update bugs. Min-root union-find and BFS levels
+#    are order-independent, so ANY run-to-run difference is a real atomics
+#    bug.
 # SPDX-License-Identifier: Apache-2.0
 
 import os
@@ -185,7 +186,7 @@ def test_debug_orientation_returns_fresh_copies():
 def _megastar():
     """Bidirectional star: hub 0 <-> 40k spokes. Hub degree 40 000 >= HUGE_MIN
     in BOTH orientations => the huge bin and its 3-tile decomposition are
-    exercised by PageRank (IN) and WCC hook (OUT)."""
+    exercised by PageRank (IN) and WCC link (OUT)."""
     mg = mg_mod()
     n = 40_000
     spokes = np.arange(1, n + 1, dtype=np.uint32)
@@ -208,7 +209,7 @@ def test_megastar_populates_huge_bin():
 
 @pytest.mark.gpu
 def test_megastar_huge_bin_gpu_matches_cpu():
-    """Numeric agreement through the tiled two-pass gather / tiled hook."""
+    """Numeric agreement through the tiled two-pass gather / tiled link."""
     mg = mg_mod()
     if not has_gpu():
         pytest.skip("no Metal device")
@@ -319,9 +320,9 @@ def test_bfs_repeated_runs_bit_identical(rand_graph, gpu_exec, bottomup):
 
 @pytest.mark.gpu
 def test_wcc_repeated_runs_identical(rand_graph, gpu_exec):
-    """WCC min-label convergence is order-independent, so the converged
-    labels are unique regardless of hook/jump scheduling — 25 runs hammer
-    the atomic_min hook paths; any difference is a lost-update bug."""
+    """WCC union-find roots each component at its minimum id regardless of
+    link scheduling, so the labels are unique — 25 runs hammer the CAS link
+    paths; any difference is a lost-update bug."""
     mg = gpu_exec
     mg.set_execution("cpu")
     labels_cpu = np.asarray(mg.experimental.wcc(rand_graph))

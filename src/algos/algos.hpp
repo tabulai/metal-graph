@@ -42,7 +42,7 @@
 //   sorting. Outputs sorted ascending: vs by user index, es by input edge id.
 //
 // WCC: undirected connected components over the stored edges (directed
-//   edges treated as undirected by hooking both endpoints). Output:
+//   edges treated as undirected by uniting both endpoints). Output:
 //   comp[user_idx] = component id; components numbered by first occurrence
 //   in USER index order (canonical-partition semantics).
 //

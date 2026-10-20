@@ -51,7 +51,7 @@ enum class StopReason { not_applicable, converged, max_iter, empty_graph };
 struct RunInfo {
   std::string op;
   ExecPath path = ExecPath::cpu;
-  int iterations = 0;   // pagerank/HITS/WCC rounds; BFS levels
+  int iterations = 0;   // pagerank/HITS iterations; WCC passes; BFS levels
   double elapsed_ms = 0.0;
   // Only HITS reports convergence so far. Each operation starts with these
   // defaults so an unrelated run cannot retain a previous HITS outcome.
