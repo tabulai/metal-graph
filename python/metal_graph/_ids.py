@@ -1,5 +1,5 @@
 # _ids.py — external-ID factorization helpers shared by Graph.from_edges
-# and Graph._from_universe.
+# and Graph.index_of.
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 

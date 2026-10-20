@@ -150,3 +150,53 @@ def test_khop_seed_out_of_range_raises():
     with pytest.raises(ValueError):
         mg.k_hop(g, np.asarray([case.num_vertices + 3], np.uint32), k=1,
                  direction="out")
+
+
+@pytest.mark.parametrize("ids", ["identity", "int64", "str"])
+@pytest.mark.parametrize("directed", [True, False])
+def test_khop_as_graph_ids_and_edges(ids, directed):
+    """as_graph: the subgraph's external ids are the reached ids in sorted
+    (np.unique) order with the parent's id dtype, and its edges are exactly
+    the induced input edges, endpoint for endpoint."""
+    rng = np.random.default_rng(4)
+    n, e = 60, 240
+    src = rng.integers(0, n, e).astype(np.uint32)
+    dst = rng.integers(0, n, e).astype(np.uint32)
+    w = rng.uniform(0.5, 2.0, e).astype(np.float32)
+    if ids == "identity":
+        g = mg.Graph.from_edges(src, dst, weights=w, directed=directed,
+                                num_vertices=n + 3)
+    elif ids == "int64":
+        ext = (np.arange(n, dtype=np.int64) * 7 - 100)[::-1].copy()
+        g = mg.Graph.from_edges(ext[src], ext[dst], weights=w,
+                                directed=directed)
+    else:
+        ext = np.array([f"v{i:03d}" for i in range(n)])[::-1].copy()
+        g = mg.Graph.from_edges(ext[src], ext[dst], weights=w,
+                                directed=directed)
+    seeds = [0, 5]
+    vs, es = mg.k_hop(g, seeds, k=2, direction="out")
+    sub = mg.k_hop(g, seeds, k=2, direction="out", as_graph=True)
+    parent_ext = np.asarray(g.external_ids)
+    sub_ext = np.asarray(sub.external_ids)
+    np.testing.assert_array_equal(sub_ext, np.unique(parent_ext[vs]))
+    assert sub_ext.dtype == parent_ext.dtype
+    np.testing.assert_array_equal(sub._src_ext, g._src_ext[es])
+    np.testing.assert_array_equal(sub._dst_ext, g._dst_ext[es])
+    np.testing.assert_array_equal(sub._weights, g._weights[es])
+    assert sub.directed == g.directed
+    # nested as_graph keeps working on the subgraph's own ids
+    sub2 = mg.k_hop(sub, [0], k=1, direction="out", as_graph=True)
+    assert set(np.asarray(sub2.external_ids)) <= set(sub_ext.tolist())
+
+
+def test_khop_as_graph_isolated_from_caller_mutation():
+    src = np.array([0, 1, 2, 3], np.uint32)
+    dst = np.array([1, 2, 3, 0], np.uint32)
+    g = mg.Graph.from_edges(src, dst, directed=True, num_vertices=4)
+    src[:] = 3  # caller reuses its arrays after building
+    dst[:] = 3
+    sub = mg.k_hop(g, [0], k=1, direction="out", as_graph=True)
+    np.testing.assert_array_equal(np.asarray(sub.external_ids), [0, 1])
+    np.testing.assert_array_equal(sub._src_ext, [0])
+    np.testing.assert_array_equal(sub._dst_ext, [1])
