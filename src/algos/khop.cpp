@@ -238,7 +238,7 @@ KhopResult k_hop(Graph& g, const uint32_t* seeds, uint32_t n_seeds,
   std::vector<uint32_t> seeds_canon =
       boundary::to_canon(g, seeds, n_seeds, "k_hop seeds");
 
-  ExecPath path = rt.plan(g.stored_edges());
+  ExecPath path = rt.plan(g.stored_edges(), PlanOp::khop);
   const bool caps = o.max_vertices != 0 || o.max_edges != 0;
   if (caps) path = ExecPath::cpu;  // deterministic cap semantics (v0.1)
   if (o.dir == BfsDir::both && g.directed && o.k > 0)

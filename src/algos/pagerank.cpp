@@ -504,7 +504,7 @@ int pagerank(Graph& g, const PagerankOpts& o, float* out_rank) {
   if (!out_rank) throw_invalid("pagerank: out_rank is null");
 
   const std::vector<double> pvec = boundary::pvec_to_canon(g, o.personalization);
-  const ExecPath path = rt.plan(g.stored_edges());
+  const ExecPath path = rt.plan(g.stored_edges(), PlanOp::pagerank);
   const int aud = audit_interval_env();
 
   std::vector<double> rank_canon(g.V, 0.0);
@@ -611,7 +611,7 @@ int ppr_topk(Graph& g, const uint32_t* seeds, const float* seed_weights,
     }
   }
 
-  ExecPath path = rt.plan(g.stored_edges());
+  ExecPath path = rt.plan(g.stored_edges(), PlanOp::ppr);
   const int aud = audit_interval_env();
 
   // Bounded-reach latency path (auto/CPU modes; forced GPU bypasses it).

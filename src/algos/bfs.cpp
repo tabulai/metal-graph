@@ -87,7 +87,7 @@ int bfs(Graph& g, const uint32_t* sources, uint32_t n_sources, BfsDir dir,
   std::vector<uint32_t> src_canon =
       boundary::to_canon(g, sources, n_sources, "bfs sources");
 
-  ExecPath path = rt.plan(g.stored_edges());
+  ExecPath path = rt.plan(g.stored_edges(), PlanOp::bfs);
   if (dir == BfsDir::both && g.directed)
     path = ExecPath::cpu;  // documented v0.1 routing (see gpu::bfs)
 
@@ -142,7 +142,7 @@ int bfs_sparse(Graph& g, const uint32_t* sources, uint32_t n_sources,
   std::vector<uint32_t> src_canon =
       boundary::to_canon(g, sources, n_sources, "bfs sources");
 
-  ExecPath path = rt.plan(g.stored_edges());
+  ExecPath path = rt.plan(g.stored_edges(), PlanOp::bfs);
   if (dir == BfsDir::both && g.directed)
     path = ExecPath::cpu;  // documented v0.1 routing (see gpu::bfs)
 

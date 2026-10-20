@@ -45,6 +45,15 @@ using BufferPtr = std::shared_ptr<Buffer>;
 enum class ExecMode : int { autom = 0, gpu = 1, cpu = 2 };
 enum class ExecPath : int { gpu = 0, cpu = 1 };
 
+// Operation families with their own auto-planner GPU threshold (stored
+// edges). Defaults (Runtime::e_gpu_min): pagerank/hits 200'000 (the GPU
+// gather amortizes its fixed cost early), ppr/bfs/wcc/generic 1'000'000,
+// khop never (CPU vertex discovery beats a GPU BFS at every measured size;
+// induced-edge extraction is a host pass on both paths). Env precedence:
+// MG_E_GPU_MIN_<OP> > MG_E_GPU_MIN (global override for every op) > per-op
+// default.
+enum class PlanOp : int { generic = 0, pagerank, hits, ppr, bfs, wcc, khop };
+
 enum class StopReason { not_applicable, converged, max_iter, empty_graph };
 
 // Telemetry for the last executed operation (planner assertion in tests).
@@ -93,12 +102,13 @@ class Runtime {
   void set_mode(ExecMode m);
   ExecMode mode() const;
   // Base decision per operation: GPU iff mode==gpu, or mode==auto &&
-  // has_gpu() && stored_edges >= e_gpu_min(). Algorithms may apply a
+  // has_gpu() && stored_edges >= e_gpu_min(op). Algorithms may apply a
   // documented bounded preflight (BFS's tiny-component CPU latency path)
   // before using this route. mode==gpu bypasses such preflights and errors
   // without a device.
-  ExecPath plan(uint64_t stored_edges) const;
-  uint64_t e_gpu_min() const;  // MG_E_GPU_MIN env, default 1'000'000
+  ExecPath plan(uint64_t stored_edges, PlanOp op = PlanOp::generic) const;
+  // Per-op threshold (see PlanOp); UINT64_MAX = never GPU under auto.
+  uint64_t e_gpu_min(PlanOp op = PlanOp::generic) const;
 
   // ---- telemetry ----
   void record_run(const RunInfo& info);

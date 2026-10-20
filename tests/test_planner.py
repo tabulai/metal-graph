@@ -1,6 +1,8 @@
 # test_planner.py — execution planner: modes, telemetry, env knobs
 # (subprocess-isolated: env is not guaranteed to be re-read per call),
 # and GPU/CPU agreement across the fixture matrix.
+import json
+
 import numpy as np
 import pytest
 
@@ -69,7 +71,8 @@ def test_last_run_info_op_per_algorithm():
 
 
 def test_auto_mode_picks_cpu_for_tiny_graph_inprocess():
-    # Default MG_E_GPU_MIN is 1M stored edges; every fixture is far below.
+    # The lowest per-op GPU threshold is 200k stored edges (pagerank/hits);
+    # every fixture is far below.
     case = ALL_CASES["gnp_dir"]
     g = build_mg(case)
     mg.set_execution("auto")
@@ -258,3 +261,102 @@ def test_agreement_khop(graph_case):
     ref_vs, ref_es = khop_ref(case, [0], 2, "both")
     np.testing.assert_array_equal(vs_c, ref_vs)
     np.testing.assert_array_equal(es_c, ref_es)
+
+
+# ---------------------------------------------------------------------------
+# per-op planner thresholds (subprocess)
+# ---------------------------------------------------------------------------
+
+PLAN_OPS_CODE = TINY_GRAPH_CODE + """
+import json
+mg.set_execution("auto")
+paths = {}
+mg.pagerank(g, alpha=0.85, tol=1e-6, max_iter=10)
+paths["pagerank"] = mg.last_run_info()["path"]
+mg.hits(g)
+paths["hits"] = mg.last_run_info()["path"]
+mg.ppr_topk(g, np.array([0], np.uint32), np.array([1.0], np.float32),
+            np.array([0, 1], np.uint64), k=2)
+paths["ppr"] = mg.last_run_info()["path"]
+mg.bfs(g, [0])
+paths["bfs"] = mg.last_run_info()["path"]
+mg.experimental.wcc(g)
+paths["wcc"] = mg.last_run_info()["path"]
+mg.k_hop(g, [0], k=1, direction="out")
+paths["khop"] = mg.last_run_info()["path"]
+print("PATHS", json.dumps(paths))
+"""
+
+
+# Empty values count as unset: shields these tests from the caller's shell.
+_NO_THRESHOLD_ENV = {f"MG_E_GPU_MIN{sfx}": "" for sfx in (
+    "", "_PAGERANK", "_HITS", "_PPR", "_BFS", "_WCC", "_KHOP")}
+
+
+def _plan_paths(env):
+    base = dict(_NO_THRESHOLD_ENV)
+    base.update({"MG_REQUIRE_GPU": "0", "MG_FORCE_CPU": "0",
+            "MG_BFS_SPARSE_MAX_VERTICES": "0", "MG_BFS_SPARSE_MAX_EDGES": "0",
+            "MG_PPR_SPARSE_MAX_VERTICES": "0", "MG_PPR_SPARSE_MAX_EDGES": "0"})
+    base.update(env)
+    r = run_python(PLAN_OPS_CODE, base)
+    assert r.returncode == 0, r.stderr
+    line = next(x for x in r.stdout.splitlines() if x.startswith("PATHS "))
+    return json.loads(line[len("PATHS "):])
+
+
+@pytest.mark.gpu
+def test_per_op_threshold_precedence_subprocess():
+    """MG_E_GPU_MIN_<OP> beats the global MG_E_GPU_MIN, which beats the
+    per-op default; the global override applies to every op, k_hop too."""
+    if not has_gpu():
+        pytest.skip("no Metal device")
+    ops = ("pagerank", "hits", "ppr", "bfs", "wcc", "khop")
+    assert _plan_paths({}) == {op: "cpu" for op in ops}
+    assert _plan_paths({"MG_E_GPU_MIN": "0"}) == {op: "gpu" for op in ops}
+    paths = _plan_paths({"MG_E_GPU_MIN": "0",
+                         "MG_E_GPU_MIN_KHOP": "1000000000",
+                         "MG_E_GPU_MIN_HITS": "1000000000"})
+    assert paths == {"pagerank": "gpu", "hits": "cpu", "ppr": "gpu",
+                     "bfs": "gpu", "wcc": "gpu", "khop": "cpu"}
+    paths = _plan_paths({"MG_E_GPU_MIN": "1000000000",
+                         "MG_E_GPU_MIN_PAGERANK": "0",
+                         "MG_E_GPU_MIN_WCC": "0"})
+    assert paths == {"pagerank": "gpu", "hits": "cpu", "ppr": "cpu",
+                     "bfs": "cpu", "wcc": "gpu", "khop": "cpu"}
+
+
+@pytest.mark.gpu
+def test_default_per_op_thresholds_subprocess():
+    """Defaults: pagerank/hits switch to the GPU at 200k stored edges,
+    ppr/bfs/wcc stay on the CPU below 1M, and auto k_hop never uses the
+    GPU, even at 1M+ stored edges."""
+    if not has_gpu():
+        pytest.skip("no Metal device")
+    code = """
+import json
+import numpy as np
+import metal_graph as mg
+rng = np.random.default_rng(1)
+def graph(e):
+    return mg.Graph.from_edges(rng.integers(0, 50_000, e).astype(np.uint32),
+                               rng.integers(0, 50_000, e).astype(np.uint32),
+                               directed=True, num_vertices=50_000)
+mg.set_execution("auto")
+out = {}
+g = graph(250_000)
+mg.pagerank(g, max_iter=5); out["pagerank_250k"] = mg.last_run_info()["path"]
+mg.hits(g, max_iter=5); out["hits_250k"] = mg.last_run_info()["path"]
+mg.experimental.wcc(g); out["wcc_250k"] = mg.last_run_info()["path"]
+g = graph(1_000_000)
+mg.k_hop(g, [0], k=2, direction="out"); out["khop_1m"] = mg.last_run_info()["path"]
+mg.experimental.wcc(g); out["wcc_1m"] = mg.last_run_info()["path"]
+print("PATHS", json.dumps(out))
+"""
+    r = run_python(code, dict(_NO_THRESHOLD_ENV, MG_REQUIRE_GPU="0",
+                              MG_FORCE_CPU="0"))
+    assert r.returncode == 0, r.stderr
+    line = next(x for x in r.stdout.splitlines() if x.startswith("PATHS "))
+    assert json.loads(line[len("PATHS "):]) == {
+        "pagerank_250k": "gpu", "hits_250k": "gpu", "wcc_250k": "cpu",
+        "khop_1m": "cpu", "wcc_1m": "gpu"}

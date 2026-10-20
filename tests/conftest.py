@@ -61,9 +61,9 @@ def has_gpu():
 
 @pytest.fixture(params=["cpu", pytest.param("gpu", marks=pytest.mark.gpu)])
 def exec_path(request):
-    """Pin the execution path for the test. Under 'auto' the default
-    MG_E_GPU_MIN (1M stored edges) would route every fixture graph to the
-    CPU — pinning is the only way to exercise both paths."""
+    """Pin the execution path for the test. Under 'auto' the per-op GPU
+    thresholds (200k-1M stored edges by default) would route every fixture
+    graph to the CPU — pinning is the only way to exercise both paths."""
     mg = mg_mod()
     path = request.param
     if path == "gpu" and not has_gpu():

@@ -194,7 +194,7 @@ int hits(Graph& g, const HitsOpts& o, float* out_hubs,
   if (!out_hubs || !out_authorities)
     throw_invalid("hits: output buffers must not be null");
 
-  const ExecPath path = rt.plan(g.stored_edges());
+  const ExecPath path = rt.plan(g.stored_edges(), PlanOp::hits);
   const int audit_interval = audit_interval_env();
   std::vector<double> hubs_canon(g.V, 0.0);
   std::vector<double> authorities_canon(g.V, 0.0);

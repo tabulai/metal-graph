@@ -221,7 +221,7 @@ ExecMode Runtime::mode() const {
   return static_cast<ExecMode>(impl_->mode.load(std::memory_order_relaxed));
 }
 
-ExecPath Runtime::plan(uint64_t stored_edges) const {
+ExecPath Runtime::plan(uint64_t stored_edges, PlanOp op) const {
   const ExecMode m = mode();
   if (m == ExecMode::gpu) {
     if (!has_gpu())
@@ -230,13 +230,42 @@ ExecPath Runtime::plan(uint64_t stored_edges) const {
     return ExecPath::gpu;
   }
   if (m == ExecMode::cpu) return ExecPath::cpu;
-  return (has_gpu() && stored_edges >= e_gpu_min()) ? ExecPath::gpu
-                                                    : ExecPath::cpu;
+  return (has_gpu() && stored_edges >= e_gpu_min(op)) ? ExecPath::gpu
+                                                      : ExecPath::cpu;
 }
 
-uint64_t Runtime::e_gpu_min() const {
-  long v = env_long("MG_E_GPU_MIN", 1000000);
-  return v < 0 ? 0 : static_cast<uint64_t>(v);
+namespace {
+
+// Set-and-parsable integer env var -> true (negative clamps to 0).
+bool env_threshold(const char* name, uint64_t& out) {
+  const char* v = std::getenv(name);
+  if (!v || !*v) return false;
+  char* end = nullptr;
+  const long long r = std::strtoll(v, &end, 10);
+  if (!end || *end != '\0') return false;
+  out = r < 0 ? 0 : static_cast<uint64_t>(r);
+  return true;
+}
+
+}  // namespace
+
+uint64_t Runtime::e_gpu_min(PlanOp op) const {
+  constexpr uint64_t kNever = std::numeric_limits<uint64_t>::max();
+  const char* op_env = nullptr;
+  uint64_t def = 1000000;
+  switch (op) {
+    case PlanOp::pagerank: op_env = "MG_E_GPU_MIN_PAGERANK"; def = 200000; break;
+    case PlanOp::hits:     op_env = "MG_E_GPU_MIN_HITS";     def = 200000; break;
+    case PlanOp::ppr:      op_env = "MG_E_GPU_MIN_PPR";      break;
+    case PlanOp::bfs:      op_env = "MG_E_GPU_MIN_BFS";      break;
+    case PlanOp::wcc:      op_env = "MG_E_GPU_MIN_WCC";      break;
+    case PlanOp::khop:     op_env = "MG_E_GPU_MIN_KHOP";     def = kNever; break;
+    case PlanOp::generic:  break;
+  }
+  uint64_t v = 0;
+  if (op_env && env_threshold(op_env, v)) return v;  // per-op override
+  if (env_threshold("MG_E_GPU_MIN", v)) return v;    // global override
+  return def;
 }
 
 void Runtime::record_run(const RunInfo& info) { t_last_run = info; }

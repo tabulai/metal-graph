@@ -297,9 +297,14 @@ graph, leaving igraph as its completed comparator.
 ## How execution is chosen
 
 `mode="auto"` is intended for normal use. The planner starts with the GPU
-when a Metal device is available and the graph has at least one million
-stored edges; otherwise it starts with the CPU. Individual algorithms can
-override that candidate when another path is more appropriate.
+when a Metal device is available and the graph has at least a per-operation
+number of stored edges: 200,000 for `pagerank` (including personalized
+PageRank) and `hits`, and one million for `ppr_topk`, `bfs`, and `wcc`;
+otherwise it starts with the CPU. `k_hop` starts with the CPU at every size,
+because its threaded CPU vertex discovery is faster than a GPU BFS on the
+graphs measured so far (induced-edge extraction runs on the host either
+way). Individual algorithms can override that candidate when another path
+is more appropriate.
 
 BFS, for example, first tries a bounded serial traversal. If the reachable
 component fits within its vertex and scanned-edge caps, the CPU answers the
@@ -357,7 +362,8 @@ shallow traversals responsive while reducing host round-trips on deep graphs.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MG_E_GPU_MIN` | 1000000 | auto-planner GPU threshold (stored edges) |
+| `MG_E_GPU_MIN` | unset (per-op defaults) | auto-planner GPU threshold (stored edges); when set, applies to every operation |
+| `MG_E_GPU_MIN_<OP>` | `PAGERANK`/`HITS` 200000; `PPR`/`BFS`/`WCC` 1000000; `KHOP` never | per-operation threshold; takes precedence over `MG_E_GPU_MIN` |
 | `MG_PR_AUDIT_INTERVAL` | 5 | iterations per GPU command batch / fp64 audit |
 | `MG_HITS_AUDIT_INTERVAL` | 5 | HITS iterations per GPU command batch / fp64 audit |
 | `MG_BFS_LEVELS_PER_BATCH` | adaptive 8,8,16,32,64… | BFS levels per command buffer; an integer pins a fixed size (clamped 1–256) |

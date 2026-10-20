@@ -95,7 +95,7 @@ int wcc(Graph& g, int32_t* out_comp) {
   int n_components = 0;
   ExecPath path = ExecPath::cpu;
   if (V > 0) {
-    path = rt.plan(g.stored_edges());
+    path = rt.plan(g.stored_edges(), PlanOp::wcc);
     std::vector<uint32_t> labels(V);
     rounds = (path == ExecPath::gpu) ? gpu::wcc(g, labels.data())
                                      : cpu::wcc(g, labels.data());
