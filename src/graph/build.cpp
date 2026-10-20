@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cfloat>
 #include <cmath>
+#include <memory>
 #include <numeric>
 #include <string>
 #include <vector>
@@ -22,18 +23,66 @@ constexpr uint64_t k_max_stored_edges = (1ull << 31) - 1;  // int32 id ceiling
 constexpr uint64_t k_max_vertices = (1ull << 31) - 1;  // int32 outputs (ids,
                                                        // parents, comp)
 
-// Parallel degree histogram over `key` (atomics: determinism of counts is
-// order-independent). Result copied to a plain vector.
-std::vector<uint32_t> histogram(uint32_t v_count,
-                                const std::vector<uint32_t>& key) {
-  std::vector<std::atomic<uint32_t>> deg_a(v_count);  // value-init to 0
-  parallel_for(key.size(), [&](std::size_t b, std::size_t e) {
-    for (std::size_t i = b; i < e; ++i)
-      deg_a[key[i]].fetch_add(1, std::memory_order_relaxed);
+constexpr std::size_t k_hist_grain = 4096;  // min items per histogram chunk
+// Private-row scratch budget in uint32 slots: max(128 MB, 8 B per item).
+constexpr std::size_t k_hist_budget_min_slots = std::size_t(32) << 20;
+// Row pitch V + 16: with V = 2^k every private row would otherwise start on
+// the same cache sets and the column-wise reduction would thrash.
+constexpr std::size_t k_hist_row_pad = 16;
+
+// Degree histogram over n items: for_keys(b, e, inc) calls inc(k) once per
+// key occurrence of items [b, e). Counts are exact and order-independent.
+// Each contiguous item chunk (one per thread) counts into its OWN row (no
+// atomics: hub counters, and the degree-descending canonical ids packed into
+// one cache line, would otherwise serialize every thread); rows are summed
+// column-wise. Falls back to shared relaxed atomics when the scratch budget
+// cannot give every chunk a row (very large V relative to the item count).
+template <typename ForKeys>
+std::vector<uint32_t> histogram(uint32_t v_count, std::size_t n,
+                                const ForKeys& for_keys) {
+  std::vector<uint32_t> deg(v_count);  // value-init to 0
+  if (n == 0) return deg;
+  const std::size_t chunks = std::min<std::size_t>(
+      num_threads(), (n + k_hist_grain - 1) / k_hist_grain);
+  if (chunks <= 1) {
+    uint32_t* d = deg.data();
+    for_keys(std::size_t(0), n, [d](uint32_t k) { ++d[k]; });
+    return deg;
+  }
+  const std::size_t pitch = std::size_t(v_count) + k_hist_row_pad;
+  if (chunks * pitch > std::max(k_hist_budget_min_slots, 2 * n)) {
+    std::vector<std::atomic<uint32_t>> deg_a(v_count);  // value-init to 0
+    parallel_for(n, [&](std::size_t b, std::size_t e) {
+      for_keys(b, e, [&deg_a](uint32_t k) {
+        deg_a[k].fetch_add(1, std::memory_order_relaxed);
+      });
+    });
+    for (uint32_t v = 0; v < v_count; ++v)
+      deg[v] = deg_a[v].load(std::memory_order_relaxed);
+    return deg;
+  }
+  const std::size_t per = (n + chunks - 1) / chunks;
+  // Uninitialized: each row is zeroed by the thread that fills it.
+  std::unique_ptr<uint32_t[]> cnt(new uint32_t[chunks * pitch]);
+  parallel_for(
+      chunks,
+      [&](std::size_t cb, std::size_t ce) {
+        for (std::size_t c = cb; c < ce; ++c) {
+          uint32_t* row = cnt.get() + c * pitch;
+          std::fill(row, row + v_count, 0u);
+          const std::size_t b = std::min(n, c * per);
+          const std::size_t e = std::min(n, b + per);
+          for_keys(b, e, [row](uint32_t k) { ++row[k]; });
+        }
+      },
+      1);
+  parallel_for(v_count, [&](std::size_t vb, std::size_t ve) {
+    uint32_t* d = deg.data();
+    for (std::size_t c = 0; c < chunks; ++c) {
+      const uint32_t* row = cnt.get() + c * pitch;
+      for (std::size_t v = vb; v < ve; ++v) d[v] += row[v];
+    }
   });
-  std::vector<uint32_t> deg(v_count);
-  for (uint32_t v = 0; v < v_count; ++v)
-    deg[v] = deg_a[v].load(std::memory_order_relaxed);
   return deg;
 }
 
@@ -54,7 +103,11 @@ Orientation build_orientation(uint32_t v_count,
   Orientation o;
   o.e_stored = es;
 
-  std::vector<uint32_t> deg = histogram(v_count, key);
+  std::vector<uint32_t> deg =
+      histogram(v_count, key.size(),
+                [&](std::size_t b, std::size_t e, auto&& inc) {
+                  for (std::size_t i = b; i < e; ++i) inc(key[i]);
+                });
 
   o.row_offsets = rt.alloc(sizeof(uint32_t) * (uint64_t(v_count) + 1),
                            (pre + "row_offsets").c_str());
@@ -195,17 +248,18 @@ std::shared_ptr<Graph> Graph::build(const uint32_t* src, const uint32_t* dst,
   const uint32_t V = n_vertices;
 
   // USER-space out-degrees over the STORED (symmetrized) edge set.
-  std::vector<std::atomic<uint32_t>> deg_a(V);
-  parallel_for(n_edges, [&](std::size_t b, std::size_t e) {
-    for (std::size_t i = b; i < e; ++i) {
-      deg_a[src[i]].fetch_add(1, std::memory_order_relaxed);
-      if (!directed && src[i] != dst[i])
-        deg_a[dst[i]].fetch_add(1, std::memory_order_relaxed);
-    }
-  });
-  std::vector<uint32_t> deg_user(V);
-  for (uint32_t u = 0; u < V; ++u)
-    deg_user[u] = deg_a[u].load(std::memory_order_relaxed);
+  std::vector<uint32_t> deg_user =
+      directed ? histogram(V, n_edges,
+                           [&](std::size_t b, std::size_t e, auto&& inc) {
+                             for (std::size_t i = b; i < e; ++i) inc(src[i]);
+                           })
+               : histogram(V, n_edges,
+                           [&](std::size_t b, std::size_t e, auto&& inc) {
+                             for (std::size_t i = b; i < e; ++i) {
+                               inc(src[i]);
+                               if (src[i] != dst[i]) inc(dst[i]);
+                             }
+                           });
 
   // Canonical order: stable sort by out-degree DESCENDING (stable => equal
   // degrees keep ascending user index).
