@@ -25,6 +25,11 @@
 //   converged lanes at audit boundaries. Selection: top-k by score, ties
 //   broken by ascending USER index; if k > V, rows are padded with
 //   id = -1 / score = 0.
+//   Latency path (auto/CPU modes, per query; MG_PPR_SPARSE_MAX_VERTICES /
+//   _EDGES, 0 disables): when the seeds' OUT-reach fits the caps, the
+//   query is solved exactly on that set by cpu::ppr_topk_sparse
+//   (bit-identical to the dense CPU path); other rows take the planned
+//   path. Telemetry path is cpu iff every row took the latency path.
 //
 // BFS: multi-source, unit depth. direction: out = follow edges as stored,
 //   in = reverse orientation, both = treat edges as undirected (union of
@@ -179,10 +184,32 @@ int pagerank(Graph& g, const double* pvec_canon, double alpha, double tol,
 // duration of the call. Queries run in parallel, so the sink may be called
 // CONCURRENTLY for DISTINCT q (never twice for the same q); it must be safe
 // under that concurrency. Never called when V == 0 or n_queries == 0.
+// Optional pre(q) runs in q's worker before its dense solve (same
+// concurrency rules as sink); a result >= 0 means q was answered elsewhere
+// with that many iterations, so neither the dense solve nor sink runs for q.
 int ppr(Graph& g, const uint32_t* seeds_canon, const float* seed_w,
         const uint64_t* offsets, uint32_t n_queries, double alpha, double tol,
         int max_iter, int audit_interval,
-        const std::function<void(uint32_t, const double*)>& sink);
+        const std::function<void(uint32_t, const double*)>& sink,
+        const std::function<int(uint32_t)>& pre = nullptr);
+
+// Bounded-reach exact PPR + top-k for ONE query (auto/CPU latency path of
+// ppr_topk). First collects the seeds' OUT-reach R (closed under out-edges,
+// so every vertex outside R has rank exactly 0 at every iteration); if R
+// fits max_vertices / max_edges (scanned out-edges), runs the cpu::ppr fp64
+// iteration restricted to R with the same audit rule, then writes the top-k
+// row (score desc, ties by ascending USER index; zero-score vertices inside
+// and outside R form one ascending-user pool; -1/0 padding when k > V).
+// Summation orders reproduce cpu::ppr, so the row and the iteration count
+// are bit-identical to the dense CPU path. Seeds as passed to cpu::ppr
+// (canonical, deduped). Returns iterations, or -1 (outputs untouched) when
+// the reach exceeds a cap. Serial and non-throwing: safe to run one query
+// per worker thread. Limits must be positive.
+int ppr_topk_sparse(Graph& g, const uint32_t* seeds_canon,
+                    const float* seed_w, uint32_t n_seeds, double alpha,
+                    double tol, int max_iter, int audit_interval,
+                    uint32_t max_vertices, uint64_t max_edges, uint32_t k,
+                    int32_t* out_ids, float* out_scores);
 
 int bfs(Graph& g, const uint32_t* sources_canon, uint32_t n_sources,
         BfsDir dir, int32_t* dist_canon, int32_t* parent_canon);

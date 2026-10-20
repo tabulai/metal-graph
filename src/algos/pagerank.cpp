@@ -16,6 +16,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <functional>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -609,8 +611,32 @@ int ppr_topk(Graph& g, const uint32_t* seeds, const float* seed_weights,
     }
   }
 
-  const ExecPath path = rt.plan(g.stored_edges());
+  ExecPath path = rt.plan(g.stored_edges());
   const int aud = audit_interval_env();
+
+  // Bounded-reach latency path (auto/CPU modes; forced GPU bypasses it).
+  // A query whose seeds' OUT-reach fits the caps has its whole support
+  // inside that set, so cpu::ppr_topk_sparse answers it exactly (fp64,
+  // bit-identical to cpu::ppr) without touching the other V - |R|
+  // vertices. Routing is per query, so batched == sequential still holds.
+  const long sp_vertices = env_long("MG_PPR_SPARSE_MAX_VERTICES", 1024);
+  const long sp_edges = env_long("MG_PPR_SPARSE_MAX_EDGES", 8192);
+  const bool sparse_on =
+      rt.mode() != ExecMode::gpu && sp_vertices > 0 && sp_edges > 0;
+  std::function<int(uint32_t)> try_sparse;
+  if (sparse_on) {
+    const uint32_t vcap = static_cast<uint32_t>(std::min<long>(
+        sp_vertices, static_cast<long>(std::numeric_limits<uint32_t>::max())));
+    const uint64_t ecap = static_cast<uint64_t>(sp_edges);
+    try_sparse = [&, vcap, ecap](uint32_t q) -> int {
+      const uint64_t s0 = offs[q];
+      return cpu::ppr_topk_sparse(
+          g, s_canon.data() + s0, s_w.data() + s0,
+          static_cast<uint32_t>(offs[q + 1] - s0), o.alpha, o.tol,
+          o.max_iter, aud, vcap, ecap, o.k, out_ids + std::size_t{q} * o.k,
+          out_scores + std::size_t{q} * o.k);
+    };
+  }
 
   // Streaming top-k selection (deterministic ties): the per-query sink runs
   // boundary::topk_user on each FINAL dense vector as it becomes available,
@@ -621,30 +647,93 @@ int ppr_topk(Graph& g, const uint32_t* seeds, const float* seed_weights,
   // mutex: topk_user is pure and each call writes only its own disjoint
   // output rows, so no serialization is needed).
   int iters = 0;
-  if (path == ExecPath::gpu && gpu::topk_select_eligible(g.V, o.k)) {
-    // GPU radix-select (plan M3): O(V) threshold + compaction on the GPU,
-    // exact tie-rule finish on a ~k-sized candidate set. Bit-identical to
-    // the CPU selection oracle (tests assert it); MG_GPU_TOPK=0 forces the
-    // oracle.
-    iters = gpu::ppr_topk_select(g, s_canon.data(), s_w.data(), offs.data(),
-                                 n_queries, o.alpha, o.tol, o.max_iter, aud,
-                                 o.k, out_ids, out_scores);
-  } else if (path == ExecPath::gpu) {
-    iters = gpu::ppr(g, s_canon.data(), s_w.data(), offs.data(), n_queries,
-                     o.alpha, o.tol, o.max_iter, aud,
-                     [&](uint32_t q, const float* rank) {
-                       boundary::topk_user(g, rank, 1u, 0u, o.k,
-                                           out_ids + std::size_t{q} * o.k,
-                                           out_scores + std::size_t{q} * o.k);
-                     });
-  } else {
+  if (path == ExecPath::cpu) {
+    // The sparse attempt runs inside cpu::ppr's per-query worker: one
+    // fan-out per batch, and an overflowing query falls through to its
+    // dense solve on the same thread.
     iters = cpu::ppr(g, s_canon.data(), s_w.data(), offs.data(), n_queries,
                      o.alpha, o.tol, o.max_iter, aud,
                      [&](uint32_t q, const double* rank) {
                        boundary::topk_user(g, rank, 1u, 0u, o.k,
                                            out_ids + std::size_t{q} * o.k,
                                            out_scores + std::size_t{q} * o.k);
-                     });
+                     },
+                     try_sparse);
+  } else {
+    auto run_gpu = [&](const uint32_t* sc, const float* sw,
+                       const uint64_t* of, uint32_t nq, int32_t* ids,
+                       float* scores) -> int {
+      if (gpu::topk_select_eligible(g.V, o.k)) {
+        // GPU radix-select (plan M3): O(V) threshold + compaction on the
+        // GPU, exact tie-rule finish on a ~k-sized candidate set.
+        // Bit-identical to the CPU selection oracle (tests assert it);
+        // MG_GPU_TOPK=0 forces the oracle.
+        return gpu::ppr_topk_select(g, sc, sw, of, nq, o.alpha, o.tol,
+                                    o.max_iter, aud, o.k, ids, scores);
+      }
+      return gpu::ppr(g, sc, sw, of, nq, o.alpha, o.tol, o.max_iter, aud,
+                      [&](uint32_t q, const float* rank) {
+                        boundary::topk_user(g, rank, 1u, 0u, o.k,
+                                            ids + std::size_t{q} * o.k,
+                                            scores + std::size_t{q} * o.k);
+                      });
+    };
+    // Answer what fits on the CPU first (queries in parallel), then send
+    // only the overflowing rows through the GPU tiles. Each attempt is
+    // capped (~tens of microseconds even when it overflows), so 4 queries
+    // per thread keeps thread start-up from dominating (B=16 -> 4 threads).
+    std::vector<uint32_t> dense_rows;
+    if (sparse_on) {
+      std::vector<int> sp_it(n_queries, -1);
+      parallel_for(
+          n_queries,
+          [&](std::size_t b, std::size_t e) {
+            for (std::size_t q = b; q < e; ++q)
+              sp_it[q] = try_sparse(static_cast<uint32_t>(q));
+          },
+          /*grain=*/4);
+      for (uint32_t q = 0; q < n_queries; ++q) {
+        if (sp_it[q] < 0)
+          dense_rows.push_back(q);
+        else
+          iters = std::max(iters, sp_it[q]);
+      }
+    } else {
+      dense_rows.resize(n_queries);
+      for (uint32_t q = 0; q < n_queries; ++q) dense_rows[q] = q;
+    }
+    if (dense_rows.empty()) {
+      path = ExecPath::cpu;  // every row was answered by the sparse path
+    } else if (dense_rows.size() == n_queries) {
+      iters = run_gpu(s_canon.data(), s_w.data(), offs.data(), n_queries,
+                      out_ids, out_scores);
+    } else {
+      // Mixed batch: compact the overflowing rows, run them on the GPU,
+      // then scatter their output rows back into place.
+      const uint32_t nd = static_cast<uint32_t>(dense_rows.size());
+      std::vector<uint32_t> d_canon;
+      std::vector<float> d_w;
+      std::vector<uint64_t> d_offs(std::size_t{nd} + 1, 0);
+      for (uint32_t i = 0; i < nd; ++i) {
+        const uint32_t q = dense_rows[i];
+        d_canon.insert(d_canon.end(), s_canon.begin() + offs[q],
+                       s_canon.begin() + offs[q + 1]);
+        d_w.insert(d_w.end(), s_w.begin() + offs[q],
+                   s_w.begin() + offs[q + 1]);
+        d_offs[i + 1] = d_canon.size();
+      }
+      std::vector<int32_t> d_ids(std::size_t{nd} * o.k);
+      std::vector<float> d_scores(std::size_t{nd} * o.k);
+      iters = std::max(iters, run_gpu(d_canon.data(), d_w.data(),
+                                      d_offs.data(), nd, d_ids.data(),
+                                      d_scores.data()));
+      for (uint32_t i = 0; i < nd; ++i) {
+        const std::size_t src = std::size_t{i} * o.k;
+        const std::size_t dst = std::size_t{dense_rows[i]} * o.k;
+        std::copy_n(d_ids.data() + src, o.k, out_ids + dst);
+        std::copy_n(d_scores.data() + src, o.k, out_scores + dst);
+      }
+    }
   }
 
   ri.path = path;

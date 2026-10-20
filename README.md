@@ -306,6 +306,17 @@ component fits within its vertex and scanned-edge caps, the CPU answers the
 query directly. If it does not fit, the partial attempt is discarded and the
 regular CPU or GPU path runs instead.
 
+`ppr_topk` applies the same idea per query. When the vertices reachable
+from a query's seeds along outgoing edges fit within the vertex and
+scanned-edge caps, every other vertex has an exact score of zero, so the CPU
+solves that query exactly in fp64 on the reachable set alone, with the same
+audit rule and tie order as the full CPU path. Queries that do not fit run
+on the planned CPU or GPU path; in a mixed batch only those rows go to the
+GPU, so their scores carry the usual GPU float32 tolerance while the others
+are fp64. `last_run_info()` reports `path="cpu"` when every query in the
+batch was answered this way, and the planned path otherwise. Forced GPU mode
+skips the attempt.
+
 You can override the planner when testing or profiling:
 
 ```python
@@ -352,6 +363,8 @@ shallow traversals responsive while reducing host round-trips on deep graphs.
 | `MG_BFS_LEVELS_PER_BATCH` | adaptive 8,8,16,32,64… | BFS levels per command buffer; an integer pins a fixed size (clamped 1–256) |
 | `MG_BFS_SPARSE_MAX_VERTICES` | 1024 | auto/CPU BFS latency-path vertex cap (0 disables) |
 | `MG_BFS_SPARSE_MAX_EDGES` | 8192 | auto/CPU BFS latency-path scanned-edge cap (0 disables) |
+| `MG_PPR_SPARSE_MAX_VERTICES` | 1024 | auto/CPU `ppr_topk` per-query reachable-set vertex cap (0 disables) |
+| `MG_PPR_SPARSE_MAX_EDGES` | 8192 | auto/CPU `ppr_topk` per-query scanned-edge cap (0 disables) |
 | `MG_WCC_ROUNDS_PER_BATCH` | — | ignored: GPU WCC is a single union-find link + compress pass |
 | `MG_WCC_CPU_PAR_MIN_EDGES` | 131072 | CPU WCC uses the threaded union-find at or above this many stored edges (serial below it, or when `MG_THREADS=1`) |
 | `MG_GPU_TOPK` | 1 | GPU radix-select for `ppr_topk` (0 = CPU oracle) |
