@@ -51,12 +51,10 @@ std::vector<uint32_t> khop_vertices(Graph& g, const uint32_t* seeds_canon,
 
   // seen[v] != 0 once claimed as seed or level candidate. A claimed-but-not-
   // admitted vertex exists only when the cap binds, and the cap binding
-  // terminates discovery, so a single marker is enough.
-  std::unique_ptr<std::atomic<uint8_t>[]> seen(new std::atomic<uint8_t>[V]);
-  parallel_for(V, [&](std::size_t b, std::size_t e) {
-    for (std::size_t v = b; v < e; ++v)
-      seen[v].store(0, std::memory_order_relaxed);
-  });
+  // terminates discovery, so a single marker is enough. Value-initialized
+  // (zeroed) at allocation: a threaded clear would spawn threads for every
+  // query, which dominates small k-hop neighborhoods.
+  std::unique_ptr<std::atomic<uint8_t>[]> seen(new std::atomic<uint8_t>[V]());
 
   const bool capped = max_vertices > 0;
   const std::size_t cap = capped ? static_cast<std::size_t>(max_vertices) : 0;

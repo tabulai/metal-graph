@@ -1,5 +1,5 @@
 // frontier.metal — GPU-resident BFS machinery (level protocol of
-// mg_params.h) and k-hop induced-edge extraction.
+// mg_params.h); k-hop reuses it for vertex discovery.
 // Binding tables and level protocol: src/kernels/mg_params.h (authoritative).
 // SPDX-License-Identifier: Apache-2.0
 
@@ -267,46 +267,4 @@ kernel void mg_bfs_bottomup_probe(
       return;
     }
   }
-}
-
-// ---------------------------------------------------------------------------
-// k-hop induced-edge extraction
-// ---------------------------------------------------------------------------
-
-// counts[i] = #edges (v -> u) with u's reached bit set, v = reached_list[i].
-kernel void mg_khop_count(
-    constant MGKhopParams& p           [[buffer(0)]],
-    device const uint* reached_list    [[buffer(1)]],
-    device const uint* row_off         [[buffer(2)]],
-    device const uint* col_idx         [[buffer(3)]],
-    device const uint* reached_bitmap  [[buffer(4)]],
-    device uint* counts                [[buffer(5)]],
-    uint gid [[thread_position_in_grid]]) {
-  if (gid >= p.n_vertices) return;
-  const uint v = reached_list[gid];
-  const uint end = row_off[v + 1u];
-  uint c = 0u;
-  for (uint e = row_off[v]; e < end; ++e)
-    if (mg_bitmap_test(reached_bitmap, col_idx[e])) ++c;
-  counts[gid] = c;
-}
-
-// Deterministic emit: edges of reached_list[i] land at offsets[i..] in CSR
-// order, reported as original input edge ids via edge_orig.
-kernel void mg_khop_emit(
-    constant MGKhopParams& p          [[buffer(0)]],
-    device const uint* reached_list   [[buffer(1)]],
-    device const uint* row_off        [[buffer(2)]],
-    device const uint* col_idx        [[buffer(3)]],
-    device const uint* reached_bitmap [[buffer(4)]],
-    device const uint* offsets        [[buffer(5)]],
-    device const uint* edge_orig      [[buffer(6)]],
-    device uint* out_edges            [[buffer(7)]],
-    uint gid [[thread_position_in_grid]]) {
-  if (gid >= p.n_vertices) return;
-  const uint v = reached_list[gid];
-  const uint end = row_off[v + 1u];
-  uint o = offsets[gid];
-  for (uint e = row_off[v]; e < end; ++e)
-    if (mg_bitmap_test(reached_bitmap, col_idx[e])) out_edges[o++] = edge_orig[e];
 }

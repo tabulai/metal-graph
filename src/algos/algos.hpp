@@ -254,11 +254,6 @@ int bfs(Graph& g, const uint32_t* sources_canon, uint32_t n_sources,
         BfsDir dir, int32_t* dist_canon, int32_t* parent_canon,
         uint32_t max_levels = 0);
 
-// Induced-edge extraction on GPU given the reached set (bitmap built by
-// caller); returns original input edge ids, unsorted.
-std::vector<uint32_t> khop_edges(Graph& g,
-                                 const std::vector<uint32_t>& reached_canon);
-
 int wcc(Graph& g, uint32_t* labels_canon);
 
 HitsResult hits(Graph& g, double tol, int max_iter, int audit_interval,

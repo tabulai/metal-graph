@@ -273,7 +273,9 @@ std::shared_ptr<Graph> Graph::build(const uint32_t* src, const uint32_t* dst,
 
   // Stored canonical edge list (kept for the lazy transpose). Undirected:
   // u!=v stored both ways (forward then reverse, input order), self-loops
-  // once; the ORIGINAL input edge id rides along.
+  // once; the ORIGINAL input edge id rides along. k_hop's edge-parallel
+  // induced-edge marking relies on the resulting orig-id layout (directed:
+  // orig id == stored position; undirected: nondecreasing) — see graph.hpp.
   uint64_t e_stored = n_edges;
   if (!directed) {
     uint64_t n_self = 0;

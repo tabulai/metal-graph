@@ -185,14 +185,6 @@ typedef struct MGBfsParams {
 #define MG_BFS_ARGS_SLOTS 5u
 // Byte offset of slot i = i * 3 * sizeof(uint32).
 
-// --- k-hop induced-edge extraction ---
-typedef struct MGKhopParams {
-  mg_u32 n_vertices;  // #reached vertices (list length)
-  mg_u32 pad0;
-  mg_u32 pad1;
-  mg_u32 pad2;
-} MGKhopParams;
-
 // --- WCC ---
 // MGWccParams.flags bits (link kernels)
 #define MG_WCC_SKIP_TWINS 1u  // undirected storage: link only (v, u > v)
@@ -452,16 +444,9 @@ typedef struct MGScanParams {
 // After K levels host waits, reads control.done / next_count, re-encodes if
 // needed. dist/parent are canonical-id indexed; host translates at boundary.
 //
-// ======================= k-hop (frontier.metal) =============================
-// mg_khop_count — grid ceil(n_vertices / MG_TG_SIZE), thread per reached vtx
-//   b0 MGKhopParams; b1 reached_list (const uint32); b2 row_off; b3 col_idx;
-//   b4 reached_bitmap (const uint32, ceil(V/32));  b5 counts (uint32, n_vertices)
-//   counts[i] = # edges (v -> u) with u's bit set, v = reached_list[i].
-// mg_khop_emit — same grid
-//   b0 MGKhopParams; b1 reached_list; b2 row_off; b3 col_idx; b4 reached_bitmap;
-//   b5 offsets (const uint32, exclusive scan of counts); b6 edge_orig (const
-//   uint32, E — CSR slot -> original input edge index); b7 out_edges (uint32)
-//   deterministic: edges of reached_list[i] written at offsets[i..], in CSR order.
+// k-hop has no kernels: vertex discovery reuses the BFS protocol above
+// (max_levels = k) and induced-edge extraction is a host bitmap pass over
+// original edge ids (src/algos/khop.cpp).
 //
 // ======================= WCC (wcc.metal) ====================================
 // One batch: mg_iota_u32 (labels[i] = i), the link kernels (huge, high,

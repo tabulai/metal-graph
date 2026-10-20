@@ -84,6 +84,20 @@ class Graph {
   std::vector<uint32_t> canon_of_user;
   std::vector<uint32_t> user_of_canon;
 
+  // Read-only view of the stored canonical edge list (see edges_*_ below),
+  // used by host edge-parallel scans (k_hop induced-edge marking). Build
+  // invariants callers may rely on: directed graphs store input edge i at
+  // position i (edges_orig_id()[i] == i); undirected graphs store orig ids
+  // nondecreasing (a u!=v edge's two copies are adjacent). Empty if the
+  // list was freed (v0.2 memory pressure): callers must fall back to CSR.
+  const std::vector<uint32_t>& edges_src_canon() const {
+    return edges_src_canon_;
+  }
+  const std::vector<uint32_t>& edges_dst_canon() const {
+    return edges_dst_canon_;
+  }
+  const std::vector<uint32_t>& edges_orig_id() const { return edges_orig_id_; }
+
   Graph() = default;
   Graph(const Graph&) = delete;
   Graph& operator=(const Graph&) = delete;

@@ -1,5 +1,5 @@
-// frontier_engine.cpp — BFS level protocol (mg_params.h, authoritative)
-// and k-hop count/emit. Per level, three encoders:
+// frontier_engine.cpp — BFS level protocol (mg_params.h, authoritative).
+// Per level, three encoders:
 //   prepare | frontier_bin + decide | expands (+ bottom-up probe)
 // because frontier_bin consumes args[BIN] written by prepare, and the
 // expand kernels consume args[EXPAND_*]/args[BOTTOMUP] written by decide;
@@ -14,7 +14,6 @@
 
 #include "../kernels/mg_params.h"
 #include "bfs_batch_schedule.hpp"
-#include "scan_engine.hpp"
 
 namespace mg {
 
@@ -177,60 +176,6 @@ int FrontierEngine::run_bfs(Graph& g,
     }
   });
   return static_cast<int>(amax.load(std::memory_order_relaxed)) + 1;
-}
-
-std::vector<uint32_t> FrontierEngine::khop_edges(
-    Graph& g, const std::vector<uint32_t>& reached_canon) {
-  std::vector<uint32_t> out;
-  const uint32_t n = static_cast<uint32_t>(reached_canon.size());
-  if (n == 0 || g.V == 0) return out;
-  const Orientation& o = g.orientation(Dir::out);
-  if (o.e_stored == 0) return out;
-
-  MTL::ComputePipelineState* pso_count = rt_.pipeline("mg_khop_count");
-  MTL::ComputePipelineState* pso_emit = rt_.pipeline("mg_khop_emit");
-
-  const uint32_t words = (g.V + 31u) / 32u;
-  BufferPtr list = rt_.alloc(std::size_t(n) * 4, "khop.reached");
-  BufferPtr bitmap = rt_.alloc(std::size_t(words) * 4, "khop.bitmap");
-  BufferPtr counts = rt_.alloc(std::size_t(n) * 4, "khop.counts");
-  BufferPtr offsets = rt_.alloc(std::size_t(n) * 4, "khop.offsets");
-
-  std::memcpy(list->data(), reached_canon.data(), std::size_t(n) * 4);
-  uint32_t* bm = bitmap->as<uint32_t>();  // zero-initialized by alloc
-  for (uint32_t i = 0; i < n; ++i) {
-    const uint32_t c = reached_canon[i];
-    bm[c >> 5] |= 1u << (c & 31u);
-  }
-
-  MGKhopParams kp{n, 0u, 0u, 0u};
-  const uint32_t tgs = ceil_div_u32(n, MG_TG_SIZE);
-  {
-    CommandBatch cb(rt_);
-    cb.dispatch(pso_count, &kp, sizeof(kp),
-                {list.get(), o.row_offsets.get(), o.col_indices.get(),
-                 bitmap.get(), counts.get()},
-                tgs, MG_TG_SIZE);
-    cb.commit_and_wait();
-  }
-
-  ScanEngine scan(rt_);
-  const uint64_t total = scan.exclusive_scan(*counts, *offsets, n);
-  if (total == 0) return out;
-
-  BufferPtr edges = rt_.alloc(std::size_t(total) * 4, "khop.edges");
-  {
-    CommandBatch cb(rt_);
-    cb.dispatch(pso_emit, &kp, sizeof(kp),
-                {list.get(), o.row_offsets.get(), o.col_indices.get(),
-                 bitmap.get(), offsets.get(), o.edge_orig.get(),
-                 edges.get()},
-                tgs, MG_TG_SIZE);
-    cb.commit_and_wait();
-  }
-  out.resize(static_cast<std::size_t>(total));
-  std::memcpy(out.data(), edges->data(), std::size_t(total) * 4);
-  return out;
 }
 
 }  // namespace mg
