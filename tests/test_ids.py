@@ -149,3 +149,51 @@ def test_identity_mode_ids_are_user_indices():
         np.asarray(ext, dtype=np.int64), np.arange(case.num_vertices))
     idx = np.asarray(g.index_of(ext[:5]))
     np.testing.assert_array_equal(idx, np.arange(5))
+
+
+@pytest.mark.parametrize("dtype", ["int8", "uint8", "int16", "uint16",
+                                   "int32", "uint32", "int64", "uint64"])
+@pytest.mark.parametrize("n_edges", [5, 300, 5000])
+@pytest.mark.parametrize("spread", ["dense", "sparse"])
+def test_factorize_matches_np_unique(dtype, n_edges, spread):
+    """_ids.factorize (dense-range fast path when ids span <= 2x the
+    endpoint count, np.unique otherwise) returns exactly np.unique's sorted
+    uniques, dtype and inverse for every integer dtype and offset."""
+    from metal_graph import _ids
+
+    info = np.iinfo(dtype)
+    rng = np.random.default_rng(n_edges)
+    width = 2 * n_edges if spread == "dense" else 50 * n_edges
+    width = min(width, int(info.max) - int(info.min))
+    for lo in {int(info.min), 0 if info.min == 0 else -width // 2,
+               int(info.max) - width}:
+        def ids():
+            off = rng.integers(0, width + 1, n_edges)
+            if info.min == 0:  # unsigned (uint64 offsets may pass 2**63)
+                return (off.astype(np.uint64) + np.uint64(lo)).astype(dtype)
+            return (off + np.int64(lo)).astype(dtype)
+        src, dst = ids(), ids()
+        uniques, s_idx, d_idx = _ids.factorize(src, dst)
+        ref, inv = np.unique(np.concatenate([src, dst]), return_inverse=True)
+        assert uniques.dtype == ref.dtype
+        np.testing.assert_array_equal(uniques, ref)
+        np.testing.assert_array_equal(s_idx, inv[:n_edges])
+        np.testing.assert_array_equal(d_idx, inv[n_edges:])
+        assert s_idx.dtype == d_idx.dtype == np.uint32
+
+
+def test_factorize_mixed_dtypes_and_from_edges():
+    from metal_graph import _ids
+
+    rng = np.random.default_rng(1)
+    src = rng.integers(-500, 500, 2000).astype(np.int32)
+    dst = rng.integers(-500, 500, 2000).astype(np.int64)
+    uniques, s_idx, d_idx = _ids.factorize(src, dst)
+    ref, inv = np.unique(np.concatenate([src, dst]), return_inverse=True)
+    assert uniques.dtype == ref.dtype == np.int64
+    np.testing.assert_array_equal(uniques, ref)
+    np.testing.assert_array_equal(s_idx, inv[:2000])
+    np.testing.assert_array_equal(d_idx, inv[2000:])
+    g = mg.Graph.from_edges(src, dst)
+    np.testing.assert_array_equal(np.asarray(g.external_ids), ref)
+    np.testing.assert_array_equal(g.index_of(src[:50]), inv[:50])

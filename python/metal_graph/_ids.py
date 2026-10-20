@@ -40,11 +40,12 @@ def _factorize_dense(src, dst):
     yields exactly np.unique's sorted uniques and inverse in O(N + span)
     instead of np.unique's O(N log N) argsort. Sparse ids (span above
     2 * (2E), i.e. proportional to the edge count with no fixed slack, so a
-    small graph with large ids never allocates a huge flag array) and
-    non-integer ids fall back to np.unique.
+    small graph with large ids never allocates a huge flag array),
+    non-integer ids, and tiny inputs (where np.unique is already cheaper
+    than the extra min/max scans) fall back to np.unique.
     """
     if (src.dtype.kind not in "iu" or dst.dtype.kind not in "iu"
-            or src.size == 0 or dst.size == 0):
+            or src.size + dst.size < 512 or src.size == 0 or dst.size == 0):
         return None
     out_dtype = np.concatenate((src[:0], dst[:0])).dtype  # np.unique's dtype
     if out_dtype.kind not in "iu":
