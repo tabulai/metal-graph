@@ -9,6 +9,37 @@ All notable changes to metal-graph are documented here.
   Callers can distinguish convergence (including on the final allowed
   iteration), an exhausted iteration budget, and empty/edgeless graphs;
   existing score returns and C function signatures are unchanged.
+- Performance: `k_hop` extracts induced edges through a bitmap over input
+  edge ids instead of sorting them, and splits hub rows across CPU threads;
+  `k_hop(as_graph=True)` remaps the subgraph through a dense index. GPU WCC
+  is a single union-find link + compress pass, and CPU WCC uses a threaded
+  union-find above `MG_WCC_CPU_PAR_MIN_EDGES` stored edges. Graph
+  construction and the lazy IN transpose use per-chunk degree histograms,
+  and `Graph.from_edges` factorizes dense integer ids without `np.unique`.
+  CPU PageRank, personalized PageRank and HITS gather over edge-balanced,
+  dynamically scheduled work items. GPU BFS splits high-degree frontier rows
+  across threadgroups (`MG_BFS_HIGH_SPLIT_MAX`), and sparse-output BFS
+  compacts its dense fallback in parallel.
+- `ppr_topk` answers each query whose seeds' out-reach fits
+  `MG_PPR_SPARSE_MAX_VERTICES` / `MG_PPR_SPARSE_MAX_EDGES` with an exact fp64
+  solve on that reach, bit-identical to the CPU path. In a batch planned for
+  the GPU only the remaining rows run there, so one batch can mix fp64 and
+  fp32 rows; `last_run_info()` reports `path="cpu"` only when every row took
+  the latency path.
+- The auto planner uses per-operation GPU thresholds (`MG_E_GPU_MIN_<OP>`;
+  `MG_E_GPU_MIN` still overrides every operation): PageRank and HITS move to
+  the GPU from 200,000 stored edges, so graphs with 200,000 to 1,000,000
+  edges now get float32 GPU results within the documented CPU/GPU tolerance,
+  and `k_hop` no longer uses the GPU in auto mode.
+- BFS's serial preflight now defaults to 8,192 vertices / 524,288 scanned
+  edges when an overflowing query would run on the GPU (1,024 / 8,192 when it
+  would run on the threaded CPU) and rejects a reach that cannot fit as soon
+  as it is discovered.
+- GPU WCC reports `iterations == 1` in `last_run_info()`, and
+  `MG_WCC_ROUNDS_PER_BATCH` is ignored. CPU HITS on graphs with rows of
+  16,384 or more edges can differ from 0.1.1 in the last float32 bit
+  (tiled fp64 summation order); results remain deterministic for every
+  thread count.
 
 ## 0.1.1 — 2026-09-04
 
