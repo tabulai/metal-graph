@@ -13,6 +13,7 @@
 
 #include "../algos.hpp"
 #include "../boundary.hpp"
+#include "cpu_gather.hpp"
 
 namespace mg::cpu {
 
@@ -22,6 +23,7 @@ struct PullCsr {
   const uint32_t* row = nullptr;
   const uint32_t* col = nullptr;
   const float* w = nullptr;  // null when unweighted
+  const CpuGatherPlan* plan = nullptr;  // edge-balanced items (cached)
 };
 
 PullCsr in_csr(Graph& g) {
@@ -30,6 +32,7 @@ PullCsr in_csr(Graph& g) {
   c.row = o.row_offsets->as<uint32_t>();
   c.col = o.col_indices->as<uint32_t>();
   if (g.weighted && o.weights) c.w = o.weights->as<float>();
+  c.plan = &g.cpu_gather_plan(Dir::in);
   return c;
 }
 
@@ -63,24 +66,18 @@ void contrib_pass(uint32_t V, const float* ows, const double* r,
 // One pull iteration: next[v] = alpha * sum_in(contrib * w) + base_v where
 // base_v = ((1-a) + a*dmass) * p[v] for a dense teleport vector p, or 0 when
 // p == null (sparse teleport: the caller adds it at the seeds afterwards).
-void gather_pass(uint32_t V, const PullCsr& c, const double* contrib,
-                 const double* p, double alpha, double one_minus_a,
-                 double dmass, double* next, bool threaded) {
-  for_range(V, threaded, [&](std::size_t b, std::size_t e) {
-    for (std::size_t v = b; v < e; ++v) {
-      double acc = 0.0;
-      const uint32_t lo = c.row[v], hi = c.row[v + 1];
-      if (c.w) {
-        for (uint32_t k = lo; k < hi; ++k)
-          acc += contrib[c.col[k]] * static_cast<double>(c.w[k]);
-      } else {
-        for (uint32_t k = lo; k < hi; ++k) acc += contrib[c.col[k]];
-      }
-      double x = alpha * acc;
-      if (p) x += (one_minus_a + alpha * dmass) * p[v];
-      next[v] = x;
-    }
-  });
+// Edge-balanced items claimed dynamically (threaded) or run inline in plan
+// order (per-query PPR workers); same bits either way. tile_part: scratch
+// of c.plan->n_slots doubles.
+void gather_pass(const PullCsr& c, const double* contrib, const double* p,
+                 double alpha, double one_minus_a, double dmass, double* next,
+                 double* tile_part, bool threaded) {
+  plan_gather(*c.plan, c.row, c.col, c.w, contrib, tile_part, threaded,
+              [&](uint32_t v, double acc) {
+                double x = alpha * acc;
+                if (p) x += (one_minus_a + alpha * dmass) * p[v];
+                next[v] = x;
+              });
 }
 
 double l1_diff(uint32_t V, const double* a, const double* b) {
@@ -143,6 +140,7 @@ int pagerank(Graph& g, const double* pvec_canon, double alpha, double tol,
   std::vector<double> r(pvec_canon, pvec_canon + V);  // r0 = pvec
   std::vector<double> r_prev(V, 0.0);
   std::vector<double> contrib(V, 0.0);
+  std::vector<double> tile_part(c.plan->n_slots);
   int done = 0;
   while (true) {
     const int batch = boundary::next_audit_batch(done, max_iter,
@@ -151,8 +149,8 @@ int pagerank(Graph& g, const double* pvec_canon, double alpha, double tol,
     for (int it = 0; it < batch; ++it) {
       contrib_pass(V, ows, r.data(), contrib.data(), true);
       const double dmass = dangling_mass(g, r.data());
-      gather_pass(V, c, contrib.data(), pvec_canon, alpha, one_minus_a,
-                  dmass, r_prev.data(), true);
+      gather_pass(c, contrib.data(), pvec_canon, alpha, one_minus_a, dmass,
+                  r_prev.data(), tile_part.data(), true);
       r.swap(r_prev);  // r = new iterate; r_prev = previous
     }
     done += batch;
@@ -209,6 +207,7 @@ int ppr(Graph& g, const uint32_t* seeds_canon, const float* seed_w,
       sw[i] = static_cast<double>(seed_w[s0 + i]) / wsum[q];
     }
     std::vector<double> r(V, 0.0), r_prev(V, 0.0), contrib(V, 0.0);
+    std::vector<double> tile_part(c.plan->n_slots);
     for (std::size_t i = 0; i < ns; ++i) r[sv[i]] += sw[i];  // r0 = p
     int done = 0;
     while (true) {
@@ -218,8 +217,8 @@ int ppr(Graph& g, const uint32_t* seeds_canon, const float* seed_w,
       for (int it = 0; it < batch; ++it) {
         contrib_pass(V, ows, r.data(), contrib.data(), threaded);
         const double dmass = dangling_mass(g, r.data());
-        gather_pass(V, c, contrib.data(), nullptr, alpha, one_minus_a,
-                    dmass, r_prev.data(), threaded);
+        gather_pass(c, contrib.data(), nullptr, alpha, one_minus_a, dmass,
+                    r_prev.data(), tile_part.data(), threaded);
         // Sparse teleport + dangling term at the seeds only (p[v] = 0
         // elsewhere); mirrors mg_pr_seed_scatter_b.
         for (std::size_t i = 0; i < ns; ++i)
@@ -242,13 +241,11 @@ int ppr(Graph& g, const uint32_t* seeds_canon, const float* seed_w,
   if (n_queries == 1) {
     run_query(0, true);
   } else {
-    parallel_for(
-        n_queries,
-        [&](std::size_t b, std::size_t e) {
-          for (std::size_t q = b; q < e; ++q)
-            run_query(static_cast<uint32_t>(q), false);
-        },
-        1);
+    // Queries claimed one at a time (P/E-core speed differences and
+    // n_queries not divisible by the thread count no longer idle threads).
+    parallel_items(n_queries, [&](std::size_t q) {
+      run_query(static_cast<uint32_t>(q), false);
+    });
   }
   return *std::max_element(iters.begin(), iters.end());
 }

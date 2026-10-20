@@ -55,6 +55,28 @@ struct Orientation {
   uint64_t e_stored = 0;
 };
 
+// Edge-balanced decomposition of one orientation for the threaded CPU pull
+// gathers (PageRank/PPR/HITS). Canonical ids are out-degree descending, so
+// equal VERTEX ranges put most edges in the first chunk; items instead hold
+// ~equal edge+vertex cost and are claimed dynamically by worker threads.
+// Rows with degree >= MG_BIN_HUGE_MIN are split into fixed
+// MG_HUGE_TILE_EDGES-edge tiles (same rule as the GPU huge bin) whose
+// partial sums the caller adds back in slot order. Cut points depend only
+// on the graph (fixed cost target, never the thread count), so results are
+// identical for every MG_THREADS value and scheduling order.
+struct CpuGatherItem {
+  uint32_t v0, v1;  // vertex range [v0, v1); a tile has v1 == v0 + 1
+  uint32_t e0, e1;  // tile edge range (tiles only)
+  int32_t slot;     // >= 0: tile of huge row v0, partial goes to this slot
+};
+
+struct CpuGatherPlan {
+  std::vector<CpuGatherItem> items;  // ascending vertex order
+  std::vector<uint32_t> huge;        // tiled rows, ascending canonical id
+  std::vector<uint32_t> huge_off;    // slot range per tiled row (n_huge+1)
+  uint32_t n_slots = 0;
+};
+
 class Graph {
  public:
   // src/dst are USER indices in [0, V). weights nullable. Throws mg::Error
@@ -72,6 +94,9 @@ class Graph {
   // cached; for undirected graphs orientation(in) == orientation(out).
   const Orientation& orientation(Dir d);
   uint64_t stored_edges() const { return out_.e_stored; }
+  // CPU gather plan of orientation(d), built lazily (O(V) scan) and cached;
+  // undirected graphs share one plan for both directions.
+  const CpuGatherPlan& cpu_gather_plan(Dir d);
 
   BufferPtr out_weight_sum;  // float, V (sum of outgoing weights, or
                              // out-degree as float when unweighted;
@@ -107,6 +132,8 @@ class Graph {
   Orientation out_;
   std::unique_ptr<Orientation> in_;  // directed only
   std::once_flag in_once_;
+  std::unique_ptr<CpuGatherPlan> cpu_plan_[2];  // indexed by Dir
+  std::once_flag cpu_plan_once_[2];
   // Original input edges in canonical ids (kept to build the transpose
   // lazily and deterministically): pairs (canon_src, canon_dst) in input
   // order, plus weights. For undirected graphs these hold the SYMMETRIZED

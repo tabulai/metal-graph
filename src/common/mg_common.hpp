@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
@@ -82,6 +84,34 @@ inline void parallel_for(std::size_t n,
     if (b >= e) break;
     ts.emplace_back([&fn, b, e] { fn(b, e); });
   }
+  for (auto& t : ts) t.join();
+}
+
+// Dynamically scheduled loop over items [0, n): fn(i) per item. The caller
+// and up to num_threads()-1 spawned threads claim items one at a time from
+// a shared counter, so faster (performance) cores take more items. fn must
+// not throw, and results must not depend on which thread runs an item.
+// Runs inline when n <= 1 or one thread is available.
+inline void parallel_items(std::size_t n,
+                           const std::function<void(std::size_t)>& fn) {
+  const unsigned nt = num_threads();
+  if (nt <= 1 || n <= 1) {
+    for (std::size_t i = 0; i < n; ++i) fn(i);
+    return;
+  }
+  const std::size_t workers = std::min<std::size_t>(nt, n);
+  std::atomic<std::size_t> next{0};
+  auto body = [&fn, &next, n] {
+    for (;;) {
+      const std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
+      if (i >= n) break;
+      fn(i);
+    }
+  };
+  std::vector<std::thread> ts;
+  ts.reserve(workers - 1);
+  for (std::size_t w = 1; w < workers; ++w) ts.emplace_back(body);
+  body();
   for (auto& t : ts) t.join();
 }
 

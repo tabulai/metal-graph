@@ -376,6 +376,62 @@ const Orientation& Graph::orientation(Dir d) {
   return *in_;
 }
 
+namespace {
+
+// Target cost (edges + vertices) per CPU gather item, equal to the huge-row
+// tile size. Fixed so that the decomposition (and every fp64 result) is
+// independent of the thread count. M4 Max sweep (cpu mode, rmat16/kg/
+// rmat18): 8192..32768 within ~3%, 2048-4096 up to 9% slower.
+constexpr uint64_t k_cpu_gather_item_cost = MG_HUGE_TILE_EDGES;
+
+CpuGatherPlan build_cpu_gather_plan(const uint32_t* row, uint32_t V) {
+  CpuGatherPlan p;
+  constexpr uint32_t tile = MG_HUGE_TILE_EDGES;
+  uint32_t v = 0;
+  while (v < V) {
+    const uint32_t deg = row[v + 1] - row[v];
+    if (deg >= MG_BIN_HUGE_MIN) {
+      p.huge.push_back(v);
+      p.huge_off.push_back(p.n_slots);
+      for (uint64_t e = row[v]; e < row[v + 1]; e += tile) {
+        const uint32_t e1 = static_cast<uint32_t>(
+            std::min<uint64_t>(row[v + 1], e + tile));
+        p.items.push_back({v, v + 1, static_cast<uint32_t>(e), e1,
+                           static_cast<int32_t>(p.n_slots++)});
+      }
+      ++v;
+      continue;
+    }
+    uint32_t v1 = v;
+    uint64_t acc = 0;
+    while (v1 < V) {
+      const uint32_t d = row[v1 + 1] - row[v1];
+      if (d >= MG_BIN_HUGE_MIN) break;
+      const uint64_t c = static_cast<uint64_t>(d) + 1;
+      if (v1 > v && acc + c > k_cpu_gather_item_cost) break;
+      acc += c;
+      ++v1;
+    }
+    p.items.push_back({v, v1, row[v], row[v1], -1});
+    v = v1;
+  }
+  p.huge_off.push_back(p.n_slots);
+  return p;
+}
+
+}  // namespace
+
+const CpuGatherPlan& Graph::cpu_gather_plan(Dir d) {
+  const Dir key = directed ? d : Dir::out;  // undirected: one shared CSR
+  const int i = static_cast<int>(key);
+  std::call_once(cpu_plan_once_[i], [this, key, i] {
+    const Orientation& o = orientation(key);
+    cpu_plan_[i] = std::make_unique<CpuGatherPlan>(
+        build_cpu_gather_plan(o.row_offsets->as<uint32_t>(), V));
+  });
+  return *cpu_plan_[i];
+}
+
 // Lazy transpose: same deterministic counting sort keyed by canon_dst.
 // Weights carried; edge_orig NOT materialized for IN.
 void Graph::build_in_orientation() {
