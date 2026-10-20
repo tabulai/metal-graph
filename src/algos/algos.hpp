@@ -219,7 +219,11 @@ std::vector<uint32_t> khop_vertices(Graph& g, const uint32_t* seeds_canon,
                                     uint32_t n_seeds, uint32_t k, BfsDir dir,
                                     uint32_t max_vertices);
 
-int wcc(Graph& g, uint32_t* labels_canon);  // labels = canonical min-id per comp
+// labels = canonical min-id per comp; returns the component count. Lock-free
+// parallel union-find (Afforest skip on undirected storage only); the serial
+// oracle runs for MG_THREADS=1 or stored edges < MG_WCC_CPU_PAR_MIN_EDGES.
+// Both produce identical labels.
+int wcc(Graph& g, uint32_t* labels_canon);
 
 HitsResult hits(Graph& g, double tol, int max_iter, int audit_interval,
                 double* hubs_canon, double* authorities_canon);

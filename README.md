@@ -353,6 +353,7 @@ shallow traversals responsive while reducing host round-trips on deep graphs.
 | `MG_BFS_SPARSE_MAX_VERTICES` | 1024 | auto/CPU BFS latency-path vertex cap (0 disables) |
 | `MG_BFS_SPARSE_MAX_EDGES` | 8192 | auto/CPU BFS latency-path scanned-edge cap (0 disables) |
 | `MG_WCC_ROUNDS_PER_BATCH` | — | ignored: GPU WCC is a single union-find link + compress pass |
+| `MG_WCC_CPU_PAR_MIN_EDGES` | 131072 | CPU WCC uses the threaded union-find at or above this many stored edges (serial below it, or when `MG_THREADS=1`) |
 | `MG_GPU_TOPK` | 1 | GPU radix-select for `ppr_topk` (0 = CPU oracle) |
 | `MG_BFS_BOTTOMUP` | 1 | direction-optimizing bottom-up switch |
 | `MG_REQUIRE_GPU` | 0 | hard-fail when no Metal device |
