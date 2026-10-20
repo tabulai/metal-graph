@@ -47,6 +47,30 @@ int bfs(Graph& g, const uint32_t* sources_canon, uint32_t n_sources,
 
 namespace {
 
+// Caps of the bounded serial BFS preflight (auto/CPU modes), shared by the
+// dense and sparse-output entries. The attempt competes with whatever runs
+// when it overflows, so the defaults depend on that fallback:
+//  * GPU: reach, not graph size, decides whether the GPU's fixed launch
+//    floor (~0.7 ms) pays off, so mid-size reaches (a few thousand
+//    vertices, e.g. behind a heavily duplicated hub adjacency) finish
+//    serially: 8192 vertices / 524288 scanned edges.
+//  * threaded CPU: that path has no launch floor and beats the serial walk
+//    on mid-size dense reaches (10-60% on 4k-8k-vertex graphs), so the
+//    tight 1024 / 8192 caps stay.
+// MG_BFS_SPARSE_MAX_VERTICES / MG_BFS_SPARSE_MAX_EDGES override both
+// (0 disables). Returns false when the preflight is disabled.
+bool sparse_caps(ExecPath fallback, uint32_t& max_vertices,
+                 uint64_t& max_edges) {
+  const bool gpu = fallback == ExecPath::gpu;
+  const long v = env_long("MG_BFS_SPARSE_MAX_VERTICES", gpu ? 8192 : 1024);
+  const long e = env_long("MG_BFS_SPARSE_MAX_EDGES", gpu ? 524288 : 8192);
+  if (v <= 0 || e <= 0) return false;
+  max_vertices = static_cast<uint32_t>(
+      std::min<long>(v, std::numeric_limits<uint32_t>::max()));
+  max_edges = static_cast<uint64_t>(e);
+  return true;
+}
+
 // Full (threaded CPU or GPU) traversal in canonical space — the shared
 // fallback behind both the dense entry and the sparse-output entry.
 int run_dense_canon(Graph& g, const std::vector<uint32_t>& src_canon,
@@ -105,15 +129,10 @@ int bfs(Graph& g, const uint32_t* sources, uint32_t n_sources, BfsDir dir,
   // try a tightly bounded serial traversal that writes USER-order outputs
   // directly. Dense outputs still preserve the public BFS contract. Forced
   // GPU mode remains an exact opt-out for testing and benchmarking kernels.
-  const long sparse_vertices =
-      env_long("MG_BFS_SPARSE_MAX_VERTICES", 1024);
-  const long sparse_edges = env_long("MG_BFS_SPARSE_MAX_EDGES", 8192);
-  if (V > 0 && rt.mode() != ExecMode::gpu && sparse_vertices > 0 &&
-      sparse_edges > 0) {
-    const uint32_t vertex_cap = static_cast<uint32_t>(
-        std::min<long>(sparse_vertices,
-                       static_cast<long>(std::numeric_limits<uint32_t>::max())));
-    const uint64_t edge_cap = static_cast<uint64_t>(sparse_edges);
+  uint32_t vertex_cap = 0;
+  uint64_t edge_cap = 0;
+  if (V > 0 && rt.mode() != ExecMode::gpu &&
+      sparse_caps(path, vertex_cap, edge_cap)) {
     const int sparse_levels = cpu::bfs_sparse_user(
         g, src_canon.data(), static_cast<uint32_t>(src_canon.size()), dir,
         vertex_cap, edge_cap, out_dist, out_parent);
@@ -161,17 +180,13 @@ int bfs_sparse(Graph& g, const uint32_t* sources, uint32_t n_sources,
   // Same bounded serial attempt (and the same opt-outs) as the dense
   // preflight — but collecting O(|reached|) output directly, which is the
   // entire point of this API: a tiny traversal never touches O(V) memory.
-  const long sparse_vertices = env_long("MG_BFS_SPARSE_MAX_VERTICES", 1024);
-  const long sparse_edges = env_long("MG_BFS_SPARSE_MAX_EDGES", 8192);
-  if (V > 0 && rt.mode() != ExecMode::gpu && sparse_vertices > 0 &&
-      sparse_edges > 0) {
-    const uint32_t vertex_cap = static_cast<uint32_t>(std::min<long>(
-        sparse_vertices,
-        static_cast<long>(std::numeric_limits<uint32_t>::max())));
+  uint32_t vertex_cap = 0;
+  uint64_t edge_cap = 0;
+  if (V > 0 && rt.mode() != ExecMode::gpu &&
+      sparse_caps(path, vertex_cap, edge_cap)) {
     const int r = cpu::bfs_sparse_collect(
         g, src_canon.data(), static_cast<uint32_t>(src_canon.size()), dir,
-        vertex_cap, static_cast<uint64_t>(sparse_edges), out.vertices,
-        out.dist, out.parent);
+        vertex_cap, edge_cap, out.vertices, out.dist, out.parent);
     if (r >= 0) {
       levels = r;
       path = ExecPath::cpu;

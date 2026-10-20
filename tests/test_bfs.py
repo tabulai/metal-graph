@@ -45,7 +45,9 @@ def _assert_bfs_op(mode, exec_path, case, direction):
         return
 
     # The default sparse preflight is guaranteed to complete when the whole
-    # relevant orientation fits its edge cap. Larger graphs may still fit
+    # relevant orientation fits its edge cap (8192 when, as for these
+    # CPU-routed fixtures, the fallback is the threaded CPU path; every
+    # fixture is also below the 1024-vertex cap). Larger graphs may still fit
     # when the reachable component is small, so leave that data-dependent
     # case to the explicit cap/fallback test below.
     orientation_copies = 1 if case.directed and direction != "both" else 2
@@ -397,3 +399,59 @@ def test_bfs_gpu_high_degree_split_matches_cpu(monkeypatch, split_max,
     np.testing.assert_array_equal(dist[par], dist[child] - 1)
     edges = set(zip(src.tolist(), dst.tolist()))  # traversal edges p -> c
     assert all((int(p), int(c)) in edges for p, c in zip(par, child))
+
+
+@pytest.mark.parametrize("direction", ["out", "both"])
+def test_sparse_preflight_cap_boundaries(monkeypatch, direction):
+    """The preflight succeeds iff the reached vertices fit the vertex cap
+    and their summed degrees (out + in when two-sided) fit the edge cap;
+    each reached vertex is charged when it is discovered."""
+    n = 40
+    src = np.arange(n - 1, dtype=np.uint32)
+    g = mg.Graph.from_edges(src, src + 1, directed=True, num_vertices=n)
+    edges = (n - 1) * (2 if direction == "both" else 1)
+    mg.set_execution("cpu")
+
+    def op_with(vertices, edge_cap):
+        monkeypatch.setenv("MG_BFS_SPARSE_MAX_VERTICES", str(vertices))
+        monkeypatch.setenv("MG_BFS_SPARSE_MAX_EDGES", str(edge_cap))
+        dist, _ = mg.bfs(g, [0], direction=direction)
+        assert np.asarray(dist).tolist() == list(range(n))
+        return mg.last_run_info()["op"]
+
+    try:
+        assert op_with(n, edges) == "bfs_sparse"
+        assert op_with(n - 1, edges) == "bfs"
+        assert op_with(n, edges - 1) == "bfs"
+    finally:
+        mg.set_execution("auto")
+
+
+@pytest.mark.gpu
+def test_sparse_preflight_default_caps_follow_fallback(monkeypatch):
+    """Default caps are 8192 vertices / 524288 edges when the overflow
+    fallback is the GPU and 1024 / 8192 when it is the threaded CPU: a
+    2000-vertex reach is answered serially only in the first case."""
+    if not mg_core.has_gpu():
+        pytest.skip("no Metal device")
+    for name in ("MG_BFS_SPARSE_MAX_VERTICES", "MG_BFS_SPARSE_MAX_EDGES",
+                 "MG_E_GPU_MIN", "MG_E_GPU_MIN_BFS"):
+        monkeypatch.delenv(name, raising=False)
+    n = 2000
+    src = np.arange(n - 1, dtype=np.uint32)
+    g = mg.Graph.from_edges(src, src + 1, directed=True, num_vertices=n)
+    try:
+        mg.set_execution("cpu")
+        mg.bfs(g, [0])
+        assert mg.last_run_info()["op"] == "bfs"  # CPU fallback: 1024 cap
+        mg.set_execution("auto")
+        monkeypatch.setenv("MG_E_GPU_MIN_BFS", "0")  # plan the GPU
+        dist, _ = mg.bfs(g, [0])
+        info = mg.last_run_info()
+        assert (info["op"], info["path"]) == ("bfs_sparse", "cpu")
+        assert np.asarray(dist).tolist() == list(range(n))
+        vs, _, _ = mg.bfs(g, [0], output="sparse")
+        assert mg.last_run_info()["op"] == "bfs_sparse"
+        assert np.asarray(vs).size == n
+    finally:
+        mg.set_execution("auto")

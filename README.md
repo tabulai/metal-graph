@@ -239,9 +239,14 @@ identical-work comparison.
 <details>
 <summary>Notes for the marked benchmark cells</summary>
 
-¹ **Tiny-component BFS.** Small reachable components use a bounded serial CPU
-path and are assessed against a 50 µs absolute-latency objective rather than
-a ratio alone. Dense result initialization dominates at this scale.
+¹ **Tiny-component BFS.** Reachable components that fit the serial-path caps
+use a bounded serial CPU path. By default the caps are 8,192 vertices and
+524,288 scanned edges when the full traversal would otherwise run on the
+GPU, and 1,024 vertices and 8,192 edges when it would run on the threaded
+CPU. The tiny source-0 component shown here is assessed against a 50 µs
+absolute-latency objective rather than a ratio alone; larger traversals that
+still fit the caps take longer than that and are not held to it. Dense result
+initialization dominates at this scale.
 `output="sparse"` avoids that cost when the traversal fits the configured
 caps. Overflow or forced-GPU execution remains exact but materializes dense
 state before compaction. The bounded collector still reserves a lazily zeroed
@@ -249,8 +254,12 @@ V-byte visited map, so sparse output is not an unconditional
 O(|reached|)-memory guarantee. The benchmark records whether the objective
 passed but does not fail the command when it is missed.
 
-For the HippoRAG high-degree source, which exercises the GPU, metal-graph
-measured 1.905 ms versus rustworkx at 50.058 ms (26.3×).
+For the HippoRAG high-degree source, metal-graph measured 1.905 ms on the
+GPU versus rustworkx at 50.058 ms (26.3×), under the earlier 1,024-vertex and
+8,192-edge serial caps. That source reaches 4,737 vertices through 437,592
+scanned edges, which fits the current GPU-fallback defaults, so auto mode
+now answers it on the serial CPU path; that has not yet been re-measured with
+the benchmark harness. `mg.set_execution("gpu")` still exercises the GPU.
 
 ² **Isolated HippoRAG PPR measurement.** The displayed values come from a
 clean-process, 20-run artifact:
@@ -265,7 +274,8 @@ This measurement supersedes the interrupted full-suite run's anomalous
 15.116 ms reading, which carried a 3.3 ms `python_boundary` residue unique to
 that collection window. The same artifact measured high-degree BFS at
 1.857 ms versus igraph at 2.321 ms (1.25×) and rustworkx at 49.334 ms
-(26.6×), using the corrected equivalent-output adapter.
+(26.6×), using the corrected equivalent-output adapter. That GPU-path
+reading also predates the current serial BFS caps (see note ¹).
 
 </details>
 
@@ -309,7 +319,11 @@ is more appropriate.
 BFS, for example, first tries a bounded serial traversal. If the reachable
 component fits within its vertex and scanned-edge caps, the CPU answers the
 query directly. If it does not fit, the partial attempt is discarded and the
-regular CPU or GPU path runs instead.
+regular CPU or GPU path runs instead. Each reached vertex's adjacency is
+charged against the edge cap when the vertex is discovered, so an attempt
+that cannot fit is usually abandoned early. The caps are larger when the
+fallback is the GPU, whose fixed launch cost a serial traversal of a few
+thousand vertices still beats, than when it is the threaded CPU path.
 
 `ppr_topk` applies the same idea per query. When the vertices reachable
 from a query's seeds along outgoing edges fit within the vertex and
@@ -367,8 +381,8 @@ shallow traversals responsive while reducing host round-trips on deep graphs.
 | `MG_PR_AUDIT_INTERVAL` | 5 | iterations per GPU command batch / fp64 audit |
 | `MG_HITS_AUDIT_INTERVAL` | 5 | HITS iterations per GPU command batch / fp64 audit |
 | `MG_BFS_LEVELS_PER_BATCH` | adaptive 8,8,16,32,64… | BFS levels per command buffer; an integer pins a fixed size (clamped 1–256) |
-| `MG_BFS_SPARSE_MAX_VERTICES` | 1024 | auto/CPU BFS latency-path vertex cap (0 disables) |
-| `MG_BFS_SPARSE_MAX_EDGES` | 8192 | auto/CPU BFS latency-path scanned-edge cap (0 disables) |
+| `MG_BFS_SPARSE_MAX_VERTICES` | 8192 if the fallback is the GPU, else 1024 | auto/CPU BFS latency-path vertex cap (0 disables) |
+| `MG_BFS_SPARSE_MAX_EDGES` | 524288 if the fallback is the GPU, else 8192 | auto/CPU BFS latency-path scanned-edge cap (0 disables) |
 | `MG_PPR_SPARSE_MAX_VERTICES` | 1024 | auto/CPU `ppr_topk` per-query reachable-set vertex cap (0 disables) |
 | `MG_PPR_SPARSE_MAX_EDGES` | 8192 | auto/CPU `ppr_topk` per-query scanned-edge cap (0 disables) |
 | `MG_WCC_ROUNDS_PER_BATCH` | — | ignored: GPU WCC is a single union-find link + compress pass |
