@@ -310,18 +310,15 @@ graph, leaving igraph as its completed comparator.
 when a Metal device is available and the graph has at least a per-operation
 number of stored edges: one million for `pagerank` (including personalized
 PageRank), `hits`, `ppr_topk`, `bfs`, and `wcc`;
-otherwise it starts with the CPU. `k_hop` starts with the CPU at every size,
-because its threaded CPU vertex discovery is faster than a GPU BFS on the
-graphs measured so far (induced-edge extraction runs on the host either
-way). Individual algorithms can override that candidate when another path
-is more appropriate.
+otherwise it starts with the CPU. By default, `k_hop` starts with the CPU at
+every size; `MG_E_GPU_MIN_KHOP` or `MG_E_GPU_MIN` can override that default.
+Its induced-edge extraction runs on the host on either path. Individual
+algorithms can override the planner's candidate when another path is more
+appropriate.
 
 PageRank and HITS retain their original fp64 CPU arithmetic below one
 million stored edges. Lowering their GPU thresholds explicitly opts into
-fp32 GPU arithmetic; it is not an identical-precision optimization. It is
-not usually faster either: on an M4 Max the threaded fp64 CPU path answers
-single calls at the default tolerance sooner than the GPU below that size,
-and the GPU pulls ahead only under sustained load with tight tolerances.
+fp32 GPU arithmetic, changing the precision of the computation.
 
 BFS, for example, first tries a bounded serial traversal. If the reachable
 component fits within its vertex and scanned-edge caps, the CPU answers the
@@ -329,8 +326,7 @@ query directly. If it does not fit, the partial attempt is discarded and the
 regular CPU or GPU path runs instead. Each reached vertex's adjacency is
 charged against the edge cap when the vertex is discovered, so an attempt
 that cannot fit is usually abandoned early. The caps are larger when the
-fallback is the GPU, whose fixed launch cost a serial traversal of a few
-thousand vertices still beats, than when it is the threaded CPU path.
+fallback is the GPU than when it is the threaded CPU path.
 
 `ppr_topk` applies the same idea per query. When the vertices reachable
 from a query's seeds along outgoing edges fit within the vertex and
@@ -341,13 +337,12 @@ incoming edges), audit rule, and tie order as the full CPU path. Dropping the
 unreachable zero-contribution edges therefore preserves the dense result
 exactly. To locate those tiles, the first auto- or CPU-mode `ppr_topk`
 call on a directed graph builds a small cached index of the large rows'
-tile boundaries (up to three parallel passes over the edges, about 1.5 ms
-for 2 million edges on an M4 Max). Queries that do not fit run
-on the planned CPU or GPU path; in a mixed batch only those rows go to the
-GPU, so their scores carry the usual GPU float32 tolerance while the others
-are fp64. `last_run_info()` reports `path="cpu"` when every query in the
-batch was answered this way, and the planned path otherwise. Forced GPU mode
-skips the attempt.
+tile boundaries (up to three parallel passes over the edges). Queries that
+do not fit run on the planned CPU or GPU path; in a mixed batch only those
+rows go to the GPU, so their scores carry the usual GPU float32 tolerance
+while the others are fp64. `last_run_info()` reports `path="cpu"` when every
+query in the batch was answered this way, and the planned path otherwise.
+Forced GPU mode skips the attempt.
 
 You can override the planner when testing or profiling:
 
@@ -448,6 +443,14 @@ The most important result conventions are:
   returned neighborhood as a new graph.
 - WCC treats directed edges as undirected and numbers components by their
   first appearance in user-index order.
+
+Version 0.1.2 changes CPU floating-point summation: PageRank and PPR scores
+can differ from 0.1.1 in the last float32 bit, and PPR near-ties can change
+order. Large adjacency rows can also change HITS scores through tiled fp64
+summation. These ranking results remain deterministic across CPU thread
+counts; see the
+[0.1.2 release notes](https://github.com/tabulai/metal-graph/blob/main/CHANGELOG.md#012--2026-10-22)
+for details.
 
 <details>
 <summary>Exact PageRank convergence behavior</summary>

@@ -16,6 +16,11 @@ concurrency:
   cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 jobs:
+  release-validation:
+    # Re-run the full suite on the exact tag commit before any publication.
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    uses: ./.github/workflows/ci.yml
+
   macos-arm64:
     name: CPython 3.10–3.14 / macOS 14 / arm64
     # This is a runtime release gate, not merely a build label. If GitHub
@@ -213,7 +218,7 @@ jobs:
   publish-testpypi:
     name: Publish wheels to TestPyPI
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: gpu-smoke
+    needs: [gpu-smoke, release-validation]
     runs-on: ubuntu-24.04
     environment:
       name: testpypi

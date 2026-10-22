@@ -74,14 +74,17 @@ After the release changes have passed pull-request checks and landed on
 `main`, push that exact tag (for example, `v0.1.2`). The production-wheel
 workflow then:
 
-1. builds, validates, and CPU-smoke-tests all five wheels on macOS 14 Apple
+1. runs lint, native sanitizers, and the complete CPU/GPU correctness suite
+   against the exact tagged commit;
+2. builds, validates, and CPU-smoke-tests all five wheels on macOS 14 Apple
    Silicon;
-2. installs every wheel on macOS 15 Apple Silicon and requires GPU execution;
-3. publishes those same artifacts to TestPyPI;
-4. installs the TestPyPI wheel and exercises CPU and forced-GPU
+3. installs every wheel on macOS 15 Apple Silicon and requires GPU execution;
+4. publishes those same artifacts to TestPyPI only after all correctness and
+   wheel checks pass;
+5. installs the TestPyPI wheel and exercises CPU and forced-GPU
    operations;
-5. publishes to PyPI only after that smoke test succeeds; and
-6. repeats the installation and runtime checks from PyPI.
+6. publishes to PyPI only after that smoke test succeeds; and
+7. repeats the installation and runtime checks from PyPI.
 
 Do not rerun a partially published release with altered artifacts or use
 `skip-existing`. If a release fails after any upload, diagnose the existing
