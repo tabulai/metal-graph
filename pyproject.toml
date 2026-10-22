@@ -7,7 +7,7 @@ build-backend = "scikit_build_core.build"
 [project]
 name = "metal-graph"
 # Single release-version source; numeric X.Y.Z is the project policy.
-version = "0.1.1"
+version = "0.1.2"
 description = "Metal-native graph analytics for Apple Silicon"
 authors = [{ name = "TabulAI" }]
 readme = "README.md"

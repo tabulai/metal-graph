@@ -4,6 +4,8 @@ All notable changes to metal-graph are documented here.
 
 ## Unreleased
 
+## 0.1.2 — 2026-10-22
+
 - Exposed HITS convergence status and final hub L1 change through Python's
   `last_run_info()` and the additive C accessor `mg_last_run_convergence()`.
   Callers can distinguish convergence (including on the final allowed
