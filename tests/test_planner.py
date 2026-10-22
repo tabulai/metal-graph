@@ -71,7 +71,7 @@ def test_last_run_info_op_per_algorithm():
 
 
 def test_auto_mode_picks_cpu_for_tiny_graph_inprocess():
-    # The lowest per-op GPU threshold is 200k stored edges (pagerank/hits);
+    # The lowest default per-op GPU threshold is 1M stored edges;
     # every fixture is far below.
     case = ALL_CASES["gnp_dir"]
     g = build_mg(case)
@@ -328,8 +328,8 @@ def test_per_op_threshold_precedence_subprocess():
 
 @pytest.mark.gpu
 def test_default_per_op_thresholds_subprocess():
-    """Defaults: pagerank/hits switch to the GPU at 200k stored edges,
-    ppr/bfs/wcc stay on the CPU below 1M, and auto k_hop never uses the
+    """Defaults preserve CPU fp64 for pagerank/hits below 1M stored edges,
+    ppr/bfs/wcc also switch at 1M, and auto k_hop never uses the
     GPU, even at 1M+ stored edges."""
     if not has_gpu():
         pytest.skip("no Metal device")
@@ -345,10 +345,20 @@ def graph(e):
 mg.set_execution("auto")
 out = {}
 g = graph(250_000)
-mg.pagerank(g, max_iter=5); out["pagerank_250k"] = mg.last_run_info()["path"]
-mg.hits(g, max_iter=5); out["hits_250k"] = mg.last_run_info()["path"]
+rank = mg.pagerank(g, max_iter=5)
+out["pagerank_250k"] = mg.last_run_info()["path"]
+hubs, auth = mg.hits(g, max_iter=5)
+out["hits_250k"] = mg.last_run_info()["path"]
+mg.set_execution("cpu")
+np.testing.assert_array_equal(rank, mg.pagerank(g, max_iter=5))
+cpu_hubs, cpu_auth = mg.hits(g, max_iter=5)
+np.testing.assert_array_equal(hubs, cpu_hubs)
+np.testing.assert_array_equal(auth, cpu_auth)
+mg.set_execution("auto")
 mg.experimental.wcc(g); out["wcc_250k"] = mg.last_run_info()["path"]
 g = graph(1_000_000)
+mg.pagerank(g, max_iter=5); out["pagerank_1m"] = mg.last_run_info()["path"]
+mg.hits(g, max_iter=5); out["hits_1m"] = mg.last_run_info()["path"]
 mg.k_hop(g, [0], k=2, direction="out"); out["khop_1m"] = mg.last_run_info()["path"]
 mg.experimental.wcc(g); out["wcc_1m"] = mg.last_run_info()["path"]
 print("PATHS", json.dumps(out))
@@ -358,5 +368,6 @@ print("PATHS", json.dumps(out))
     assert r.returncode == 0, r.stderr
     line = next(x for x in r.stdout.splitlines() if x.startswith("PATHS "))
     assert json.loads(line[len("PATHS "):]) == {
-        "pagerank_250k": "gpu", "hits_250k": "gpu", "wcc_250k": "cpu",
+        "pagerank_250k": "cpu", "hits_250k": "cpu", "wcc_250k": "cpu",
+        "pagerank_1m": "gpu", "hits_1m": "gpu",
         "khop_1m": "cpu", "wcc_1m": "gpu"}

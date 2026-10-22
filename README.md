@@ -308,13 +308,20 @@ graph, leaving igraph as its completed comparator.
 
 `mode="auto"` is intended for normal use. The planner starts with the GPU
 when a Metal device is available and the graph has at least a per-operation
-number of stored edges: 200,000 for `pagerank` (including personalized
-PageRank) and `hits`, and one million for `ppr_topk`, `bfs`, and `wcc`;
+number of stored edges: one million for `pagerank` (including personalized
+PageRank), `hits`, `ppr_topk`, `bfs`, and `wcc`;
 otherwise it starts with the CPU. `k_hop` starts with the CPU at every size,
 because its threaded CPU vertex discovery is faster than a GPU BFS on the
 graphs measured so far (induced-edge extraction runs on the host either
 way). Individual algorithms can override that candidate when another path
 is more appropriate.
+
+PageRank and HITS retain their original fp64 CPU arithmetic below one
+million stored edges. Lowering their GPU thresholds explicitly opts into
+fp32 GPU arithmetic; it is not an identical-precision optimization. It is
+not usually faster either: on an M4 Max the threaded fp64 CPU path answers
+single calls at the default tolerance sooner than the GPU below that size,
+and the GPU pulls ahead only under sustained load with tight tolerances.
 
 BFS, for example, first tries a bounded serial traversal. If the reachable
 component fits within its vertex and scanned-edge caps, the CPU answers the
@@ -329,7 +336,13 @@ thousand vertices still beats, than when it is the threaded CPU path.
 from a query's seeds along outgoing edges fit within the vertex and
 scanned-edge caps, every other vertex has an exact score of zero, so the CPU
 solves that query exactly in fp64 on the reachable set alone, with the same
-audit rule and tie order as the full CPU path. Queries that do not fit run
+summation order (including the fixed 16,384-edge tiles of rows with that many
+incoming edges), audit rule, and tie order as the full CPU path. Dropping the
+unreachable zero-contribution edges therefore preserves the dense result
+exactly. To locate those tiles, the first auto- or CPU-mode `ppr_topk`
+call on a directed graph builds a small cached index of the large rows'
+tile boundaries (up to three parallel passes over the edges, about 1.5 ms
+for 2 million edges on an M4 Max). Queries that do not fit run
 on the planned CPU or GPU path; in a mixed batch only those rows go to the
 GPU, so their scores carry the usual GPU float32 tolerance while the others
 are fp64. `last_run_info()` reports `path="cpu"` when every query in the
@@ -377,7 +390,7 @@ shallow traversals responsive while reducing host round-trips on deep graphs.
 | Variable | Default | Meaning |
 |---|---|---|
 | `MG_E_GPU_MIN` | unset (per-op defaults) | auto-planner GPU threshold (stored edges); when set, applies to every operation |
-| `MG_E_GPU_MIN_<OP>` | `PAGERANK`/`HITS` 200000; `PPR`/`BFS`/`WCC` 1000000; `KHOP` never | per-operation threshold; takes precedence over `MG_E_GPU_MIN` |
+| `MG_E_GPU_MIN_<OP>` | `PAGERANK`/`HITS`/`PPR`/`BFS`/`WCC` 1000000; `KHOP` never | per-operation threshold; takes precedence over `MG_E_GPU_MIN`; lowering numeric-operation thresholds opts into fp32 GPU arithmetic |
 | `MG_PR_AUDIT_INTERVAL` | 5 | iterations per GPU command batch / fp64 audit |
 | `MG_HITS_AUDIT_INTERVAL` | 5 | HITS iterations per GPU command batch / fp64 audit |
 | `MG_BFS_LEVELS_PER_BATCH` | adaptive 8,8,16,32,64… | BFS levels per command buffer; an integer pins a fixed size (clamped 1–256) |
@@ -385,15 +398,16 @@ shallow traversals responsive while reducing host round-trips on deep graphs.
 | `MG_BFS_SPARSE_MAX_EDGES` | 524288 if the fallback is the GPU, else 8192 | auto/CPU BFS latency-path scanned-edge cap (0 disables) |
 | `MG_PPR_SPARSE_MAX_VERTICES` | 1024 | auto/CPU `ppr_topk` per-query reachable-set vertex cap (0 disables) |
 | `MG_PPR_SPARSE_MAX_EDGES` | 8192 | auto/CPU `ppr_topk` per-query scanned-edge cap (0 disables) |
-| `MG_WCC_ROUNDS_PER_BATCH` | — | ignored: GPU WCC is a single union-find link + compress pass |
-| `MG_WCC_CPU_PAR_MIN_EDGES` | 131072 | CPU WCC uses the threaded union-find at or above this many stored edges (serial below it, or when `MG_THREADS=1`) |
+| `MG_WCC_ROUNDS_PER_BATCH` | — | ignored: GPU WCC runs one fixed sequence of union-find passes (sample, snapshot, link, compress) in a single command buffer |
+| `MG_WCC_CPU_PAR_MIN_EDGES` | 65536 | CPU WCC uses the threaded union-find at or above this many stored edges (serial below it, or when `MG_THREADS=1`) |
 | `MG_GPU_TOPK` | 1 | GPU radix-select for `ppr_topk` (0 = CPU oracle) |
 | `MG_BFS_BOTTOMUP` | 1 | direction-optimizing bottom-up switch |
 | `MG_BFS_HIGH_SPLIT_MAX` | 64 | GPU BFS: max threadgroups per high-degree frontier vertex (1 = unsplit; clamped 1–1024) |
 | `MG_REQUIRE_GPU` | 0 | hard-fail when no Metal device |
 | `MG_FORCE_CPU` | 0 | disable the GPU entirely |
-| `MG_THREADS` | all cores | CPU-path thread count |
+| `MG_THREADS` | all cores | CPU-path thread count (the caller plus persistent pool workers; values above 257 use 256 workers) |
 | `MG_METALLIB` | embedded | override path to a .metallib (dev loop) |
+| `MG_DEBUG_POISON_SCRATCH` | 0 | debug: fill uninitialized GPU scratch buffers with 0xFF bytes (NaN) so reads of unwritten elements surface |
 
 </details>
 

@@ -25,14 +25,9 @@ inline std::vector<uint32_t> to_canon(const Graph& g, const uint32_t* user,
   return out;
 }
 
-// Dense personalization (USER order, may be null => uniform) -> normalized
-// canonical fp64 vector. Rejects non-finite/negative and all-zero vectors.
-inline std::vector<double> pvec_to_canon(const Graph& g, const float* p_user) {
-  std::vector<double> p(g.V);
-  if (!p_user) {
-    std::fill(p.begin(), p.end(), 1.0 / static_cast<double>(g.V));
-    return p;
-  }
+// Validate a dense USER-order personalization and return its fp64 sum
+// (sequential, USER order). Rejects non-finite/negative and all-zero vectors.
+inline double personalization_sum(const Graph& g, const float* p_user) {
   double s = 0.0;
   for (uint32_t u = 0; u < g.V; ++u) {
     double v = p_user[u];
@@ -42,8 +37,21 @@ inline std::vector<double> pvec_to_canon(const Graph& g, const float* p_user) {
   }
   if (!(s > 0.0) || !std::isfinite(s))
     throw_invalid("personalization: sum must be finite and > 0");
+  return s;
+}
+
+// Dense personalization (USER order, may be null => uniform) -> normalized
+// canonical fp64 vector: p[canon_of_user[u]] = p_user[u] / p_sum, where p_sum
+// is personalization_sum(g, p_user) (validated by the caller).
+inline std::vector<double> pvec_to_canon(const Graph& g, const float* p_user,
+                                         double p_sum) {
+  std::vector<double> p(g.V);
+  if (!p_user) {
+    std::fill(p.begin(), p.end(), 1.0 / static_cast<double>(g.V));
+    return p;
+  }
   for (uint32_t u = 0; u < g.V; ++u)
-    p[g.canon_of_user[u]] = static_cast<double>(p_user[u]) / s;
+    p[g.canon_of_user[u]] = static_cast<double>(p_user[u]) / p_sum;
   return p;
 }
 

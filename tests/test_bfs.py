@@ -244,6 +244,99 @@ def test_sparse_cpu_path_is_reentrant(monkeypatch):
             )
 
 
+@pytest.mark.parametrize("direction", DIRECTIONS)
+@pytest.mark.parametrize("directed", [True, False])
+@pytest.mark.parametrize("threads", ["1", "4"])
+def test_cpu_dense_output_fused_gather_permuted_ids(
+        monkeypatch, direction, directed, threads):
+    """A wide layered graph exercises parallel claims, competing parents,
+    and USER/canonical permutations. Direct dense output must match the
+    canonical sparse fallback and the serial preflight, including empty
+    sources, duplicate sources, and isolated vertices."""
+    from collections import deque
+
+    width = 4096  # each full layer exceeds the frontier's threading grain
+    a = np.arange(1, width + 1, dtype=np.uint32)
+    b = a + width
+    c = b + width
+    sink = 3 * width + 1
+    v = sink + 17
+    chain = np.arange(sink + 1, sink + 9, dtype=np.uint32)
+    src = np.concatenate((np.zeros(width, np.uint32), a, a, b, c,
+                          chain[:-1], [a[5], 0])).astype(np.uint32)
+    dst = np.concatenate((a, b, np.roll(b, 1), c,
+                          np.full(width, sink, np.uint32),
+                          chain[1:], [a[5], 0])).astype(np.uint32)
+    perm = np.random.default_rng(29).permutation(v).astype(np.uint32)
+    src, dst = perm[src], perm[dst]
+    g = mg.Graph.from_edges(src, dst, directed=directed, num_vertices=v)
+    if not directed or direction == "both":
+        ts, td = np.concatenate((src, dst)), np.concatenate((dst, src))
+    elif direction == "in":
+        ts, td = dst, src
+    else:
+        ts, td = src, dst
+    adjacency = [[] for _ in range(v)]
+    for s, d in zip(ts, td):
+        adjacency[int(s)].append(int(d))
+    edge_keys = ts.astype(np.int64) * v + td
+    root = sink if direction == "in" else 0
+    source_sets = [[], [int(perm[-1])],
+                   perm[[v - 1, root, root, sink + 4]].tolist()]
+
+    def expected_dist(sources):
+        distance = np.full(v, -1, np.int32)
+        queue = deque()
+        for source in sources:
+            if distance[source] < 0:
+                distance[source] = 0
+                queue.append(source)
+        while queue:
+            source = queue.popleft()
+            for target in adjacency[source]:
+                if distance[target] < 0:
+                    distance[target] = distance[source] + 1
+                    queue.append(target)
+        return distance
+
+    def assert_parents(vertices, distances, parents, expected):
+        vertices = np.asarray(vertices)
+        distances = np.asarray(distances)
+        parents = np.asarray(parents)
+        child = distances > 0
+        assert (parents[~child] == -1).all()
+        p = parents[child].astype(np.int64)
+        children = vertices[child].astype(np.int64)
+        assert ((p >= 0) & (p < v)).all()
+        np.testing.assert_array_equal(expected[p], distances[child] - 1)
+        assert np.isin(p * v + children, edge_keys).all()
+
+    monkeypatch.setenv("MG_THREADS", threads)
+    mg.set_execution("cpu")
+    try:
+        for sources in source_sets:
+            expected = expected_dist(sources)
+            for vertex_cap, edge_cap in ((0, 0), (1, 1), (v, 2 * src.size)):
+                monkeypatch.setenv("MG_BFS_SPARSE_MAX_VERTICES", str(vertex_cap))
+                monkeypatch.setenv("MG_BFS_SPARSE_MAX_EDGES", str(edge_cap))
+                source_array = np.asarray(sources, np.uint32)
+                distances, parents = mg.bfs(g, source_array, direction=direction)
+                info = dict(mg.last_run_info())
+                assert info["path"] == "cpu"
+                if vertex_cap == 0:
+                    assert info["op"] == "bfs"  # isolate the new fused gather
+                np.testing.assert_array_equal(distances, expected)
+                assert info["iterations"] == int(expected.max()) + 1
+                assert_parents(np.arange(v), distances, parents, expected)
+                vs, ds, ps = mg.bfs(g, source_array, direction=direction,
+                                    output="sparse")
+                np.testing.assert_array_equal(vs, np.flatnonzero(expected >= 0))
+                np.testing.assert_array_equal(ds, expected[vs])
+                assert_parents(vs, ds, ps, expected)
+    finally:
+        mg.set_execution("auto")
+
+
 def _debug_batch_schedule(monkeypatch, value=None, *, vertices=4096,
                           max_levels=0, encoded=0, max_batches=6):
     if value is None:
@@ -455,3 +548,188 @@ def test_sparse_preflight_default_caps_follow_fallback(monkeypatch):
         assert np.asarray(vs).size == n
     finally:
         mg.set_execution("auto")
+
+
+@pytest.mark.parametrize("degree", [65535, 65536, 65537, 131073])
+@pytest.mark.parametrize("direction", ["out", "in", "both"])
+@pytest.mark.parametrize("threads", ["1", "4"])
+def test_cpu_bfs_edge_slice_degree_boundaries(degree, direction, threads, monkeypatch):
+    leaves = np.arange(1, degree + 1, dtype=np.uint32)
+    zeros = np.zeros(degree, dtype=np.uint32)
+    # A source row crosses chunk boundaries. The two extra leaf edges
+    # offer competing valid parents to one depth-2 vertex. Initial sources
+    # include isolates before, between, and after two nonzero-degree rows,
+    # exercising repeated edge-prefix offsets on the optimized both path.
+    deep = degree + 1
+    v = degree + 11
+    if direction == "out":
+        src = np.concatenate((zeros, [1, 2]))
+        dst = np.concatenate((leaves, [deep, deep]))
+    elif direction == "in":
+        src = np.concatenate((leaves, [deep, deep]))
+        dst = np.concatenate((zeros, [1, 2]))
+    else:
+        mid = degree // 2
+        src = np.concatenate((zeros[:mid], leaves[mid:], [1, 2]))
+        dst = np.concatenate((leaves[:mid], zeros[mid:], [deep, deep]))
+    second_source, second_child = degree + 4, degree + 5
+    extra_src, extra_dst = ((second_child, second_source) if direction == "in"
+                            else (second_source, second_child))
+    src = np.concatenate((src, [extra_src]))
+    dst = np.concatenate((dst, [extra_dst]))
+    perm = np.random.default_rng(37).permutation(v).astype(np.uint32)
+    src = perm[src.astype(np.uint32)]
+    dst = perm[dst.astype(np.uint32)]
+    g = mg.Graph.from_edges(src, dst, directed=True, num_vertices=v)
+    monkeypatch.setenv("MG_THREADS", threads)
+    monkeypatch.setenv("MG_BFS_SPARSE_MAX_VERTICES", "0")
+    sources = perm[[degree + 2, 0, degree + 3, second_source, degree + 6, 0]]
+    mg.set_execution("cpu")
+    try:
+        distance, parent = mg.bfs(g, sources, direction=direction)
+        assert mg.last_run_info()["iterations"] == 3
+        vs, ds, ps = mg.bfs(g, sources, direction=direction, output="sparse")
+    finally:
+        mg.set_execution("auto")
+    expected = np.full(v, -1, np.int32)
+    expected[sources] = 0
+    expected[perm[leaves]] = 1
+    expected[perm[deep]] = 2
+    expected[perm[second_child]] = 1
+    np.testing.assert_array_equal(distance, expected)
+    np.testing.assert_array_equal(vs, np.flatnonzero(expected >= 0))
+    np.testing.assert_array_equal(ds, expected[vs])
+    if direction == "in":
+        src, dst = dst, src
+    edges = src.astype(np.int64) * v + dst
+    if direction == "both":
+        edges = np.concatenate((edges, dst.astype(np.int64) * v + src))
+    for vertices, distances, parents in ((np.arange(v), distance, parent),
+                                         (vs, ds, ps)):
+        child = distances > 0
+        assert (parents[~child] == -1).all()
+        p = parents[child].astype(np.int64)
+        c = vertices[child].astype(np.int64)
+        assert ((p >= 0) & (p < v)).all()
+        np.testing.assert_array_equal(expected[p], distances[child] - 1)
+        assert np.isin(p * v + c, edges).all()
+
+
+@pytest.mark.parametrize("threads", ["1", "4"])
+def test_cpu_bfs_edge_slice_all_zero_degree_frontier(monkeypatch, threads):
+    """>1024 isolated sources enter the parallel-size frontier branch with
+    an all-zero edge prefix. The level still counts once and ends cleanly."""
+    v = 2048
+    empty = np.asarray([], np.uint32)
+    g = mg.Graph.from_edges(empty, empty, directed=True, num_vertices=v)
+    sources = np.random.default_rng(43).permutation(v)[:1500].astype(np.uint32)
+    sources = np.concatenate((sources, sources[:2]))  # deduplicate before slicing
+    expected = np.full(v, -1, np.int32)
+    expected[sources] = 0
+    monkeypatch.setenv("MG_THREADS", threads)
+    monkeypatch.setenv("MG_BFS_SPARSE_MAX_VERTICES", "0")
+    mg.set_execution("cpu")
+    try:
+        distance, parent = mg.bfs(g, sources, direction="both")
+        assert mg.last_run_info()["iterations"] == 1
+        vs, ds, ps = mg.bfs(g, sources, direction="both", output="sparse")
+        assert mg.last_run_info()["iterations"] == 1
+    finally:
+        mg.set_execution("auto")
+    np.testing.assert_array_equal(distance, expected)
+    assert (parent == -1).all()
+    np.testing.assert_array_equal(vs, np.flatnonzero(expected >= 0))
+    np.testing.assert_array_equal(ds, np.zeros(1500, np.int32))
+    assert (ps == -1).all()
+
+
+@pytest.mark.parametrize("frontier_size", [262143, 262144, 262145])
+@pytest.mark.parametrize("threads", ["1", "4", "default"])
+def test_cpu_bfs_parallel_prefix_boundary(frontier_size, threads, monkeypatch):
+    """Large initial frontiers cross the parallel-prefix threshold, with
+    repeated offsets spanning scan blocks and hubs split across edge slices."""
+    source_rows = [1, frontier_size // 4 - 1,
+                   frontier_size // 2 + 1, frontier_size - 2]
+    degrees = [65537, 3, 65539, 2]
+    n_leaves = sum(degrees)
+    leaves = np.arange(frontier_size, frontier_size + n_leaves, dtype=np.uint32)
+    deep = frontier_size + n_leaves
+    v = deep + 5
+    src, dst = [], []
+    cursor = 0
+    for row, degree in zip(source_rows, degrees):
+        neighbors = leaves[cursor:cursor + degree]
+        cursor += degree
+        split = degree // 2
+        src.extend((np.full(split, row, np.uint32), neighbors[split:]))
+        dst.extend((neighbors[:split], np.full(degree - split, row, np.uint32)))
+    # A later level has competing parents and both orientation transitions.
+    src.append(np.asarray([leaves[0], deep, leaves[0]], np.uint32))
+    dst.append(np.asarray([deep, leaves[-1], deep], np.uint32))
+    perm = np.random.default_rng(83).permutation(v).astype(np.uint32)
+    src, dst = perm[np.concatenate(src)], perm[np.concatenate(dst)]
+    sources = perm[np.arange(frontier_size, dtype=np.uint32)]
+    sources = np.concatenate((sources, sources[[0, 1, -1]]))
+    expected = np.full(v, -1, np.int32)
+    expected[sources] = 0
+    expected[perm[leaves]] = 1
+    expected[perm[deep]] = 2
+    g = mg.Graph.from_edges(src, dst, directed=True, num_vertices=v)
+    if threads == "default":
+        monkeypatch.delenv("MG_THREADS", raising=False)
+    else:
+        monkeypatch.setenv("MG_THREADS", threads)
+    monkeypatch.setenv("MG_BFS_SPARSE_MAX_VERTICES", "0")
+    mg.set_execution("cpu")
+    try:
+        distance, parent = mg.bfs(g, sources, direction="both")
+        assert mg.last_run_info()["iterations"] == 3
+        vs, ds, ps = mg.bfs(g, sources, direction="both", output="sparse")
+        assert mg.last_run_info()["iterations"] == 3
+    finally:
+        mg.set_execution("auto")
+    np.testing.assert_array_equal(distance, expected)
+    np.testing.assert_array_equal(vs, np.flatnonzero(expected >= 0))
+    np.testing.assert_array_equal(ds, expected[vs])
+    edges = np.concatenate((src.astype(np.int64) * v + dst,
+                            dst.astype(np.int64) * v + src))
+    for vertices, distances, parents in ((np.arange(v), distance, parent),
+                                         (vs, ds, ps)):
+        child = distances > 0
+        assert (parents[~child] == -1).all()
+        p, c = parents[child].astype(np.int64), vertices[child].astype(np.int64)
+        assert ((p >= 0) & (p < v)).all()
+        np.testing.assert_array_equal(expected[p], distances[child] - 1)
+        assert np.isin(p * v + c, edges).all()
+
+
+@pytest.mark.parametrize("frontier_size", [262144, 262145])
+@pytest.mark.parametrize("threads", ["4", "default"])
+def test_cpu_bfs_parallel_prefix_all_zero(frontier_size, threads, monkeypatch):
+    """Every block total is zero; a large isolated-source level still runs
+    exactly once and leaves disconnected nonsources untouched."""
+    v = frontier_size + 7
+    empty = np.asarray([], np.uint32)
+    g = mg.Graph.from_edges(empty, empty, directed=True, num_vertices=v)
+    sources = np.random.default_rng(89).permutation(v)[:frontier_size].astype(np.uint32)
+    sources = np.concatenate((sources, sources[:3]))
+    expected = np.full(v, -1, np.int32)
+    expected[sources] = 0
+    if threads == "default":
+        monkeypatch.delenv("MG_THREADS", raising=False)
+    else:
+        monkeypatch.setenv("MG_THREADS", threads)
+    monkeypatch.setenv("MG_BFS_SPARSE_MAX_VERTICES", "0")
+    mg.set_execution("cpu")
+    try:
+        distance, parent = mg.bfs(g, sources, direction="both")
+        assert mg.last_run_info()["iterations"] == 1
+        vs, ds, ps = mg.bfs(g, sources, direction="both", output="sparse")
+        assert mg.last_run_info()["iterations"] == 1
+    finally:
+        mg.set_execution("auto")
+    np.testing.assert_array_equal(distance, expected)
+    assert (parent == -1).all()
+    np.testing.assert_array_equal(vs, np.flatnonzero(expected >= 0))
+    np.testing.assert_array_equal(ds, np.zeros(frontier_size, np.int32))
+    assert (ps == -1).all()

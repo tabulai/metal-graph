@@ -27,8 +27,8 @@ inline uint32_t bit_test(const uint32_t* bm, uint32_t i) {  // 0 or 1
 inline void bit_set(uint32_t* bm, uint32_t i) { bm[i >> 5] |= 1u << (i & 31u); }
 
 // Parallel granularity, in units of ~one bitmap word scanned (an emitted id
-// counts as 4): a chunk below this runs inline, since spawning a thread
-// costs more than scanning a few hundred KB.
+// counts as 4): a chunk below this runs inline, since handing it to another
+// thread costs more than scanning a few hundred KB.
 constexpr uint64_t k_par_grain = 1u << 17;
 // Popcount block for enumeration (prefix granularity).
 constexpr std::size_t k_block_words = 2048;
@@ -36,8 +36,8 @@ constexpr std::size_t k_block_words = 2048;
 constexpr uint64_t k_mark_grain_edges = 65536;
 // Full edge-list scan vs a serial walk of the reached CSR rows: the walk
 // costs ~deg_sum = sum(out_deg(reached)); the scan streams every stored edge
-// across up to num_threads() chunks (memory-bound, so little gain past 8
-// threads) after a fixed thread start-up. Scan when
+// on up to num_threads() threads (memory-bound, so little gain past 8
+// threads) after a fixed parallel start-up. Scan when
 //   deg_sum >= k_fullscan_fixed + stored * (0.05 + 0.2 / min(threads, 8)),
 // fitted on 1/4/8/16 threads (rmat16-rmat20, rmat18u, kg).
 constexpr double k_fullscan_fixed = 65536.0;
@@ -132,12 +132,12 @@ void mark_full_scan(Graph& g, const uint32_t* rbm, uint32_t* ebm) {
   const uint32_t* oid = g.edges_orig_id().data();
   const std::size_t chunks = std::max<std::size_t>(
       1, std::min<std::size_t>(
-             num_threads(),
+             k_par_balance * num_threads(),
              static_cast<std::size_t>((E + k_mark_grain_edges - 1) /
                                       k_mark_grain_edges)));
   const std::size_t per = (words + chunks - 1) / chunks;  // words per chunk
   const bool directed = g.directed;
-  parallel_for(
+  parallel_for_balanced(  // each word range claimed on its own
       chunks,
       [&](std::size_t b, std::size_t e) {
         for (std::size_t c = b; c < e; ++c) {

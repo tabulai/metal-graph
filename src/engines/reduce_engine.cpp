@@ -7,6 +7,7 @@ namespace mg {
 ReduceEngine::ReduceEngine(Runtime& rt, bool batched) {
   if (!batched) {
     dangling_ = rt.pipeline("mg_pr_dangling_partials");
+    sum_ = rt.pipeline("mg_sum_partials");
     finalize_ = rt.pipeline("mg_reduce_finalize");
   } else {
     dangling_b_ = rt.pipeline("mg_pr_dangling_partials_b");
@@ -24,6 +25,21 @@ void ReduceEngine::encode_list_sum(CommandBatch& cb, MGPrParams base,
   const uint32_t blocks = n_blocks(list_count);
   cb.dispatch(dangling_, &p, sizeof(p), {list, values, partials}, blocks,
               MG_TG_SIZE);
+  MGReduceParams rp{};
+  rp.n_partials = blocks;
+  rp.dst_index = dst_index;
+  cb.dispatch(finalize_, &rp, sizeof(rp), {partials, dst}, 1, MG_TG_SIZE);
+}
+
+void ReduceEngine::encode_sum(CommandBatch& cb, MGPrParams base,
+                              uint32_t count, Buffer* values,
+                              Buffer* partials, Buffer* dst,
+                              uint32_t dst_index) {
+  if (count == 0) return;
+  MGPrParams p = base;
+  p.count = count;
+  const uint32_t blocks = n_blocks(count);
+  cb.dispatch(sum_, &p, sizeof(p), {values, partials}, blocks, MG_TG_SIZE);
   MGReduceParams rp{};
   rp.n_partials = blocks;
   rp.dst_index = dst_index;

@@ -5,17 +5,18 @@
 // every stored OUT edge (matches the GPU link-both-endpoints semantics).
 //
 //  * wcc_serial: the sequential oracle (path halving + union by smaller
-//    root id). Used when MG_THREADS=1, when the graph is small (stored
-//    edges < MG_WCC_CPU_PAR_MIN_EDGES; thread start-up would dominate), or
-//    if worker threads cannot be started.
-//  * wcc_parallel: lock-free union-find over one set of worker threads with
-//    phase barriers. link() CASes the LARGER root's parent slot from itself
+//    root id). Used when MG_THREADS=1 or when the graph is small (stored
+//    edges < MG_WCC_CPU_PAR_MIN_EDGES; the threaded phases would cost more
+//    than they save).
+//  * wcc_parallel: lock-free union-find run as a sequence of parallel
+//    phases over fixed pieces (the end of each dispatch is the phase
+//    barrier). link() CASes the LARGER root's parent slot from itself
 //    to the smaller root, so every parent pointer is strictly smaller than
 //    its owner and each tree's root is its component minimum under any
 //    interleaving; path-halving stores only ever write an ancestor into a
 //    non-root slot (never a CAS target), so trees never split. The final
-//    labeling pass walks read-only and stores only each thread's own
-//    vertices (path halving there could clobber another thread's stored
+//    labeling pass walks read-only and stores only each piece's own
+//    vertices (path halving there could clobber another piece's stored
 //    root with a stale ancestor). Edges are
 //    split evenly by count (canonical order is degree-descending, so equal
 //    vertex ranges would be badly imbalanced).
@@ -32,7 +33,6 @@
 #include <atomic>
 #include <cstdint>
 #include <numeric>
-#include <thread>
 #include <vector>
 
 #include "../algos.hpp"
@@ -113,28 +113,6 @@ inline void uf_link(uint32_t* parent, uint32_t a, uint32_t b) {
   }
 }
 
-// Sense-free generation barrier for a fixed set of spinning threads.
-class SpinBarrier {
- public:
-  void set_count(unsigned n) { n_ = n; }
-  void wait() {
-    const unsigned g = gen_.load(std::memory_order_acquire);
-    if (count_.fetch_add(1, std::memory_order_acq_rel) + 1 == n_) {
-      count_.store(0, std::memory_order_relaxed);
-      gen_.store(g + 1, std::memory_order_release);
-      return;
-    }
-    unsigned spins = 0;
-    while (gen_.load(std::memory_order_acquire) == g)
-      if (++spins > 256) std::this_thread::yield();
-  }
-
- private:
-  unsigned n_ = 1;
-  std::atomic<unsigned> count_{0};
-  std::atomic<unsigned> gen_{0};
-};
-
 constexpr uint32_t kAfforestK = 2;         // edges per vertex linked first
 constexpr int kAfforestSamples = 1024;     // root samples for the giant comp
 
@@ -192,68 +170,51 @@ uint32_t sample_giant_root(uint32_t* parent, uint32_t V) {
   return best_root;
 }
 
-// Returns the number of components, or -1 if worker threads could not be
-// started (caller falls back to the serial path).
+// Returns the number of components. Each phase is one parallel_items over
+// P fixed pieces (vertex or edge ranges), so the end of a dispatch is the
+// phase barrier: no piece ever waits for another, whichever threads run
+// them.
 int wcc_parallel(uint32_t V, const uint32_t* row, const uint32_t* col,
-                 bool afforest, unsigned T, uint32_t* parent) {
+                 bool afforest, unsigned P, uint32_t* parent) {
   const uint64_t E = row[V];
-  SpinBarrier barrier;
-  std::atomic<int> go{0};  // 0 wait, 1 run, -1 abort
-  std::vector<uint32_t> n_roots(T, 0);
-  uint32_t giant = UINT32_MAX;
-
-  auto vrange = [&](unsigned t, uint32_t& b, uint32_t& e) {
-    b = static_cast<uint32_t>(uint64_t(V) * t / T);
-    e = static_cast<uint32_t>(uint64_t(V) * (t + 1) / T);
+  auto vbegin = [&](std::size_t t) {
+    return static_cast<uint32_t>(uint64_t(V) * t / P);
   };
-  auto worker = [&](unsigned t) {
-    int state;
-    while ((state = go.load(std::memory_order_acquire)) == 0)
-      std::this_thread::yield();
-    if (state < 0) return;
-    uint32_t vb, ve;
-    vrange(t, vb, ve);
-    for (uint32_t v = vb; v < ve; ++v)
+  auto phase = [&](const std::function<void(std::size_t)>& piece) {
+    parallel_items(P, piece);
+  };
+
+  phase([&](std::size_t t) {
+    for (uint32_t v = vbegin(t); v < vbegin(t + 1); ++v)
       ARef(parent[v]).store(v, std::memory_order_relaxed);
-    barrier.wait();
-    if (afforest) {
-      for (uint32_t v = vb; v < ve; ++v) {
+  });
+  uint32_t giant = UINT32_MAX;
+  if (afforest) {
+    phase([&](std::size_t t) {
+      for (uint32_t v = vbegin(t); v < vbegin(t + 1); ++v) {
         const uint32_t end = std::min(row[v] + kAfforestK, row[v + 1]);
         for (uint32_t k = row[v]; k < end; ++k) uf_link(parent, v, col[k]);
       }
-      barrier.wait();
-      if (t == 0) giant = sample_giant_root(parent, V);
-      barrier.wait();
-    }
-    link_edge_range(parent, row, col, V, E * t / T, E * (t + 1) / T,
-                    afforest ? giant : UINT32_MAX);
-    barrier.wait();
-    // Final labeling: the forest is frozen, but other threads are storing
-    // their own vertices' roots. uf_find's path halving would write a
-    // (now stale) grandparent into slots owned by other threads and could
-    // overwrite a root stored there, so walk read-only and store only v.
+    });
+    giant = sample_giant_root(parent, V);
+  }
+  phase([&](std::size_t t) {
+    link_edge_range(parent, row, col, V, E * t / P, E * (t + 1) / P, giant);
+  });
+  // Final labeling: the forest is frozen, but other pieces are storing
+  // their own vertices' roots. uf_find's path halving would write a (now
+  // stale) grandparent into slots owned by other pieces and could
+  // overwrite a root stored there, so walk read-only and store only v.
+  std::vector<uint32_t> n_roots(P, 0);
+  phase([&](std::size_t t) {
     uint32_t roots = 0;
-    for (uint32_t v = vb; v < ve; ++v) {
+    for (uint32_t v = vbegin(t); v < vbegin(t + 1); ++v) {
       const uint32_t r = uf_root(parent, v);
       roots += (r == v);
       ARef(parent[v]).store(r, std::memory_order_relaxed);
     }
     n_roots[t] = roots;
-  };
-
-  std::vector<std::thread> threads;
-  threads.reserve(T - 1);
-  try {
-    for (unsigned t = 1; t < T; ++t) threads.emplace_back(worker, t);
-  } catch (...) {
-    go.store(-1, std::memory_order_release);
-    for (auto& th : threads) th.join();
-    return -1;
-  }
-  barrier.set_count(T);
-  go.store(1, std::memory_order_release);
-  worker(0);
-  for (auto& th : threads) th.join();
+  });
   uint64_t total = 0;
   for (uint32_t r : n_roots) total += r;
   return static_cast<int>(total);
@@ -270,16 +231,17 @@ int wcc(Graph& g, uint32_t* labels_canon) {
   const uint64_t E = row[V];
 
   const unsigned nt = num_threads();
-  // Below ~128K edges the serial pass beats thread start-up (~12 us per
-  // thread); above it, ~64K edges per thread (at least 4 threads).
-  const long min_edges = env_long("MG_WCC_CPU_PAR_MIN_EDGES", 131072);
+  // Below ~64K edges the serial pass beats the threaded phases. Above it,
+  // pieces of ~8K+ edges, one to four per thread: pieces are claimed
+  // dynamically, so performance cores take more of them.
+  const long min_edges = env_long("MG_WCC_CPU_PAR_MIN_EDGES", 65536);
   if (nt > 1 && E > 0 && E >= static_cast<uint64_t>(std::max(0L, min_edges))) {
-    const uint64_t want = std::max<uint64_t>(4, E >> 16);
-    const unsigned T = static_cast<unsigned>(
-        std::min<uint64_t>(std::min<uint64_t>(nt, want), V));
+    const uint64_t pieces =
+        std::min<uint64_t>(uint64_t(4) * nt, std::max<uint64_t>(nt, E >> 13));
     // labels_canon doubles as the parent array; it ends fully compressed.
-    const int n = wcc_parallel(V, row, col, !g.directed, T, labels_canon);
-    if (n >= 0) return n;
+    return wcc_parallel(V, row, col, !g.directed,
+                        static_cast<unsigned>(std::min<uint64_t>(pieces, V)),
+                        labels_canon);
   }
   return wcc_serial(V, row, col, labels_canon);
 }

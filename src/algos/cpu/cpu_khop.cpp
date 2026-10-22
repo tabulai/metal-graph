@@ -52,8 +52,8 @@ std::vector<uint32_t> khop_vertices(Graph& g, const uint32_t* seeds_canon,
   // seen[v] != 0 once claimed as seed or level candidate. A claimed-but-not-
   // admitted vertex exists only when the cap binds, and the cap binding
   // terminates discovery, so a single marker is enough. Value-initialized
-  // (zeroed) at allocation: a threaded clear would spawn threads for every
-  // query, which dominates small k-hop neighborhoods.
+  // (zeroed) at allocation: a threaded clear would cost a parallel dispatch
+  // for every query, which dominates small k-hop neighborhoods.
   std::unique_ptr<std::atomic<uint8_t>[]> seen(new std::atomic<uint8_t>[V]());
 
   const bool capped = max_vertices > 0;
@@ -105,13 +105,18 @@ std::vector<uint32_t> khop_vertices(Graph& g, const uint32_t* seeds_canon,
     }
     const uint64_t total = pre[F];
     // Below this many frontier edges: one inline slice. Each extra slice
-    // costs a thread spawn, which outweighs splitting 8k-65k-edge levels.
+    // costs a hand-off to another thread, which outweighs splitting
+    // 8k-65k-edge levels (smaller slices measured no faster on the pool).
     constexpr uint64_t kSliceEdges = 65536;
+    // Several slices per thread, each its own balanced chunk: slices into
+    // seen targets or on efficiency cores finish later, and faster threads
+    // take more slices.
     std::size_t chunks = static_cast<std::size_t>(std::min<uint64_t>(
-        num_threads(), (total + kSliceEdges - 1) / kSliceEdges));
+        k_par_balance * num_threads(),
+        (total + kSliceEdges - 1) / kSliceEdges));
     if (chunks == 0) chunks = 1;
     const uint64_t per = (total + chunks - 1) / chunks;
-    parallel_for(
+    parallel_for_balanced(
         chunks,
         [&](std::size_t cb, std::size_t ce) {
           std::vector<uint32_t> local;

@@ -64,34 +64,98 @@ inline unsigned num_threads() {
   return hc ? hc : 4;
 }
 
-// Chunked parallel for over [0, n): fn(begin, end) per chunk.
-// Runs inline when n is small or one thread is available.
-inline void parallel_for(std::size_t n,
-                         const std::function<void(std::size_t, std::size_t)>& fn,
-                         std::size_t grain = 4096) {
-  unsigned nt = num_threads();
-  if (n == 0) return;
-  if (nt <= 1 || n <= grain) {
+// Work units (one O(1) item, or one CSR edge) each parallel_for chunk must
+// carry before handing it to another thread pays off. The old fixed
+// 4096-item grain spawned fresh threads for any loop over 4096 items, so
+// small graphs ran slower with all threads than with MG_THREADS=1.
+constexpr std::size_t k_par_work_grain = std::size_t{1} << 15;
+
+// Chunks per thread for loops whose chunks vary in cost (degree-skewed
+// rows, targets already visited, efficiency cores): the chunks are claimed
+// one at a time, so faster threads take more of them. M4 Max CPU BFS on
+// rmat18-22: 8 per thread cut time 6-30% against 1; 16 was no better.
+constexpr std::size_t k_par_balance = 8;
+
+// Chunks parallel_for splits n items into: at most per_thread *
+// num_threads(), each of at least `grain` items. 1 means the loop runs
+// inline on the caller.
+inline std::size_t parallel_chunks(std::size_t n,
+                                   std::size_t grain = k_par_work_grain,
+                                   std::size_t per_thread = 1) {
+  const std::size_t chunks = std::min<std::size_t>(
+      per_thread * num_threads(), n / std::max<std::size_t>(grain, 1));
+  return std::max<std::size_t>(chunks, 1);
+}
+
+// parallel_for grain for n items doing `work` units in total (rows plus
+// their edges, say), so each chunk carries ~k_par_work_grain units.
+inline std::size_t work_grain(std::size_t n, uint64_t work) {
+  if (work <= k_par_work_grain) return std::max<std::size_t>(n, 1);  // inline
+  const uint64_t g = uint64_t(n) * k_par_work_grain / work;
+  return static_cast<std::size_t>(std::max<uint64_t>(g, 1));
+}
+
+namespace detail {
+using TaskFn = void (*)(const void* ctx, std::size_t i);
+// Calls task(ctx, i) once for every i in [0, n): the calling thread and up
+// to `helpers` other threads claim indices from a shared counter, so which
+// thread runs an index is unspecified. Helpers are persistent pool workers
+// (mg_pool.cpp). A call from inside a task runs inline; a call the pool
+// cannot take (another thread mid-dispatch, or a forked child) runs on
+// freshly started threads. The first exception a task throws stops further
+// claims and is rethrown here once every helper has finished.
+void run_tasks(std::size_t n, std::size_t helpers, TaskFn task,
+               const void* ctx);
+
+// fn(begin, end) over `chunks` equal chunks of [0, n), claimed by the caller
+// and pool workers; inline for one chunk.
+inline void run_chunks(std::size_t n, std::size_t chunks,
+                       const std::function<void(std::size_t, std::size_t)>& fn) {
+  if (chunks <= 1) {
     fn(0, n);
     return;
   }
-  std::size_t chunks = std::min<std::size_t>(nt, (n + grain - 1) / grain);
-  std::size_t per = (n + chunks - 1) / chunks;
-  std::vector<std::thread> ts;
-  ts.reserve(chunks);
-  for (std::size_t c = 0; c < chunks; ++c) {
-    std::size_t b = c * per, e = std::min(n, b + per);
-    if (b >= e) break;
-    ts.emplace_back([&fn, b, e] { fn(b, e); });
-  }
-  for (auto& t : ts) t.join();
+  struct Ctx {
+    const std::function<void(std::size_t, std::size_t)>* fn;
+    std::size_t n, per;
+  } ctx{&fn, n, (n + chunks - 1) / chunks};
+  run_tasks(
+      chunks, std::min<std::size_t>(chunks, num_threads()) - 1,
+      [](const void* p, std::size_t c) {
+        const Ctx& x = *static_cast<const Ctx*>(p);
+        const std::size_t b = c * x.per;
+        if (b < x.n) (*x.fn)(b, std::min(x.n, b + x.per));
+      },
+      &ctx);
+}
+}  // namespace detail
+
+// Chunked parallel for over [0, n): fn(begin, end) per chunk, chunks claimed
+// by the caller and pool workers. `grain` is the minimum items per chunk;
+// the default suits O(1) items, and loops with heavier items pass
+// work_grain(). Runs inline when there is under two chunks' work or one
+// thread is available.
+inline void parallel_for(std::size_t n,
+                         const std::function<void(std::size_t, std::size_t)>& fn,
+                         std::size_t grain = k_par_work_grain) {
+  if (n == 0) return;
+  detail::run_chunks(n, parallel_chunks(n, grain), fn);
+}
+
+// parallel_for split into up to k_par_balance chunks per thread, for loops
+// whose chunks vary in cost.
+inline void parallel_for_balanced(
+    std::size_t n, const std::function<void(std::size_t, std::size_t)>& fn,
+    std::size_t grain = k_par_work_grain) {
+  if (n == 0) return;
+  detail::run_chunks(n, parallel_chunks(n, grain, k_par_balance), fn);
 }
 
 // Dynamically scheduled loop over items [0, n): fn(i) per item. The caller
-// and up to num_threads()-1 spawned threads claim items one at a time from
-// a shared counter, so faster (performance) cores take more items. fn must
-// not throw, and results must not depend on which thread runs an item.
-// Runs inline when n <= 1 or one thread is available.
+// and up to num_threads()-1 pool workers claim items one at a time from a
+// shared counter, so faster (performance) cores take more items. Results
+// must not depend on which thread runs an item. Runs inline when n <= 1 or
+// one thread is available.
 inline void parallel_items(std::size_t n,
                            const std::function<void(std::size_t)>& fn) {
   const unsigned nt = num_threads();
@@ -99,20 +163,12 @@ inline void parallel_items(std::size_t n,
     for (std::size_t i = 0; i < n; ++i) fn(i);
     return;
   }
-  const std::size_t workers = std::min<std::size_t>(nt, n);
-  std::atomic<std::size_t> next{0};
-  auto body = [&fn, &next, n] {
-    for (;;) {
-      const std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
-      if (i >= n) break;
-      fn(i);
-    }
-  };
-  std::vector<std::thread> ts;
-  ts.reserve(workers - 1);
-  for (std::size_t w = 1; w < workers; ++w) ts.emplace_back(body);
-  body();
-  for (auto& t : ts) t.join();
+  detail::run_tasks(
+      n, std::min<std::size_t>(nt, n) - 1,
+      [](const void* p, std::size_t i) {
+        (*static_cast<const std::function<void(std::size_t)>*>(p))(i);
+      },
+      &fn);
 }
 
 inline uint32_t ceil_div_u32(uint64_t a, uint64_t b) {

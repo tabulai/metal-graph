@@ -35,9 +35,10 @@ def _pack(queries):
     return seeds, w, offs
 
 
-def _run(g, queries, k):
+def _run(g, queries, k, options=None):
     seeds, w, offs = _pack(queries)
-    ids, scores = mg.ppr_topk(g, seeds, w, offs, k=k, **PPR_KW)
+    ids, scores = mg.ppr_topk(g, seeds, w, offs, k=k,
+                             **(PPR_KW if options is None else options))
     info = mg.last_run_info()
     return (np.asarray(ids).reshape(len(queries), k).copy(),
             np.asarray(scores).reshape(len(queries), k).copy(), info)
@@ -123,6 +124,236 @@ def test_sparse_rows_alone_bit_identical(ppr_env, directed, weighted):
         np.testing.assert_array_equal(ids1, ids0)
         assert sc1.tobytes() == sc0.tobytes()
         assert info1["iterations"] == info0["iterations"]
+
+
+def _shifted_huge_rows(unreachable_edges, extra_hubs=0):
+    """Seed 2 reaches {0, 1, 2} over 8,004 edges. Unreachable source 3
+    shifts tiny terms across target 1's global IN-row tile boundaries.
+    Serial fp64 sums would tie 0 and 1 exactly; the dense gather's fixed
+    tiles favor 1 even though the returned float32 scores are identical."""
+    n = 4000
+    src = np.concatenate(([2], np.repeat(3, unreachable_edges),
+                          np.repeat(2, n), [2], np.repeat(2, n), [0, 1]))
+    dst = np.concatenate(([1], np.repeat(1, unreachable_edges),
+                          np.repeat(1, n), [0], np.repeat(0, n), [0, 1]))
+    w = np.concatenate(([1.], np.ones(unreachable_edges),
+                        np.full(n, 2.**-55), [1.],
+                        np.full(n, 2.**-55), [1., 1.]))
+    if extra_hubs:
+        # Enough plan items to exercise dense PPR's threaded gather.
+        hubs = np.repeat(np.arange(4, 4 + extra_hubs), 16384)
+        src = np.concatenate((src, hubs))
+        dst = np.concatenate((dst, hubs))
+        w = np.concatenate((w, np.ones(hubs.size)))
+    return mg.Graph.from_edges(src.astype(np.uint32), dst.astype(np.uint32),
+                                weights=w.astype(np.float32), directed=True,
+                                num_vertices=4 + extra_hubs)
+
+
+@pytest.mark.parametrize("unreachable_edges", [16382, 16383, 32767])
+@pytest.mark.parametrize("options", [{}, dict(max_iter=1)])
+def test_huge_row_near_tie_matches_dense_tiles(
+        ppr_env, unreachable_edges, options):
+    """Default convergence and one iteration must keep the dense path's
+    fp64 order before top-k selection, including k=1, different tile
+    boundaries, thread counts, and the latency path on or off."""
+    mg.set_execution("cpu")
+    g = _shifted_huge_rows(unreachable_edges, extra_hubs=8)
+    expected = {}
+    for threads in (1, 4):
+        ppr_env.setenv("MG_THREADS", str(threads))
+        for cap in (0, 8192):
+            _set_caps(ppr_env, 1024, cap)
+            for k in (1, 4):
+                ids, scores, info = _run(g, [([2], [1.])], k,
+                                         options=options)
+                # Target 1's row is tiled (a serial sum would tie, pick 0).
+                assert ids[0, 0] == 1
+                if k == 4:
+                    np.testing.assert_array_equal(ids[0], [1, 0, 2, 3])
+                    assert scores[0, 0] == scores[0, 1]
+                result = (ids.tobytes(), scores.tobytes(), info["iterations"])
+                assert expected.setdefault(k, result) == result
+
+
+def test_huge_rows_in_mixed_sparse_dense_batch(ppr_env):
+    """The near-tie sparse row and two overflowing rows must match both
+    dense-only batches and individual calls, independently of workers."""
+    mg.set_execution("cpu")
+    g = _shifted_huge_rows(16383, extra_hubs=8)
+    qs = [([2], [1.]), ([3], [1.]), ([4], [1.])]
+    baseline = None
+    for threads in (1, 4):
+        ppr_env.setenv("MG_THREADS", str(threads))
+        for cap in (0, 8192):
+            _set_caps(ppr_env, 1024, cap)
+            ids, scores, info = _run(g, qs, 4)
+            result = (ids.tobytes(), scores.tobytes(), info["iterations"])
+            if baseline is None:
+                baseline = result
+            assert result == baseline
+            iterations = []
+            for row, query in enumerate(qs):
+                ids_q, scores_q, info_q = _run(g, [query], 4)
+                np.testing.assert_array_equal(ids_q[0], ids[row])
+                assert scores_q[0].tobytes() == scores[row].tobytes()
+                iterations.append(info_q["iterations"])
+            assert info["iterations"] == max(iterations)
+
+
+@pytest.mark.parametrize("directed,weighted", GRAPHS)
+def test_huge_reachable_rows_with_raised_caps(ppr_env, directed, weighted):
+    """With raised caps the sparse row can itself exceed a tile. Cover
+    both orientations, zero weights, duplicate edges, and padded top-k."""
+    n = 17000
+    src = np.concatenate((np.full(n, 2), np.full(n, 3), [0, 1]))
+    dst = np.concatenate((np.zeros(n), np.ones(n), [2, 3]))
+    w = None
+    if weighted:
+        w = np.ones(src.size, np.float32)
+        w[1:n] = 2.**-55
+        w[n + 1:2 * n] = 2.**-55
+        w[::19] = 0.0
+    g = mg.Graph.from_edges(src.astype(np.uint32), dst.astype(np.uint32),
+                            weights=w, directed=directed, num_vertices=5)
+    mg.set_execution("cpu")
+    baseline = None
+    for threads in (1, 4):
+        ppr_env.setenv("MG_THREADS", str(threads))
+        for cap in (0, 100000):
+            _set_caps(ppr_env, 1024, cap)
+            ids, scores, info = _run(g, [([2, 3], [1., 1.])], 8)
+            result = (ids.tobytes(), scores.tobytes(), info["iterations"])
+            if baseline is None:
+                baseline = result
+            assert result == baseline
+
+
+# MG_HUGE_TILE_EDGES == MG_BIN_HUGE_MIN (src/kernels/mg_params.h): rows with
+# at least this many stored in-edges are gathered in tiles of this size.
+TILE = 16384
+
+
+def _interleaved_huge_rows(directed, weighted, seed, m=1500):
+    """Seed 0 has m out-edges to each target 1..4 with one shared weight
+    sequence, so serial fp64 row sums tie exactly. Source 5 (unreachable
+    from 0 when directed) adds 0, TILE // 2 + 1 or several tiles of edges
+    into a target, interleaved at random with the reachable ones, so each
+    target's global tile boundaries cut its reachable edges differently."""
+    rng = np.random.default_rng(seed)
+    src, dst, w = [], [], []
+    w_reach = rng.uniform(0.5, 2.0, m)
+    pick = rng.random(m)
+    w_reach[pick < 0.15] = 2.0 ** -rng.integers(40, 56, (pick < 0.15).sum())
+    w_reach[(pick >= 0.15) & (pick < 0.22)] = 0.0
+    w_reach[(pick >= 0.22) & (pick < 0.25)] = -0.0  # valid: -0.0 >= 0
+    for t, extra in enumerate([0, TILE // 2 + 1,
+                               int(rng.integers(TILE, 2 * TILE)),
+                               int(rng.integers(2 * TILE, 3 * TILE))]):
+        reach = np.zeros(m + extra, bool)
+        reach[rng.choice(m + extra, m, replace=False)] = True
+        src.append(np.where(reach, 0, 5))
+        dst.append(np.full(m + extra, t + 1))
+        wt = rng.uniform(0.1, 3.0, m + extra)
+        wt[reach] = w_reach
+        w.append(wt)
+    src = np.concatenate(src).astype(np.uint32)
+    dst = np.concatenate(dst).astype(np.uint32)
+    w = np.concatenate(w).astype(np.float32) if weighted else None
+    g = mg.Graph.from_edges(src, dst, weights=w, directed=directed,
+                            num_vertices=7)  # + isolated vertex 6
+    return g, src, dst, w
+
+
+def _tiled_first_iteration(src, dst, w, directed, v, alpha=0.85):
+    """fp64 scores after one PPR iteration from seed 0: the dense CPU
+    gather's documented arithmetic. Stored IN row of x = edges into x in
+    input order (undirected: every edge at x); rows of >= TILE edges sum
+    each TILE-edge tile serially, then the partials in order; products are
+    rounded before they are added. Only seed 0 has nonzero mass."""
+    n = src.size
+    key, other, eid = dst, src, np.arange(n)
+    if not directed:
+        loop = src == dst
+        key = np.concatenate((dst, src[~loop]))
+        other = np.concatenate((src, dst[~loop]))
+        eid = np.concatenate((eid, eid[~loop]))
+    order = np.lexsort((eid, key))  # row, then stored (= input) order
+    key, other, eid = key[order], other[order], eid[order]
+    first = np.searchsorted(key, np.arange(v))
+    deg = np.bincount(key, minlength=v)
+    pos = np.arange(key.size) - first[key]
+    # ows[0]: float32 sum over the seed's OUT row (stored order).
+    out0 = eid[key == 0] if not directed else np.flatnonzero(src == 0)
+    ows = np.float32(0.0)
+    for e in out0:
+        ows = np.float32(ows + (w[e] if w is not None else np.float32(1)))
+    c = 1.0 / float(ows)
+    parts = {}
+    for i in np.flatnonzero(other == 0):
+        x = int(key[i])
+        tile = int(pos[i]) // TILE if deg[x] >= TILE else 0
+        term = c * float(w[eid[i]]) if w is not None else c
+        parts[(x, tile)] = parts.get((x, tile), 0.0) + term
+    acc = [0.0] * v
+    for (x, _), p in sorted(parts.items()):
+        acc[x] += p
+    r = [alpha * a for a in acc]
+    r[0] += (1.0 - alpha) + alpha * 0.0  # seed teleport (no dangling mass)
+    return r
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3, 6])
+@pytest.mark.parametrize("directed,weighted", GRAPHS)
+def test_interleaved_huge_rows_match_tiled_sums(ppr_env, directed, weighted,
+                                                seed):
+    """One iteration, every vertex ranked: the dense path and the latency
+    path both reproduce the tiled fp64 sums exactly (near-ties ordered by
+    the exact fp64 value, float32 scores equal), for any thread count.
+    Weighted seeds 1 and 6 also fail if either path fuses multiply-adds."""
+    g, src, dst, w = _interleaved_huge_rows(directed, weighted, seed)
+    r = _tiled_first_iteration(src, dst, w, directed, 7)
+    want_ids = sorted(range(7), key=lambda x: (-r[x], x))
+    want_scores = np.array([r[x] for x in want_ids], np.float32)
+    mg.set_execution("cpu")
+    opts = dict(alpha=0.85, tol=1e-12, max_iter=1)
+    # Undirected: the seed reaches all of the high-degree vertices.
+    caps = (1024, 8192) if directed else (1024, 1 << 22)
+    for threads in (1, 4):
+        ppr_env.setenv("MG_THREADS", str(threads))
+        for vertices, edges in ((0, 0), caps):
+            _set_caps(ppr_env, vertices, edges)
+            ids, scores, info = _run(g, [([0], [1.])], 7, options=opts)
+            assert info["iterations"] == 1
+            np.testing.assert_array_equal(ids[0], want_ids)
+            assert scores[0].tobytes() == want_scores.tobytes()
+
+
+@pytest.mark.parametrize("seed", [1, 2])
+@pytest.mark.parametrize("directed,weighted", GRAPHS)
+def test_interleaved_huge_rows_sparse_matches_dense(ppr_env, directed,
+                                                    weighted, seed):
+    """Converged queries over huge tiled rows: latency path on or off,
+    batched or one at a time, 1 or 4 threads, all bit-identical. Directed
+    batches mix latency rows (seed 0, targets) with a dense one (source 5)."""
+    g, *_ = _interleaved_huge_rows(directed, weighted, seed)
+    qs = [([0], [1.]), ([5], [1.]), ([0, 3], [0.25, 1.]), ([4], [1.])]
+    caps = (1024, 8192) if directed else (1024, 1 << 22)
+    mg.set_execution("cpu")
+    baseline = None
+    for threads in (1, 4):
+        ppr_env.setenv("MG_THREADS", str(threads))
+        for vertices, edges in ((0, 0), caps):
+            _set_caps(ppr_env, vertices, edges)
+            ids, scores, info = _run(g, qs, 7)
+            result = (ids.tobytes(), scores.tobytes(), info["iterations"])
+            if baseline is None:
+                baseline = result
+            assert result == baseline
+            for row, query in enumerate(qs):
+                ids_q, scores_q, _ = _run(g, [query], 7)
+                np.testing.assert_array_equal(ids_q[0], ids[row])
+                assert scores_q[0].tobytes() == scores[row].tobytes()
 
 
 @pytest.mark.gpu

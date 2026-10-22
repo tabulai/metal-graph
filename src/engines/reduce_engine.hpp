@@ -33,6 +33,12 @@ class ReduceEngine {
                        Buffer* list, Buffer* values, Buffer* partials,
                        Buffer* dst, uint32_t dst_index);
 
+  // dst[dst_index] = sum of values[0..count): encode_list_sum over the
+  // identity list (bit-identical), without materializing one.
+  void encode_sum(CommandBatch& cb, MGPrParams base, uint32_t count,
+                  Buffer* values, Buffer* partials, Buffer* dst,
+                  uint32_t dst_index);
+
   // Per-lane variant: dst[lane] = sum over the list of
   // values_b[list[i] * MG_PPR_TILE + lane], for every lane.
   void encode_list_sum_b(CommandBatch& cb, MGPprParams base,
@@ -41,6 +47,7 @@ class ReduceEngine {
 
  private:
   MTL::ComputePipelineState* dangling_ = nullptr;
+  MTL::ComputePipelineState* sum_ = nullptr;
   MTL::ComputePipelineState* finalize_ = nullptr;
   MTL::ComputePipelineState* dangling_b_ = nullptr;
   MTL::ComputePipelineState* finalize_b_ = nullptr;

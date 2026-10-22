@@ -46,8 +46,8 @@ enum class ExecMode : int { autom = 0, gpu = 1, cpu = 2 };
 enum class ExecPath : int { gpu = 0, cpu = 1 };
 
 // Operation families with their own auto-planner GPU threshold (stored
-// edges). Defaults (Runtime::e_gpu_min): pagerank/hits 200'000 (the GPU
-// gather amortizes its fixed cost early), ppr/bfs/wcc/generic 1'000'000,
+// edges). Defaults (Runtime::e_gpu_min): 1'000'000 for numeric and traversal
+// operations, preserving the original CPU fp64 range for pagerank/hits;
 // khop never (CPU vertex discovery beats a GPU BFS at every measured size;
 // induced-edge extraction is a host pass on both paths). Env precedence:
 // MG_E_GPU_MIN_<OP> > MG_E_GPU_MIN (global override for every op) > per-op
@@ -95,6 +95,11 @@ class Runtime {
 
   // Shared-mode tracked buffer (zero-initialized: MG guarantees this).
   BufferPtr alloc(std::size_t bytes, const char* label);
+  // Same, but contents are UNSPECIFIED: for scratch that the host or the GPU
+  // fully writes before any read. Skipping the zero-fill skips its host
+  // first-touch page faults, the dominant cost of a fresh V-sized buffer.
+  // MG_DEBUG_POISON_SCRATCH=1 fills these buffers with 0xFF bytes instead.
+  BufferPtr alloc_scratch(std::size_t bytes, const char* label);
   // 16-byte dummy buffer for never-dereferenced bindings.
   BufferPtr dummy() const;
 
@@ -120,6 +125,7 @@ class Runtime {
 
  private:
   Runtime();
+  BufferPtr make_buffer(std::size_t bytes, const char* label, bool zero);
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

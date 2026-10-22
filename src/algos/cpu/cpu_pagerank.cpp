@@ -15,6 +15,11 @@
 #include "../boundary.hpp"
 #include "cpu_gather.hpp"
 
+// No fused multiply-adds in this file (see row_sum): cpu::ppr_topk_sparse
+// reproduces cpu::ppr's fp64 bits, which must not depend on whether the
+// compiler fuses a given `a * b + c`.
+#pragma clang fp contract(off)
+
 namespace mg::cpu {
 
 namespace {
@@ -324,6 +329,38 @@ int ppr_topk_sparse(Graph& g, const uint32_t* seeds_canon,
   for (const LEdge& x : le) ++in_row[x.dst + 1];
   for (uint32_t i = 0; i < n; ++i) in_row[i + 1] += in_row[i];
 
+  // Rows that cpu::ppr's gather plan tiles (global IN degree >=
+  // MG_BIN_HUGE_MIN) are summed like plan_gather: each GLOBAL tile's local
+  // in-edges serially, then the tile partials in tile order. The edges and
+  // tiles left out add exact zeros (r is +0.0 outside R; a -0.0 weight
+  // gives -0.0), and x + (+-0.0) == x for every x but -0.0, which a running
+  // sum started at +0.0 never is: dropping them changes no bit. Tiled local
+  // row tiled[h] sums the edge ranges [cuts[s], cuts[s + 1]) for s in
+  // [cut_off[h], cut_off[h + 1] - 1).
+  const CpuInTileKeys& tk = g.cpu_in_tile_keys();
+  if (!tk.ok) return -1;
+  std::vector<uint32_t> tiled, cut_off(1, 0), cuts;
+  if (!tk.huge.empty()) {
+    auto hit = tk.huge.begin();  // both lists ascend in canonical id
+    for (uint32_t v = 0; v < n; ++v) {
+      hit = std::lower_bound(hit, tk.huge.end(), reach[v]);
+      if (hit == tk.huge.end()) break;
+      if (*hit != reach[v] || in_row[v] == in_row[v + 1]) continue;
+      const std::size_t h = static_cast<std::size_t>(hit - tk.huge.begin());
+      const uint32_t* key = tk.first_orig.data() + tk.key_off[h];
+      const uint32_t* key_end = tk.first_orig.data() + tk.key_off[h + 1];
+      tiled.push_back(v);
+      cuts.push_back(in_row[v]);
+      for (uint32_t j = in_row[v]; j < in_row[v + 1]; ++j) {
+        const uint32_t* k = std::upper_bound(key, key_end, le[j].orig);
+        if (k != key && j != in_row[v]) cuts.push_back(j);  // next tile
+        key = k;
+      }
+      cuts.push_back(in_row[v + 1]);
+      cut_off.push_back(static_cast<uint32_t>(cuts.size()));
+    }
+  }
+
   std::vector<float> ows(n);
   std::vector<uint32_t> dang;  // local ids, ascending canonical
   for (uint32_t i = 0; i < n; ++i) {
@@ -347,6 +384,17 @@ int ppr_topk_sparse(Graph& g, const uint32_t* seeds_canon,
   const double thresh = static_cast<double>(V) * tol;
   std::vector<double> r(n, 0.0), r_prev(n, 0.0), contrib(n, 0.0);
   for (uint32_t i = 0; i < n_seeds; ++i) r[sl[i]] += sw[i];
+  // Serial fp64 sum over local edges [lo, hi), as row_sum.
+  auto local_sum = [&](uint32_t lo, uint32_t hi) {
+    double acc = 0.0;
+    if (wt) {
+      for (uint32_t j = lo; j < hi; ++j)
+        acc += contrib[le[j].src] * static_cast<double>(le[j].w);
+    } else {
+      for (uint32_t j = lo; j < hi; ++j) acc += contrib[le[j].src];
+    }
+    return acc;
+  };
   int done = 0;
   while (true) {
     const int batch =
@@ -358,14 +406,15 @@ int ppr_topk_sparse(Graph& g, const uint32_t* seeds_canon,
             ows[u] > 0.0f ? r[u] / static_cast<double>(ows[u]) : 0.0;
       double dmass = 0.0;
       for (uint32_t d : dang) dmass += r[d];
+      std::size_t h = 0;  // next tiled row
       for (uint32_t v = 0; v < n; ++v) {
         double acc = 0.0;
-        if (wt) {
-          for (uint32_t j = in_row[v]; j < in_row[v + 1]; ++j)
-            acc += contrib[le[j].src] * static_cast<double>(le[j].w);
+        if (h < tiled.size() && tiled[h] == v) {
+          for (uint32_t s = cut_off[h]; s + 1 < cut_off[h + 1]; ++s)
+            acc += local_sum(cuts[s], cuts[s + 1]);
+          ++h;
         } else {
-          for (uint32_t j = in_row[v]; j < in_row[v + 1]; ++j)
-            acc += contrib[le[j].src];
+          acc = local_sum(in_row[v], in_row[v + 1]);
         }
         r_prev[v] = alpha * acc;
       }

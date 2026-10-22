@@ -77,6 +77,20 @@ struct CpuGatherPlan {
   uint32_t n_slots = 0;
 };
 
+// The tiles of cpu_gather_plan(Dir::in)'s huge rows, keyed by ORIGINAL
+// input-edge id, for the bounded-reach PPR path: it sees in-edges only as
+// OUT-orientation edges (edge_orig), and needs each one's global tile to
+// sum like the dense gather. IN rows store their edges in ascending
+// original id (directed: input order; undirected: the OUT rows), so an
+// in-edge with id o of row huge[h] lies in tile
+// #{i in [key_off[h], key_off[h+1]) : first_orig[i] <= o}.
+struct CpuInTileKeys {
+  std::vector<uint32_t> huge;        // == cpu_gather_plan(Dir::in).huge
+  std::vector<uint32_t> key_off;     // range in first_orig per row (n_huge+1)
+  std::vector<uint32_t> first_orig;  // id of the first edge of tiles 1..
+  bool ok = true;  // false: stored edge list freed, keys unavailable
+};
+
 class Graph {
  public:
   // src/dst are USER indices in [0, V). weights nullable. Throws mg::Error
@@ -97,6 +111,10 @@ class Graph {
   // CPU gather plan of orientation(d), built lazily (O(V) scan) and cached;
   // undirected graphs share one plan for both directions.
   const CpuGatherPlan& cpu_gather_plan(Dir d);
+  // Tile keys of the IN plan's huge rows, built lazily and cached from the
+  // stored edge list (parallel O(E) degree count; no IN transpose) and
+  // kept in O(n_huge + n_tiles) memory.
+  const CpuInTileKeys& cpu_in_tile_keys();
 
   BufferPtr out_weight_sum;  // float, V (sum of outgoing weights, or
                              // out-degree as float when unweighted;
@@ -134,6 +152,8 @@ class Graph {
   std::once_flag in_once_;
   std::unique_ptr<CpuGatherPlan> cpu_plan_[2];  // indexed by Dir
   std::once_flag cpu_plan_once_[2];
+  std::unique_ptr<CpuInTileKeys> in_tile_keys_;
+  std::once_flag in_tile_keys_once_;
   // Original input edges in canonical ids (kept to build the transpose
   // lazily and deterministically): pairs (canon_src, canon_dst) in input
   // order, plus weights. For undirected graphs these hold the SYMMETRIZED
@@ -143,6 +163,7 @@ class Graph {
   std::vector<float> edges_w_;
   std::vector<uint32_t> edges_orig_id_;
   void build_in_orientation();
+  CpuInTileKeys make_cpu_in_tile_keys() const;
 };
 
 using GraphPtr = std::shared_ptr<Graph>;

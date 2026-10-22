@@ -75,7 +75,7 @@ markdown table. Result files use an explicit schema version and strict JSON.
 | `ppr_topk / python_boundary` | wall median minus `last_run_info()["ms"]` (engine time) |
 | `ppr_topk / topk_selection_estimate` | median(k=1024) − median(k=1): selection cost estimate |
 | `bfs / warm_single_source`, `warm_high_degree_source`, `warm_64_sources` | path/variant and levels attached; single-source rows also record source degree, reached vertices, scanned reachable edges, max distance, and frontier sizes; bounded sparse-path rows carry the ≤50 µs SLO assessment |
-| `wcc / warm` | executed `path` and passes attached (`rounds=1` on the GPU's single union-find link + compress pass) |
+| `wcc / warm` | executed `path` and passes attached (`rounds=1` on the GPU's single fixed sequence of union-find passes) |
 | `k_hop / warm_k2_capped` | capped extraction (agent-latency shape) |
 | `bfs / baseline_rustworkx` | identical-semantics dense `dist+parent` visitor |
 | `bfs / baseline_igraph` | identical-semantics dense `dist+parent` adapter |

@@ -273,6 +273,31 @@ kernel void mg_pr_zero_fill_b(
   }
 }
 
+// Tile init, step 1 (thread per vertex): zero every lane of rank_b.
+static_assert(MG_PPR_TILE == 8u, "a vertex's lanes are two float4s");
+kernel void mg_pr_tile_zero_b(
+    constant MGPprParams& p [[buffer(0)]],
+    device float4* rank4_b  [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid >= p.count) return;
+  rank4_b[2ul * gid] = float4(0.0f);
+  rank4_b[2ul * gid + 1ul] = float4(0.0f);
+}
+
+// Tile init, step 2 (thread per seed): rank_b[v*TILE+t] = w. Seeds are
+// pre-deduplicated per (v, lane) on host — single writer per slot.
+kernel void mg_pr_seed_init_b(
+    constant MGPprParams& p         [[buffer(0)]],
+    device const uint* seed_vertex  [[buffer(1)]],
+    device const uint* seed_lane    [[buffer(2)]],
+    device const float* seed_weight [[buffer(3)]],
+    device float* rank_b            [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid >= p.count) return;
+  rank_b[ulong(seed_vertex[gid]) * MG_PPR_TILE + seed_lane[gid]] =
+      seed_weight[gid];
+}
+
 // Seed scatter: rank_next_b[v*TILE+t] += (1-a)*w + a*D_t*w for active
 // lanes. Seeds pre-deduplicated per (v, lane) on host — no write conflicts.
 kernel void mg_pr_seed_scatter_b(

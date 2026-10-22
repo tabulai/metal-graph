@@ -92,6 +92,10 @@ int run_dense_canon(Graph& g, const std::vector<uint32_t>& src_canon,
 int run_dense_user(Graph& g, const std::vector<uint32_t>& src_canon,
                    BfsDir dir, ExecPath path, int32_t* out_dist,
                    int32_t* out_parent) {
+  if (path == ExecPath::cpu)
+    return cpu::bfs_user(g, src_canon.data(),
+                         static_cast<uint32_t>(src_canon.size()), dir,
+                         out_dist, out_parent);
   const uint32_t V = g.V;
   std::vector<int32_t> dist_c, parent_c;
   const int levels = run_dense_canon(g, src_canon, dir, path, dist_c, parent_c);
@@ -231,10 +235,10 @@ int bfs_sparse(Graph& g, const uint32_t* sources, uint32_t n_sources,
     constexpr std::size_t kChunk = 16384;  // user indices per chunk
     const std::size_t nchunks =
         (static_cast<std::size_t>(V) + kChunk - 1) / kChunk;
-    // Thread spawn (~0.15-0.3 ms per parallel_for) only pays off once the
-    // two O(V) gathers are large; below the threshold run both inline
-    // (measured: serial wins at V=100k, parallel wins from V=2^18).
-    constexpr std::size_t kParMinV = std::size_t{1} << 18;
+    // Handing chunks to other threads only pays off once the two O(V)
+    // gathers are large; below the threshold run both inline (measured on
+    // the persistent pool: serial wins at V=2^15, parallel from V=2^16).
+    constexpr std::size_t kParMinV = std::size_t{1} << 16;
     const std::size_t pgrain = V >= kParMinV ? 1 : nchunks;
     std::vector<std::size_t> off(nchunks + 1, 0);
     parallel_for(

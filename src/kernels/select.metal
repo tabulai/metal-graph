@@ -12,69 +12,104 @@ using namespace metal;
 #include "mg_params.h"
 #include "mg_common_msl.h"
 
-// One threadgroup per query lane: MSB-first 8-bit histogram refinement.
-// Four passes; after pass p the top 8*(p+1) bits of the k-th largest score
-// are fixed in `prefix`. Elements are re-scanned each pass and counted only
-// when their already-decided high bits match the prefix (no compaction —
-// V*4 strided reads per lane are trivial next to the PPR iterations).
-kernel void mg_topk_threshold_b(
-    constant MGTopkParams& p   [[buffer(0)]],
-    device const float* rank_b [[buffer(1)]],
-    device uint* thresholds    [[buffer(2)]],
-    uint tg_id   [[threadgroup_position_in_grid]],
-    uint tid     [[thread_index_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]]) {
-  const uint lane = tg_id;
-  if (lane >= MG_PPR_TILE) return;                  // threadgroup-uniform
-  if (((p.active_mask >> lane) & 1u) == 0u) return; // threadgroup-uniform
+// MSB-first 8-bit radix select over every active lane of a tile at once:
+// four passes, each mg_topk_hist_b (whole grid) then mg_topk_digit_b (one
+// threadgroup). After pass p the top 8*(p+1) bits of each lane's k-th
+// largest score are fixed in thresholds[lane]. Counts are exact integers,
+// so the result is the same bit pattern any exact selection would return.
+//
+// Digit 0 is never counted: it is derived as class_size - (digits 1..255),
+// where class_size is the number of scores matching the decided prefix (V
+// in pass 0). Exact zeros (unreached vertices) would otherwise put most of
+// the tile on one threadgroup atomic.
 
-  threadgroup atomic_uint hist[256];
-  threadgroup uint tg_prefix;
-  threadgroup uint tg_remaining;
-  if (tid == 0u) {
-    tg_prefix = 0u;
-    tg_remaining = p.k;  // 1-based rank still wanted inside the prefix class
-  }
+// Thread per vertex (grid-stride): every active lane's score whose decided
+// high bits match thresholds[lane] counts toward its next digit, first in a
+// threadgroup histogram, then flushed to hist with one device atomic per
+// nonzero bucket.
+static_assert(MG_PPR_TILE == 8u, "a vertex's lanes are two float4s");
+kernel void mg_topk_hist_b(
+    constant MGTopkParams& p      [[buffer(0)]],
+    device const float4* rank4_b  [[buffer(1)]],
+    device const uint* thresholds [[buffer(2)]],
+    device atomic_uint* hist      [[buffer(3)]],
+    uint gid       [[thread_position_in_grid]],
+    uint grid_size [[threads_per_grid]],
+    uint tid       [[thread_index_in_threadgroup]],
+    uint tg_size   [[threads_per_threadgroup]]) {
+  threadgroup atomic_uint h[MG_PPR_TILE * 256u];
+  for (uint i = tid; i < MG_PPR_TILE * 256u; i += tg_size)
+    atomic_store_explicit(&h[i], 0u, memory_order_relaxed);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  for (uint pass = 0u; pass < 4u; ++pass) {
-    const uint shift = 24u - pass * 8u;
-    for (uint i = tid; i < 256u; i += tg_size)
-      atomic_store_explicit(&hist[i], 0u, memory_order_relaxed);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const uint prefix = tg_prefix;
-    const uint pmask = (pass == 0u) ? 0u : (0xFFFFFFFFu << (shift + 8u));
-    for (uint v = tid; v < p.v_count; v += tg_size) {
-      const uint bits = as_type<uint>(rank_b[ulong(v) * MG_PPR_TILE + lane]);
-      if ((bits & pmask) == prefix)
-        atomic_fetch_add_explicit(&hist[(bits >> shift) & 0xFFu], 1u,
+  const uint shift = 24u - 8u * p.pass;
+  const uint pmask = (p.pass == 0u) ? 0u : (0xFFFFFFFFu << (shift + 8u));
+  uint prefix[MG_PPR_TILE];
+  for (uint t = 0u; t < MG_PPR_TILE; ++t) prefix[t] = thresholds[t];
+  for (uint v = gid; v < p.v_count; v += grid_size) {
+    const float4 lo = rank4_b[2ul * v];
+    const float4 hi = rank4_b[2ul * v + 1ul];
+    const float s[MG_PPR_TILE] = {lo.x, lo.y, lo.z, lo.w,
+                                  hi.x, hi.y, hi.z, hi.w};
+    for (uint t = 0u; t < MG_PPR_TILE; ++t) {
+      if (((p.active_mask >> t) & 1u) == 0u) continue;
+      const uint bits = as_type<uint>(s[t]);
+      const uint digit = (bits >> shift) & 0xFFu;
+      if (digit != 0u && (bits & pmask) == prefix[t])
+        atomic_fetch_add_explicit(&h[t * 256u + digit], 1u,
                                   memory_order_relaxed);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (tid == 0u) {
-      // Walk buckets from the top: the k-th largest lives in the first
-      // bucket where the running count reaches the remaining rank.
-      uint rem = tg_remaining;
-      uint acc = 0u;
-      uint digit = 0u;
-      for (int b = 255; b >= 0; --b) {
-        const uint c =
-            atomic_load_explicit(&hist[uint(b)], memory_order_relaxed);
-        if (acc + c >= rem) {
-          digit = uint(b);
-          rem -= acc;
-          break;
-        }
-        acc += c;
-      }
-      tg_remaining = rem;
-      tg_prefix = prefix | (digit << shift);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  if (tid == 0u) thresholds[lane] = tg_prefix;
+  for (uint i = tid; i < MG_PPR_TILE * 256u; i += tg_size) {
+    const uint c = atomic_load_explicit(&h[i], memory_order_relaxed);
+    if (c != 0u)
+      atomic_fetch_add_explicit(&hist[i], c, memory_order_relaxed);
+  }
+}
+
+// ONE threadgroup: thread `lane` walks its lane's buckets from the top; the
+// k-th largest lives in the first bucket where the running count reaches
+// the remaining rank. Then every thread clears hist for the next pass.
+kernel void mg_topk_digit_b(
+    constant MGTopkParams& p      [[buffer(0)]],
+    device atomic_uint* hist      [[buffer(1)]],
+    device uint* thresholds       [[buffer(2)]],
+    device uint* select_state     [[buffer(3)]],
+    uint tid     [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]) {
+  if (tid < MG_PPR_TILE && ((p.active_mask >> tid) & 1u) != 0u) {
+    const uint lane = tid;
+    const uint shift = 24u - 8u * p.pass;
+    device uint* remaining = select_state;
+    device uint* class_size = select_state + MG_PPR_TILE;
+    const uint total = class_size[lane];
+    uint rem = remaining[lane];
+    uint acc = 0u;
+    uint digit = 0u;
+    uint count = 0u;
+    for (int b = 255; b >= 0; --b) {
+      // acc == sum of buckets 255..1 when b reaches 0.
+      const uint c = (b > 0) ? atomic_load_explicit(
+                                   &hist[lane * 256u + uint(b)],
+                                   memory_order_relaxed)
+                             : total - acc;
+      if (acc + c >= rem) {
+        digit = uint(b);
+        rem -= acc;
+        count = c;
+        break;
+      }
+      acc += c;
+    }
+    remaining[lane] = rem;
+    class_size[lane] = count;
+    thresholds[lane] |= digit << shift;
+  }
+  threadgroup_barrier(mem_flags::mem_device);
+  for (uint i = tid; i < MG_PPR_TILE * 256u; i += tg_size)
+    atomic_store_explicit(&hist[i], 0u, memory_order_relaxed);
 }
 
 // Thread per vertex: append every candidate with bits >= threshold to its

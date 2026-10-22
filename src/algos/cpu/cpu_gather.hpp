@@ -16,15 +16,20 @@
 
 namespace mg::cpu {
 
-// Plans with fewer items (~128k edge+vertex cost at the plan's 16k-cost
-// items) gather inline even when threading is allowed: spawning threads
-// for every pass made auto-mode PageRank/HITS/PPR on small CPU-routed
-// graphs (V <= 4k, E 16k-70k) 1.3-2.9x slower.
-constexpr std::size_t kMinThreadedGatherItems = 8;
+// Plans with fewer items gather inline even when threading is allowed. On
+// the persistent pool two 16k-cost items already break even, and more gain
+// quickly (M4 Max: rmat11, 3 items, PageRank/HITS/PPR 1.6x faster threaded;
+// rmat12 2.4x). Spawning threads for every pass had needed 8.
+constexpr std::size_t kMinThreadedGatherItems = 2;
 
-// Serial fp64 sum of x[col[k]] (* w[k] when weighted) over [lo, hi).
+// Serial fp64 sum of x[col[k]] (* w[k] when weighted) over [lo, hi). Each
+// product is rounded before it is added: under clang's default
+// -ffp-contract=on, `acc += x * w` may or may not become one fused
+// multiply-add depending on how the loop is unrolled (tile and row loops
+// differed), and the bounded-reach PPR path must reproduce these bits.
 inline double row_sum(const uint32_t* col, const float* w, const double* x,
                       uint32_t lo, uint32_t hi) {
+#pragma clang fp contract(off)
   double acc = 0.0;
   if (w) {
     for (uint32_t k = lo; k < hi; ++k)

@@ -23,7 +23,6 @@ constexpr uint64_t k_max_stored_edges = (1ull << 31) - 1;  // int32 id ceiling
 constexpr uint64_t k_max_vertices = (1ull << 31) - 1;  // int32 outputs (ids,
                                                        // parents, comp)
 
-constexpr std::size_t k_hist_grain = 4096;  // min items per histogram chunk
 // Private-row scratch budget in uint32 slots: max(128 MB, 8 B per item).
 constexpr std::size_t k_hist_budget_min_slots = std::size_t(32) << 20;
 // Row pitch V + 16: with V = 2^k every private row would otherwise start on
@@ -42,8 +41,7 @@ std::vector<uint32_t> histogram(uint32_t v_count, std::size_t n,
                                 const ForKeys& for_keys) {
   std::vector<uint32_t> deg(v_count);  // value-init to 0
   if (n == 0) return deg;
-  const std::size_t chunks = std::min<std::size_t>(
-      num_threads(), (n + k_hist_grain - 1) / k_hist_grain);
+  const std::size_t chunks = parallel_chunks(n);
   if (chunks <= 1) {
     uint32_t* d = deg.data();
     for_keys(std::size_t(0), n, [d](uint32_t k) { ++d[k]; });
@@ -76,13 +74,16 @@ std::vector<uint32_t> histogram(uint32_t v_count, std::size_t n,
         }
       },
       1);
-  parallel_for(v_count, [&](std::size_t vb, std::size_t ve) {
-    uint32_t* d = deg.data();
-    for (std::size_t c = 0; c < chunks; ++c) {
-      const uint32_t* row = cnt.get() + c * pitch;
-      for (std::size_t v = vb; v < ve; ++v) d[v] += row[v];
-    }
-  });
+  parallel_for(
+      v_count,
+      [&](std::size_t vb, std::size_t ve) {
+        uint32_t* d = deg.data();
+        for (std::size_t c = 0; c < chunks; ++c) {
+          const uint32_t* row = cnt.get() + c * pitch;
+          for (std::size_t v = vb; v < ve; ++v) d[v] += row[v];
+        }
+      },
+      work_grain(v_count, uint64_t(v_count) * chunks));
   return deg;
 }
 
@@ -331,22 +332,26 @@ std::shared_ptr<Graph> Graph::build(const uint32_t* src, const uint32_t* dst,
   if (g->weighted) {
     const float* wp = g->out_.weights->as<float>();
     std::atomic<bool> bad_weight_sum{false};
-    parallel_for(V, [&](std::size_t b, std::size_t e) {
-      for (std::size_t c = b; c < e; ++c) {
-        float s = 0.0f;
-        for (uint32_t k = row[c]; k < row[c + 1]; ++k) s += wp[k];
-        if (!std::isfinite(s)) {
-          bad_weight_sum.store(true, std::memory_order_relaxed);
-          ows[c] = 0.0f;
-          continue;
-        }
-        // Flush subnormal sums to zero: GPU fp32 runs flush-to-zero, so a
-        // subnormal ows would make kernels drop the vertex's contribution
-        // while the host skips it in dangling_list — silent mass loss.
-        // Flushing here classifies such vertices as dangling on BOTH paths.
-        ows[c] = (s < FLT_MIN) ? 0.0f : s;
-      }
-    });
+    parallel_for(
+        V,
+        [&](std::size_t b, std::size_t e) {
+          for (std::size_t c = b; c < e; ++c) {
+            float s = 0.0f;
+            for (uint32_t k = row[c]; k < row[c + 1]; ++k) s += wp[k];
+            if (!std::isfinite(s)) {
+              bad_weight_sum.store(true, std::memory_order_relaxed);
+              ows[c] = 0.0f;
+              continue;
+            }
+            // Flush subnormal sums to zero: GPU fp32 runs flush-to-zero, so
+            // a subnormal ows would make kernels drop the vertex's
+            // contribution while the host skips it in dangling_list —
+            // silent mass loss. Flushing here classifies such vertices as
+            // dangling on BOTH paths.
+            ows[c] = (s < FLT_MIN) ? 0.0f : s;
+          }
+        },
+        work_grain(V, uint64_t(V) + e_stored));
     if (bad_weight_sum.load(std::memory_order_relaxed))
       throw_invalid(
           "outgoing edge weights must have a finite float32 sum per vertex");
@@ -430,6 +435,103 @@ const CpuGatherPlan& Graph::cpu_gather_plan(Dir d) {
         build_cpu_gather_plan(o.row_offsets->as<uint32_t>(), V));
   });
   return *cpu_plan_[i];
+}
+
+const CpuInTileKeys& Graph::cpu_in_tile_keys() {
+  std::call_once(in_tile_keys_once_, [this] {
+    in_tile_keys_ = std::make_unique<CpuInTileKeys>(make_cpu_in_tile_keys());
+  });
+  return *in_tile_keys_;
+}
+
+// Same huge-row and tile rule as build_cpu_gather_plan over the IN rows.
+// Undirected: IN == OUT, whose edge_orig gives the keys directly. Directed:
+// IN row v lists the stored edges with dst v in stored order, where the
+// original id IS the stored position, so tile t of v starts at the stored
+// position of v's (t * TILE)-th in-edge. Found in parallel: per-chunk
+// counts of each huge row's edges, an exclusive prefix over the chunks,
+// then each chunk writes the keys that fall inside it (each key exactly
+// once; the values do not depend on the chunking).
+CpuInTileKeys Graph::make_cpu_in_tile_keys() const {
+  constexpr uint32_t tile = MG_HUGE_TILE_EDGES;
+  CpuInTileKeys t;
+  t.key_off.push_back(0);
+  if (!directed) {
+    const uint32_t* row = out_.row_offsets->as<uint32_t>();
+    const uint32_t* orig = out_.edge_orig->as<uint32_t>();
+    for (uint32_t v = 0; v < V; ++v) {
+      if (row[v + 1] - row[v] < MG_BIN_HUGE_MIN) continue;
+      t.huge.push_back(v);
+      for (uint64_t e = uint64_t{row[v]} + tile; e < row[v + 1]; e += tile)
+        t.first_orig.push_back(orig[e]);
+      t.key_off.push_back(static_cast<uint32_t>(t.first_orig.size()));
+    }
+    return t;
+  }
+  const std::vector<uint32_t>& dst = edges_dst_canon_;
+  const std::size_t n = dst.size();
+  if (n != out_.e_stored) {  // edge list freed (see graph.hpp)
+    t.ok = false;
+    return t;
+  }
+  // In-degrees, then reused as vertex -> huge-row index (kNone otherwise).
+  constexpr uint32_t kNone = 0xFFFFFFFFu;
+  std::vector<uint32_t> hrow =
+      histogram(V, n, [&](std::size_t b, std::size_t e, auto&& inc) {
+        for (std::size_t i = b; i < e; ++i) inc(dst[i]);
+      });
+  for (uint32_t v = 0; v < V; ++v) {
+    const uint32_t d = hrow[v];
+    hrow[v] = kNone;
+    if (d < MG_BIN_HUGE_MIN) continue;
+    hrow[v] = static_cast<uint32_t>(t.huge.size());
+    t.huge.push_back(v);
+    t.key_off.push_back(t.key_off.back() + (d - 1) / tile);
+  }
+  const std::size_t nh = t.huge.size();
+  if (nh == 0) return t;
+  t.first_orig.resize(t.key_off.back());
+  const std::size_t chunks = parallel_chunks(n);  // same rule as histogram
+  const std::size_t per = (n + chunks - 1) / chunks;
+  // base[c * nh + h]: edges of huge row h stored before chunk c.
+  std::vector<uint32_t> base(chunks * nh, 0);
+  auto per_chunk = [&](auto&& body) {
+    parallel_for(
+        chunks,
+        [&](std::size_t cb, std::size_t ce) {
+          for (std::size_t c = cb; c < ce; ++c)
+            body(c, std::min(n, c * per), std::min(n, c * per + per));
+        },
+        1);
+  };
+  per_chunk([&](std::size_t c, std::size_t b, std::size_t e) {
+    std::vector<uint32_t> cnt(nh, 0);  // private: no false sharing
+    for (std::size_t i = b; i < e; ++i) {
+      const uint32_t h = hrow[dst[i]];
+      if (h != kNone) ++cnt[h];
+    }
+    std::copy(cnt.begin(), cnt.end(), base.begin() + c * nh);
+  });
+  for (std::size_t h = 0; h < nh; ++h) {
+    uint32_t acc = 0;
+    for (std::size_t c = 0; c < chunks; ++c) {
+      const uint32_t x = base[c * nh + h];
+      base[c * nh + h] = acc;
+      acc += x;
+    }
+  }
+  per_chunk([&](std::size_t c, std::size_t b, std::size_t e) {
+    std::vector<uint32_t> k(base.begin() + c * nh,
+                            base.begin() + (c + 1) * nh);
+    for (std::size_t i = b; i < e; ++i) {
+      const uint32_t h = hrow[dst[i]];
+      if (h == kNone) continue;
+      const uint32_t pos = k[h]++;
+      if (pos % tile == 0 && pos > 0)
+        t.first_orig[t.key_off[h] + pos / tile - 1] = static_cast<uint32_t>(i);
+    }
+  });
+  return t;
 }
 
 // Lazy transpose: same deterministic counting sort keyed by canon_dst.

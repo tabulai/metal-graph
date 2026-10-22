@@ -167,6 +167,7 @@ add_custom_command(
 # Core static library
 # ---------------------------------------------------------------------------
 add_library(mgcore STATIC
+  src/common/mg_pool.cpp
   src/runtime/metalcpp_impl.cpp
   src/runtime/runtime.cpp
   src/graph/build.cpp
@@ -207,6 +208,10 @@ target_link_libraries(mgcore PUBLIC
 if(NOT SKBUILD)
   add_library(metalgraph SHARED src/c_api/mg_c.cpp)
   target_link_libraries(metalgraph PRIVATE mgcore)
+  # Only the mg_* C ABI leaves the dylib: at -O0, libc++'s availability-
+  # annotated std::atomic::wait/notify_one (used by the CPU worker pool) are
+  # emitted as default-visibility weak symbols the presets cannot hide.
+  target_link_options(metalgraph PRIVATE "LINKER:-exported_symbol,_mg_*")
   set_target_properties(metalgraph PROPERTIES
     OUTPUT_NAME "metalgraph"
     VERSION ${PROJECT_VERSION}
@@ -283,6 +288,14 @@ if(MG_BUILD_TESTS AND NOT SKBUILD)
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(mg_smoke PRIVATE metalgraph)
   add_test(NAME mg_smoke COMMAND mg_smoke)
+  # Worker-pool stress (no Metal): built from the pool source alone so its
+  # fork-child checks run in a process that never loaded the GPU stack.
+  add_executable(mg_pool_stress tests/c/pool_stress.cpp src/common/mg_pool.cpp)
+  target_include_directories(mg_pool_stress PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_compile_options(mg_pool_stress PRIVATE -Wall -Wextra)
+  add_test(NAME mg_pool_stress COMMAND mg_pool_stress)
+  set_tests_properties(mg_pool_stress PROPERTIES TIMEOUT 300)
   add_test(
     NAME mg_exports
     COMMAND ${CMAKE_COMMAND}
