@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace mg {
@@ -56,6 +57,65 @@ inline bool env_flag(const char* name, bool fallback = false) {
   if (!v || !*v) return fallback;
   return !(v[0] == '0' && v[1] == '\0');
 }
+
+// std::atomic_ref where the standard library has it (libc++ 19+). The Xcode
+// 15 libc++ that builds the macOS 14 wheels does not, so there it is this
+// subset over the same compiler builtins. Like std::atomic_ref, the object
+// must be naturally aligned and accessed only through atomic_ref while any
+// thread may be writing it. MG_ATOMIC_REF_FALLBACK forces the subset (tests).
+#if defined(__cpp_lib_atomic_ref) && !defined(MG_ATOMIC_REF_FALLBACK)
+template <class T>
+using atomic_ref = std::atomic_ref<T>;
+#else
+template <class T>
+class atomic_ref {
+  static_assert(std::is_integral_v<T> && sizeof(T) <= sizeof(uint64_t),
+                "mg::atomic_ref fallback supports integers only");
+
+ public:
+  explicit atomic_ref(T& obj) noexcept : p_(&obj) {}
+
+  T load(std::memory_order mo = std::memory_order_seq_cst) const noexcept {
+    return __atomic_load_n(p_, builtin(mo));
+  }
+  void store(T v,
+             std::memory_order mo = std::memory_order_seq_cst) const noexcept {
+    __atomic_store_n(p_, v, builtin(mo));
+  }
+  bool compare_exchange_weak(
+      T& expected, T desired,
+      std::memory_order mo = std::memory_order_seq_cst) const noexcept {
+    return __atomic_compare_exchange_n(p_, &expected, desired, true,
+                                       builtin(mo), builtin(failure(mo)));
+  }
+  bool compare_exchange_strong(
+      T& expected, T desired,
+      std::memory_order mo = std::memory_order_seq_cst) const noexcept {
+    return __atomic_compare_exchange_n(p_, &expected, desired, false,
+                                       builtin(mo), builtin(failure(mo)));
+  }
+
+ private:
+  static constexpr int builtin(std::memory_order mo) noexcept {
+    switch (mo) {
+      case std::memory_order_relaxed: return __ATOMIC_RELAXED;
+      case std::memory_order_consume: return __ATOMIC_CONSUME;
+      case std::memory_order_acquire: return __ATOMIC_ACQUIRE;
+      case std::memory_order_release: return __ATOMIC_RELEASE;
+      case std::memory_order_acq_rel: return __ATOMIC_ACQ_REL;
+      default: return __ATOMIC_SEQ_CST;
+    }
+  }
+  // The single-order overloads' failure order, as for std::atomic.
+  static constexpr std::memory_order failure(std::memory_order mo) noexcept {
+    return mo == std::memory_order_acq_rel   ? std::memory_order_acquire
+           : mo == std::memory_order_release ? std::memory_order_relaxed
+                                             : mo;
+  }
+
+  T* p_;
+};
+#endif
 
 inline unsigned num_threads() {
   long t = env_long("MG_THREADS", 0);

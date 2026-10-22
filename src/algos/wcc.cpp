@@ -167,7 +167,7 @@ int number_parallel(const Graph& g, const uint32_t* labels,
     uint32_t run_root = V, run_min = 0;
     auto flush = [&] {
       if (run_root == V) return;
-      std::atomic_ref<uint32_t> f(first[run_root]);
+      atomic_ref<uint32_t> f(first[run_root]);
       uint32_t cur = f.load(std::memory_order_relaxed);
       while ((cur == 0 || run_min < cur) &&
              !f.compare_exchange_weak(cur, run_min,
