@@ -9,6 +9,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
   workflow_dispatch:
     inputs:
       run_perf:
@@ -153,6 +154,20 @@ jobs:
           MG_REQUIRE_GPU: "1"
           PYTHONPATH: python
         run: python -m pytest tests -v -ra --durations=15
+
+      - name: Exercise the Xcode 15 atomic_ref fallback
+        if: matrix.python-version == '3.13'
+        env:
+          MG_REQUIRE_GPU: "1"
+          PYTHONPATH: python
+        run: |
+          cmake -S . -B build/atomic-ref-fallback \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DPython_EXECUTABLE="$(python -c 'import sys; print(sys.executable)')" \
+            -DCMAKE_CXX_FLAGS=-DMG_ATOMIC_REF_FALLBACK
+          cmake --build build/atomic-ref-fallback --target _core -j 3
+          python -m pytest tests/test_wcc_cpu_parallel.py \
+            tests/test_wcc_gpu_concurrency.py -q
 
   perf-smoke:
     name: perf-smoke (self-hosted physical Apple Silicon)

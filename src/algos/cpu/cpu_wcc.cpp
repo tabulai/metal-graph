@@ -72,7 +72,7 @@ int wcc_serial(uint32_t V, const uint32_t* row, const uint32_t* col,
   return n_components;
 }
 
-using ARef = std::atomic_ref<uint32_t>;
+using ARef = atomic_ref<uint32_t>;  // mg::atomic_ref (mg_common.hpp)
 
 // Root of x's tree (path halving). May return a stale root while other
 // threads are linking; link() validates with CAS.

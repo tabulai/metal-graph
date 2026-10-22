@@ -4,6 +4,8 @@ All notable changes to metal-graph are documented here.
 
 ## Unreleased
 
+## 0.1.2 — 2026-10-22
+
 - Exposed HITS convergence status and final hub L1 change through Python's
   `last_run_info()` and the additive C accessor `mg_last_run_convergence()`.
   Callers can distinguish convergence (including on the final allowed
@@ -20,10 +22,8 @@ All notable changes to metal-graph are documented here.
   compacts its dense fallback in parallel.
 - Host loops run on a persistent worker pool (spin, then park) instead of
   starting threads on every call, and size their fan-out by work rather
-  than item count, so small graphs on the CPU path are no longer slower
-  with all threads than with `MG_THREADS=1`. CPU BFS and `k_hop` split
-  large levels into several chunks per thread, claimed one at a time, so
-  efficiency cores no longer hold up a level. CPU WCC uses a lock-free
+  than item count. CPU BFS and `k_hop` split large levels into several
+  chunks per thread, claimed one at a time. CPU WCC uses a lock-free
   union-find on the pool (with the Afforest giant-component skip on
   undirected graphs) at or above `MG_WCC_CPU_PAR_MIN_EDGES` stored edges
   (default 65,536), and the serial oracle below it. Results are unchanged
@@ -61,8 +61,9 @@ All notable changes to metal-graph are documented here.
   (`MG_E_GPU_MIN_<OP>` takes precedence over `MG_E_GPU_MIN`, which still
   applies to every operation). PageRank and HITS retain the original
   one-million-edge threshold and fp64 CPU arithmetic below it; lower
-  thresholds remain explicit opt-ins to fp32 GPU arithmetic. `k_hop` no
-  longer uses the GPU in auto mode.
+  thresholds remain explicit opt-ins to fp32 GPU arithmetic. `k_hop`
+  defaults to CPU at every size in auto mode; `MG_E_GPU_MIN_KHOP` or
+  `MG_E_GPU_MIN` can override that default.
 - BFS's serial preflight now defaults to 8,192 vertices / 524,288 scanned
   edges when an overflowing query would run on the GPU (1,024 / 8,192 when it
   would run on the threaded CPU), rejects a reach that cannot fit as soon as
