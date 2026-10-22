@@ -45,7 +45,7 @@ static inline bool mg_visited_claim(device atomic_uint* visited, uint v) {
   return (atomic_fetch_or_explicit(w, bit, memory_order_relaxed) & bit) == 0u;
 }
 
-// Non-atomic bitmap test (read-only bitmaps, e.g. the k-hop reached set).
+// Non-atomic bitmap test (read-only bitmaps).
 static inline bool mg_bitmap_test(device const uint* bitmap, uint v) {
   return (bitmap[v >> 5u] & (1u << (v & 31u))) != 0u;
 }
@@ -64,8 +64,8 @@ typedef struct MGBfsControlDev {
   atomic_uint bin_count_low;   // atomic (frontier_bin)
   atomic_uint frontier_edges;  // atomic (frontier_bin)
   uint unvisited;              // single-writer (decide)
-  uint pad0;
-  uint pad1;
+  atomic_uint max_high_deg;    // atomic (frontier_bin)
+  uint high_split;             // single-writer (decide)
 } MGBfsControlDev;
 
 #endif  // MG_COMMON_MSL_H

@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cfloat>
 #include <cmath>
+#include <memory>
 #include <numeric>
 #include <string>
 #include <vector>
@@ -22,18 +23,67 @@ constexpr uint64_t k_max_stored_edges = (1ull << 31) - 1;  // int32 id ceiling
 constexpr uint64_t k_max_vertices = (1ull << 31) - 1;  // int32 outputs (ids,
                                                        // parents, comp)
 
-// Parallel degree histogram over `key` (atomics: determinism of counts is
-// order-independent). Result copied to a plain vector.
-std::vector<uint32_t> histogram(uint32_t v_count,
-                                const std::vector<uint32_t>& key) {
-  std::vector<std::atomic<uint32_t>> deg_a(v_count);  // value-init to 0
-  parallel_for(key.size(), [&](std::size_t b, std::size_t e) {
-    for (std::size_t i = b; i < e; ++i)
-      deg_a[key[i]].fetch_add(1, std::memory_order_relaxed);
-  });
-  std::vector<uint32_t> deg(v_count);
-  for (uint32_t v = 0; v < v_count; ++v)
-    deg[v] = deg_a[v].load(std::memory_order_relaxed);
+// Private-row scratch budget in uint32 slots: max(128 MB, 8 B per item).
+constexpr std::size_t k_hist_budget_min_slots = std::size_t(32) << 20;
+// Row pitch V + 16: with V = 2^k every private row would otherwise start on
+// the same cache sets and the column-wise reduction would thrash.
+constexpr std::size_t k_hist_row_pad = 16;
+
+// Degree histogram over n items: for_keys(b, e, inc) calls inc(k) once per
+// key occurrence of items [b, e). Counts are exact and order-independent.
+// Each contiguous item chunk (one per thread) counts into its OWN row (no
+// atomics: hub counters, and the degree-descending canonical ids packed into
+// one cache line, would otherwise serialize every thread); rows are summed
+// column-wise. Falls back to shared relaxed atomics when the scratch budget
+// cannot give every chunk a row (very large V relative to the item count).
+template <typename ForKeys>
+std::vector<uint32_t> histogram(uint32_t v_count, std::size_t n,
+                                const ForKeys& for_keys) {
+  std::vector<uint32_t> deg(v_count);  // value-init to 0
+  if (n == 0) return deg;
+  const std::size_t chunks = parallel_chunks(n);
+  if (chunks <= 1) {
+    uint32_t* d = deg.data();
+    for_keys(std::size_t(0), n, [d](uint32_t k) { ++d[k]; });
+    return deg;
+  }
+  const std::size_t pitch = std::size_t(v_count) + k_hist_row_pad;
+  if (chunks * pitch > std::max(k_hist_budget_min_slots, 2 * n)) {
+    std::vector<std::atomic<uint32_t>> deg_a(v_count);  // value-init to 0
+    parallel_for(n, [&](std::size_t b, std::size_t e) {
+      for_keys(b, e, [&deg_a](uint32_t k) {
+        deg_a[k].fetch_add(1, std::memory_order_relaxed);
+      });
+    });
+    for (uint32_t v = 0; v < v_count; ++v)
+      deg[v] = deg_a[v].load(std::memory_order_relaxed);
+    return deg;
+  }
+  const std::size_t per = (n + chunks - 1) / chunks;
+  // Uninitialized: each row is zeroed by the thread that fills it.
+  std::unique_ptr<uint32_t[]> cnt(new uint32_t[chunks * pitch]);
+  parallel_for(
+      chunks,
+      [&](std::size_t cb, std::size_t ce) {
+        for (std::size_t c = cb; c < ce; ++c) {
+          uint32_t* row = cnt.get() + c * pitch;
+          std::fill(row, row + v_count, 0u);
+          const std::size_t b = std::min(n, c * per);
+          const std::size_t e = std::min(n, b + per);
+          for_keys(b, e, [row](uint32_t k) { ++row[k]; });
+        }
+      },
+      1);
+  parallel_for(
+      v_count,
+      [&](std::size_t vb, std::size_t ve) {
+        uint32_t* d = deg.data();
+        for (std::size_t c = 0; c < chunks; ++c) {
+          const uint32_t* row = cnt.get() + c * pitch;
+          for (std::size_t v = vb; v < ve; ++v) d[v] += row[v];
+        }
+      },
+      work_grain(v_count, uint64_t(v_count) * chunks));
   return deg;
 }
 
@@ -54,7 +104,11 @@ Orientation build_orientation(uint32_t v_count,
   Orientation o;
   o.e_stored = es;
 
-  std::vector<uint32_t> deg = histogram(v_count, key);
+  std::vector<uint32_t> deg =
+      histogram(v_count, key.size(),
+                [&](std::size_t b, std::size_t e, auto&& inc) {
+                  for (std::size_t i = b; i < e; ++i) inc(key[i]);
+                });
 
   o.row_offsets = rt.alloc(sizeof(uint32_t) * (uint64_t(v_count) + 1),
                            (pre + "row_offsets").c_str());
@@ -195,17 +249,18 @@ std::shared_ptr<Graph> Graph::build(const uint32_t* src, const uint32_t* dst,
   const uint32_t V = n_vertices;
 
   // USER-space out-degrees over the STORED (symmetrized) edge set.
-  std::vector<std::atomic<uint32_t>> deg_a(V);
-  parallel_for(n_edges, [&](std::size_t b, std::size_t e) {
-    for (std::size_t i = b; i < e; ++i) {
-      deg_a[src[i]].fetch_add(1, std::memory_order_relaxed);
-      if (!directed && src[i] != dst[i])
-        deg_a[dst[i]].fetch_add(1, std::memory_order_relaxed);
-    }
-  });
-  std::vector<uint32_t> deg_user(V);
-  for (uint32_t u = 0; u < V; ++u)
-    deg_user[u] = deg_a[u].load(std::memory_order_relaxed);
+  std::vector<uint32_t> deg_user =
+      directed ? histogram(V, n_edges,
+                           [&](std::size_t b, std::size_t e, auto&& inc) {
+                             for (std::size_t i = b; i < e; ++i) inc(src[i]);
+                           })
+               : histogram(V, n_edges,
+                           [&](std::size_t b, std::size_t e, auto&& inc) {
+                             for (std::size_t i = b; i < e; ++i) {
+                               inc(src[i]);
+                               if (src[i] != dst[i]) inc(dst[i]);
+                             }
+                           });
 
   // Canonical order: stable sort by out-degree DESCENDING (stable => equal
   // degrees keep ascending user index).
@@ -219,7 +274,9 @@ std::shared_ptr<Graph> Graph::build(const uint32_t* src, const uint32_t* dst,
 
   // Stored canonical edge list (kept for the lazy transpose). Undirected:
   // u!=v stored both ways (forward then reverse, input order), self-loops
-  // once; the ORIGINAL input edge id rides along.
+  // once; the ORIGINAL input edge id rides along. k_hop's edge-parallel
+  // induced-edge marking relies on the resulting orig-id layout (directed:
+  // orig id == stored position; undirected: nondecreasing) — see graph.hpp.
   uint64_t e_stored = n_edges;
   if (!directed) {
     uint64_t n_self = 0;
@@ -275,22 +332,26 @@ std::shared_ptr<Graph> Graph::build(const uint32_t* src, const uint32_t* dst,
   if (g->weighted) {
     const float* wp = g->out_.weights->as<float>();
     std::atomic<bool> bad_weight_sum{false};
-    parallel_for(V, [&](std::size_t b, std::size_t e) {
-      for (std::size_t c = b; c < e; ++c) {
-        float s = 0.0f;
-        for (uint32_t k = row[c]; k < row[c + 1]; ++k) s += wp[k];
-        if (!std::isfinite(s)) {
-          bad_weight_sum.store(true, std::memory_order_relaxed);
-          ows[c] = 0.0f;
-          continue;
-        }
-        // Flush subnormal sums to zero: GPU fp32 runs flush-to-zero, so a
-        // subnormal ows would make kernels drop the vertex's contribution
-        // while the host skips it in dangling_list — silent mass loss.
-        // Flushing here classifies such vertices as dangling on BOTH paths.
-        ows[c] = (s < FLT_MIN) ? 0.0f : s;
-      }
-    });
+    parallel_for(
+        V,
+        [&](std::size_t b, std::size_t e) {
+          for (std::size_t c = b; c < e; ++c) {
+            float s = 0.0f;
+            for (uint32_t k = row[c]; k < row[c + 1]; ++k) s += wp[k];
+            if (!std::isfinite(s)) {
+              bad_weight_sum.store(true, std::memory_order_relaxed);
+              ows[c] = 0.0f;
+              continue;
+            }
+            // Flush subnormal sums to zero: GPU fp32 runs flush-to-zero, so
+            // a subnormal ows would make kernels drop the vertex's
+            // contribution while the host skips it in dangling_list —
+            // silent mass loss. Flushing here classifies such vertices as
+            // dangling on BOTH paths.
+            ows[c] = (s < FLT_MIN) ? 0.0f : s;
+          }
+        },
+        work_grain(V, uint64_t(V) + e_stored));
     if (bad_weight_sum.load(std::memory_order_relaxed))
       throw_invalid(
           "outgoing edge weights must have a finite float32 sum per vertex");
@@ -318,6 +379,159 @@ const Orientation& Graph::orientation(Dir d) {
   if (d == Dir::out || !directed) return out_;
   std::call_once(in_once_, [this] { build_in_orientation(); });
   return *in_;
+}
+
+namespace {
+
+// Target cost (edges + vertices) per CPU gather item, equal to the huge-row
+// tile size. Fixed so that the decomposition (and every fp64 result) is
+// independent of the thread count. M4 Max sweep (cpu mode, rmat16/kg/
+// rmat18): 8192..32768 within ~3%, 2048-4096 up to 9% slower.
+constexpr uint64_t k_cpu_gather_item_cost = MG_HUGE_TILE_EDGES;
+
+CpuGatherPlan build_cpu_gather_plan(const uint32_t* row, uint32_t V) {
+  CpuGatherPlan p;
+  constexpr uint32_t tile = MG_HUGE_TILE_EDGES;
+  uint32_t v = 0;
+  while (v < V) {
+    const uint32_t deg = row[v + 1] - row[v];
+    if (deg >= MG_BIN_HUGE_MIN) {
+      p.huge.push_back(v);
+      p.huge_off.push_back(p.n_slots);
+      for (uint64_t e = row[v]; e < row[v + 1]; e += tile) {
+        const uint32_t e1 = static_cast<uint32_t>(
+            std::min<uint64_t>(row[v + 1], e + tile));
+        p.items.push_back({v, v + 1, static_cast<uint32_t>(e), e1,
+                           static_cast<int32_t>(p.n_slots++)});
+      }
+      ++v;
+      continue;
+    }
+    uint32_t v1 = v;
+    uint64_t acc = 0;
+    while (v1 < V) {
+      const uint32_t d = row[v1 + 1] - row[v1];
+      if (d >= MG_BIN_HUGE_MIN) break;
+      const uint64_t c = static_cast<uint64_t>(d) + 1;
+      if (v1 > v && acc + c > k_cpu_gather_item_cost) break;
+      acc += c;
+      ++v1;
+    }
+    p.items.push_back({v, v1, row[v], row[v1], -1});
+    v = v1;
+  }
+  p.huge_off.push_back(p.n_slots);
+  return p;
+}
+
+}  // namespace
+
+const CpuGatherPlan& Graph::cpu_gather_plan(Dir d) {
+  const Dir key = directed ? d : Dir::out;  // undirected: one shared CSR
+  const int i = static_cast<int>(key);
+  std::call_once(cpu_plan_once_[i], [this, key, i] {
+    const Orientation& o = orientation(key);
+    cpu_plan_[i] = std::make_unique<CpuGatherPlan>(
+        build_cpu_gather_plan(o.row_offsets->as<uint32_t>(), V));
+  });
+  return *cpu_plan_[i];
+}
+
+const CpuInTileKeys& Graph::cpu_in_tile_keys() {
+  std::call_once(in_tile_keys_once_, [this] {
+    in_tile_keys_ = std::make_unique<CpuInTileKeys>(make_cpu_in_tile_keys());
+  });
+  return *in_tile_keys_;
+}
+
+// Same huge-row and tile rule as build_cpu_gather_plan over the IN rows.
+// Undirected: IN == OUT, whose edge_orig gives the keys directly. Directed:
+// IN row v lists the stored edges with dst v in stored order, where the
+// original id IS the stored position, so tile t of v starts at the stored
+// position of v's (t * TILE)-th in-edge. Found in parallel: per-chunk
+// counts of each huge row's edges, an exclusive prefix over the chunks,
+// then each chunk writes the keys that fall inside it (each key exactly
+// once; the values do not depend on the chunking).
+CpuInTileKeys Graph::make_cpu_in_tile_keys() const {
+  constexpr uint32_t tile = MG_HUGE_TILE_EDGES;
+  CpuInTileKeys t;
+  t.key_off.push_back(0);
+  if (!directed) {
+    const uint32_t* row = out_.row_offsets->as<uint32_t>();
+    const uint32_t* orig = out_.edge_orig->as<uint32_t>();
+    for (uint32_t v = 0; v < V; ++v) {
+      if (row[v + 1] - row[v] < MG_BIN_HUGE_MIN) continue;
+      t.huge.push_back(v);
+      for (uint64_t e = uint64_t{row[v]} + tile; e < row[v + 1]; e += tile)
+        t.first_orig.push_back(orig[e]);
+      t.key_off.push_back(static_cast<uint32_t>(t.first_orig.size()));
+    }
+    return t;
+  }
+  const std::vector<uint32_t>& dst = edges_dst_canon_;
+  const std::size_t n = dst.size();
+  if (n != out_.e_stored) {  // edge list freed (see graph.hpp)
+    t.ok = false;
+    return t;
+  }
+  // In-degrees, then reused as vertex -> huge-row index (kNone otherwise).
+  constexpr uint32_t kNone = 0xFFFFFFFFu;
+  std::vector<uint32_t> hrow =
+      histogram(V, n, [&](std::size_t b, std::size_t e, auto&& inc) {
+        for (std::size_t i = b; i < e; ++i) inc(dst[i]);
+      });
+  for (uint32_t v = 0; v < V; ++v) {
+    const uint32_t d = hrow[v];
+    hrow[v] = kNone;
+    if (d < MG_BIN_HUGE_MIN) continue;
+    hrow[v] = static_cast<uint32_t>(t.huge.size());
+    t.huge.push_back(v);
+    t.key_off.push_back(t.key_off.back() + (d - 1) / tile);
+  }
+  const std::size_t nh = t.huge.size();
+  if (nh == 0) return t;
+  t.first_orig.resize(t.key_off.back());
+  const std::size_t chunks = parallel_chunks(n);  // same rule as histogram
+  const std::size_t per = (n + chunks - 1) / chunks;
+  // base[c * nh + h]: edges of huge row h stored before chunk c.
+  std::vector<uint32_t> base(chunks * nh, 0);
+  auto per_chunk = [&](auto&& body) {
+    parallel_for(
+        chunks,
+        [&](std::size_t cb, std::size_t ce) {
+          for (std::size_t c = cb; c < ce; ++c)
+            body(c, std::min(n, c * per), std::min(n, c * per + per));
+        },
+        1);
+  };
+  per_chunk([&](std::size_t c, std::size_t b, std::size_t e) {
+    std::vector<uint32_t> cnt(nh, 0);  // private: no false sharing
+    for (std::size_t i = b; i < e; ++i) {
+      const uint32_t h = hrow[dst[i]];
+      if (h != kNone) ++cnt[h];
+    }
+    std::copy(cnt.begin(), cnt.end(), base.begin() + c * nh);
+  });
+  for (std::size_t h = 0; h < nh; ++h) {
+    uint32_t acc = 0;
+    for (std::size_t c = 0; c < chunks; ++c) {
+      const uint32_t x = base[c * nh + h];
+      base[c * nh + h] = acc;
+      acc += x;
+    }
+  }
+  per_chunk([&](std::size_t c, std::size_t b, std::size_t e) {
+    std::vector<uint32_t> k(base.begin() + c * nh,
+                            base.begin() + (c + 1) * nh);
+    for (std::size_t i = b; i < e; ++i) {
+      const uint32_t h = hrow[dst[i]];
+      if (h == kNone) continue;
+      const uint32_t pos = k[h]++;
+      if (pos % tile == 0 && pos > 0)
+        t.first_orig[t.key_off[h] + pos / tile - 1] = static_cast<uint32_t>(i);
+    }
+  });
+  return t;
 }
 
 // Lazy transpose: same deterministic counting sort keyed by canon_dst.

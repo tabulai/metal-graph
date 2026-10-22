@@ -93,15 +93,18 @@ class Graph:
         raise TypeError("use Graph.from_edges(...) to construct a Graph")
 
     @classmethod
-    def _wrap(cls, core, external_ids, identity, src_ext, dst_ext, weights):
+    def _wrap(cls, core, external_ids, identity, src_idx, dst_idx, weights):
         self = object.__new__(cls)
         self._g = core
         external_ids.setflags(write=False)
         self._external_ids = external_ids
         self._identity = identity
-        # Kept for k_hop(as_graph=True): input edge id -> external endpoints.
-        self._src_ext = src_ext
-        self._dst_ext = dst_ext
+        # Kept for k_hop(as_graph=True): input edge id -> USER-index
+        # endpoints (uint32; external ids are external_ids[idx]). Private
+        # arrays: a caller mutating their inputs must not corrupt the
+        # immutable snapshot's view of its own edges.
+        self._src_idx = src_idx
+        self._dst_idx = dst_idx
         self._weights = weights
         return self
 
@@ -141,8 +144,10 @@ class Graph:
                     raise ValueError(
                         "src/dst: vertex ids must be in [0, num_vertices)"
                     )
-            src_idx = np.ascontiguousarray(src, dtype=np.uint32)
-            dst_idx = np.ascontiguousarray(dst, dtype=np.uint32)
+            # Always copy (np.ascontiguousarray would alias a caller's
+            # uint32 array); factorize() below returns fresh arrays.
+            src_idx = np.array(src, dtype=np.uint32)
+            dst_idx = np.array(dst, dtype=np.uint32)
             external_ids = np.arange(num_vertices, dtype=np.int64)
             identity = True
         else:
@@ -153,31 +158,18 @@ class Graph:
             np.ascontiguousarray(dst_idx, dtype=np.uint32),
             w, len(external_ids), bool(directed),
         )
-        # Defensive copies: k_hop(as_graph=True) indexes these later, and a
-        # caller mutating their arrays must not corrupt the immutable
-        # snapshot's view of its own inputs.
-        return cls._wrap(core, external_ids, identity, src.copy(), dst.copy(),
+        return cls._wrap(core, external_ids, identity, src_idx, dst_idx,
                          None if w is None else w.copy())
 
-    @classmethod
-    def _from_universe(cls, src_ext, dst_ext, weights, universe_ext, directed):
-        """Build a graph over an explicit vertex universe (external IDs).
+    @property
+    def _src_ext(self):
+        """Private: external source id per input edge (derived lazily)."""
+        return self._external_ids[self._src_idx]
 
-        Used by k_hop(as_graph=True): the universe carries reached vertices
-        (so isolated reached vertices appear) plus the induced-edge
-        endpoints. User indices follow np.unique order of the universe.
-        """
-        src_ext = np.asarray(src_ext)
-        dst_ext = np.asarray(dst_ext)
-        uniques = np.unique(np.asarray(universe_ext))
-        src_idx = index_in_sorted(uniques, src_ext, "subgraph src")
-        dst_idx = index_in_sorted(uniques, dst_ext, "subgraph dst")
-        w = None
-        if weights is not None:
-            w = np.ascontiguousarray(weights, dtype=np.float32)
-        core = _core.build_graph(src_idx, dst_idx, w, len(uniques),
-                                 bool(directed))
-        return cls._wrap(core, uniques, False, src_ext, dst_ext, w)
+    @property
+    def _dst_ext(self):
+        """Private: external destination id per input edge (lazy)."""
+        return self._external_ids[self._dst_idx]
 
     @property
     def num_vertices(self):
@@ -352,13 +344,23 @@ def k_hop(G, seeds, k=2, direction="both", max_vertices=None, max_edges=None,
     vs, es = _core.k_hop(core, s, k, _direction_code(direction), mv, me)
     if not as_graph:
         return vs, es
-    sub_src = G._src_ext[es]
-    sub_dst = G._dst_ext[es]
+    # Every induced edge has BOTH endpoints in vs (k_hop contract), so the
+    # subgraph's vertex universe is exactly the reached set. vs is ascending
+    # and external_ids is sorted, hence external_ids[vs] IS the np.unique
+    # order of that universe. Endpoints are renumbered through a dense
+    # user-index -> subgraph-index table (O(V + ne), no unique/searchsorted);
+    # unreached slots hold an out-of-range sentinel, so an edge that ever
+    # broke the k_hop contract would be rejected by build_graph, not
+    # silently remapped to vertex 0.
+    uniques = G._external_ids[vs]
+    remap = np.full(G.num_vertices, 0xFFFFFFFF, dtype=np.uint32)
+    remap[vs] = np.arange(vs.size, dtype=np.uint32)
+    src_idx = remap[G._src_idx[es]]
+    dst_idx = remap[G._dst_idx[es]]
     sub_w = None if G._weights is None else G._weights[es]
-    reached_ext = np.asarray(G.external_ids)[vs]
-    universe = np.concatenate([reached_ext, sub_src, sub_dst])
-    return Graph._from_universe(sub_src, sub_dst, sub_w, universe,
-                                G.directed)
+    sub = _core.build_graph(src_idx, dst_idx, sub_w, len(uniques),
+                            bool(G.directed))
+    return Graph._wrap(sub, uniques, False, src_idx, dst_idx, sub_w)
 
 
 def set_execution(mode="auto"):

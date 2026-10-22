@@ -42,6 +42,8 @@ typedef int32_t mg_i32;
 //   huge: degree >= MG_BIN_HUGE_MIN      -> fixed edge TILES across many
 //                                           threadgroups (see below)
 //   high: MG_BIN_HIGH_MIN <= d < HUGE    -> one threadgroup per vertex
+//                                           (GPU BFS: up to K per vertex,
+//                                           split by mg_bfs_decide)
 //   mid:  MG_BIN_MID_MIN <= d < HIGH_MIN -> one simdgroup per vertex
 //   low:  1 <= d < MG_BIN_MID_MIN        -> one thread per vertex
 //   zero: d == 0                          -> zero-fill list (per orientation)
@@ -54,7 +56,7 @@ typedef int32_t mg_i32;
 // MG_BIN_HUGE_MIN leave the high bin; their edge ranges are decomposed AT
 // BUILD TIME into fixed tiles of MG_HUGE_TILE_EDGES edges. PageRank gathers
 // them in a deterministic two-pass (per-tile threadgroup partials, then a
-// per-vertex finalize summing tiles in fixed order); WCC hooks tiles
+// per-vertex finalize summing tiles in fixed order); WCC links tiles
 // directly (no reduction needed). Fixed decomposition + ordered finalize
 // preserve the determinism guarantee at fixed iteration counts.
 #define MG_BIN_HUGE_MIN 16384u
@@ -160,8 +162,8 @@ typedef struct MGBfsControl {
   mg_u32 bin_count_low;
   mg_u32 frontier_edges;  // sum of degrees over current frontier (atomic)
   mg_u32 unvisited;       // V - #visited so far (maintained by decide)
-  mg_u32 pad0;
-  mg_u32 pad1;
+  mg_u32 max_high_deg;    // max degree in the high bin this level (atomic max)
+  mg_u32 high_split;      // threadgroups per high-bin vertex (decide)
 } MGBfsControl;
 
 typedef struct MGBfsParams {
@@ -172,34 +174,52 @@ typedef struct MGBfsParams {
   mg_u32 alpha_cut;       // bottom-up when frontier_edges * alpha_cut > e_unvisited... see decide
   mg_u32 beta_cut;        // bottom-up density guard: frontier_count * beta_cut > V
   mg_u32 enable_bottomup; // 0 disables bottom-up entirely
-  mg_u32 pad0;
+  mg_u32 high_split_max;  // cap on threadgroups per high-bin vertex (>= 1;
+                          // MG_BFS_HIGH_SPLIT_MAX, 1 = unsplit)
 } MGBfsParams;
+
+// BFS high-bin split target: mg_bfs_decide picks high_split so the high-bin
+// expand grid has about this many threadgroups (never splitting below
+// ~MG_BIN_HIGH_MIN edges per slice).
+#define MG_BFS_HIGH_SPLIT_TARGET_TGS 2048u
 
 // Indirect dispatch argument slots (MTLDispatchThreadgroupsIndirectArguments
 // = 3 x uint32). The BFS args buffer holds MG_BFS_ARGS_SLOTS slots:
 #define MG_BFS_ARG_BIN 0u       // mg_bfs_frontier_bin dispatch
-#define MG_BFS_ARG_EXPAND_TG 1u // mg_bfs_expand_tg (one tg per high vertex)
+#define MG_BFS_ARG_EXPAND_TG 1u // mg_bfs_expand_tg ({high vertices, split, 1})
 #define MG_BFS_ARG_EXPAND_SG 2u // mg_bfs_expand_sg
 #define MG_BFS_ARG_EXPAND_TH 3u // mg_bfs_expand_thread
 #define MG_BFS_ARG_BOTTOMUP 4u  // mg_bfs_bottomup_probe (covers all V)
 #define MG_BFS_ARGS_SLOTS 5u
 // Byte offset of slot i = i * 3 * sizeof(uint32).
 
-// --- k-hop induced-edge extraction ---
-typedef struct MGKhopParams {
-  mg_u32 n_vertices;  // #reached vertices (list length)
-  mg_u32 pad0;
-  mg_u32 pad1;
-  mg_u32 pad2;
-} MGKhopParams;
-
 // --- WCC ---
+// MGWccLinkParams.flags bits (both set for undirected storage)
+#define MG_WCC_SKIP_TWINS 1u  // an edge between two scanned vertices is
+                              // linked only from its (v, u > v) copy
+#define MG_WCC_SKIP_GIANT 2u  // vertices of the snapshot giant set are not
+                              // scanned (Afforest skip)
+// OUT edges per vertex linked by mg_wcc_sample before the snapshot.
+#define MG_WCC_SAMPLE_EDGES 2u
+// mg_wcc_sample / mg_wcc_snapshot / mg_wcc_compress
 typedef struct MGWccParams {
   mg_u32 v_count;
-  mg_u32 count;  // worklist length for this dispatch
+  mg_u32 count;  // threads: V - n_zero (sample) or V (snapshot, compress)
   mg_u32 pad0;
   mg_u32 pad1;
 } MGWccParams;
+// mg_wcc_link: one grid over every OUT bin, threadgroup ranges in order
+// [n_tiles huge tiles | n_high high | mid_tgs mid | ceil(n_low/TG) low].
+typedef struct MGWccLinkParams {
+  mg_u32 flags;  // MG_WCC_* bits
+  mg_u32 n_tiles;
+  mg_u32 n_high;
+  mg_u32 n_mid;
+  mg_u32 mid_tgs;  // ceil(n_mid / simdgroups per threadgroup)
+  mg_u32 n_low;
+  mg_u32 pad0;
+  mg_u32 pad1;
+} MGWccLinkParams;
 
 // --- GPU top-k select (batched PPR tiles) ---
 // cap = k + MG_TOPK_TIE_SLACK candidate slots per lane; a lane whose
@@ -210,6 +230,10 @@ typedef struct MGTopkParams {
   mg_u32 k;
   mg_u32 cap;
   mg_u32 active_mask;  // lanes carrying queries in this tile
+  mg_u32 pass;         // radix pass 0..3 (hist / digit kernels)
+  mg_u32 pad0;
+  mg_u32 pad1;
+  mg_u32 pad2;
 } MGTopkParams;
 
 // --- Scan ---
@@ -265,6 +289,11 @@ typedef struct MGScanParams {
 //   b1 dangling_list   (const uint32)   zero OUT-weight vertices
 //   b2 rank            (const float, V) rank_next of the iteration just done
 //   b3 partials        (float, #tgs)    per-threadgroup sums
+//
+// mg_sum_partials — grid: ceil(count / MG_TG_SIZE)
+//   b0 MGPrParams (count); b1 values (const float, count)
+//   b2 partials (float, #tgs)  per-tg sums; equal to mg_pr_dangling_partials
+//   over the identity list 0..count-1
 //
 // mg_pr_residual_partials — grid: ceil(V / MG_TG_SIZE)
 //   b0 MGPrParams (count = V)
@@ -325,6 +354,15 @@ typedef struct MGScanParams {
 //   (seeds pre-deduplicated per (v,lane) on host => no write conflicts)
 //   inactive lanes: skip.
 //
+// Tile init (head of a tile's first batch): mg_pr_tile_zero_b then
+// mg_pr_seed_init_b set rank_cur_b = the per-lane seed vectors.
+// mg_pr_tile_zero_b — grid: ceil(V / MG_TG_SIZE), thread/vertex
+//   b0 MGPprParams (count = V); b1 rank_b (float4, V*TILE/4) = 0
+// mg_pr_seed_init_b — grid: ceil(seed_total / MG_TG_SIZE), thread/seed
+//   b0 MGPprParams (count = seed_total); b1 seed_vertex; b2 seed_lane;
+//   b3 seed_weight (as mg_pr_seed_scatter_b); b4 rank_b (float, V*TILE)
+//   rank_b[v*TILE+lane] = w (deduplicated seeds => single writer).
+//
 // mg_pr_dangling_partials_b — grid: ceil(n_dangling / MG_TG_SIZE)
 //   b0 MGPprParams (count = dangling list length)
 //   b1 dangling_list (const uint32)
@@ -378,11 +416,8 @@ typedef struct MGScanParams {
 //   b5 rank_cur_b
 //   batched write contract: active lanes ASSIGN alpha*acc, inactive COPY.
 //
-// mg_wcc_hook_huge — grid: n_tiles tgs of MG_TG_SIZE
-//   b0 MGWccParams (count = n_tiles)
-//   b1 tile_owner; b2 tile_first_edge; b3 wl_huge; b4 row_offsets;
-//   b5 col_indices; b6 labels (atomic_uint, V); b7 changed (atomic_uint, 1)
-//   per-edge hook over the tile; conditional changed store per thread.
+// mg_wcc_link takes huge tiles in the first n_tiles threadgroups of its
+//   grid: per-edge filtered union-find link over the tile (see WCC section).
 //
 // ======================= utilities (reduce.metal) ==========================
 // mg_fill_f32 — b0 MGFillParams; b1 dst (float)
@@ -424,12 +459,13 @@ typedef struct MGScanParams {
 // Level sequence (encoded per level; encoder breaks marked |):
 //   mg_bfs_prepare_level  (1 tg): frontier_count = next_count;
 //       next_count = 0; if (frontier_count == 0) done = 1; level += 1;
-//       zero bin counts & frontier_edges; write args[BIN] =
+//       zero bin counts, frontier_edges & max_high_deg; write args[BIN] =
 //       ceil(frontier_count / tg_size). (Host swaps the frontier/next
 //       buffer BINDINGS each level — kernels always read b4, append to b5.)
 //   | mg_bfs_frontier_bin (indirect ARG_BIN): thread i < frontier_count reads
 //       v = frontier[i], d = degree(v), appends v to the right bin (atomic
-//       bin counters in control), atomically adds d to frontier_edges.
+//       bin counters in control), atomically adds d to frontier_edges and
+//       atomic-maxes high-bin degrees into max_high_deg.
 //       Must no-op entirely when control.done == 1.
 //   mg_bfs_decide (1 tg): unvisited -= frontier_count; mode = BOTTOMUP iff
 //       enable_bottomup && frontier_edges * alpha_cut > e_count AND
@@ -437,9 +473,13 @@ typedef struct MGScanParams {
 //       guard prevents a single high-degree hub from triggering a full
 //       reverse-CSR scan. Write args[EXPAND_*] from bin counts
 //       (0 groups for the unused path), args[BOTTOMUP] = ceil(V/tg_size) or
-//       0. All args 0 when done == 1.
+//       0. All args 0 when done == 1. Top-down args[EXPAND_TG] = {bh, K, 1},
+//       high_split = K = min(ceil(max_high_deg / MG_BIN_HIGH_MIN),
+//       max(1, MG_BFS_HIGH_SPLIT_TARGET_TGS / bh), high_split_max).
 //   | mg_bfs_expand_tg / _sg / _thread (indirect): top-down expansion of the
-//       matching bin; claim neighbors via visited-bitmap atomic_fetch_or;
+//       matching bin (expand_tg: threadgroup (x, y) takes slice y of
+//       high_split slices of vertex bins[x]'s edges);
+//       claim neighbors via visited-bitmap atomic_fetch_or;
 //       append to next via simd-compaction (sg/tg variants) or per-discovery
 //       atomic (thread variant); dist[nbr] = level; parent[nbr] = v.
 //   mg_bfs_bottomup_probe (indirect): thread per vertex v: if dist[v] == -1,
@@ -450,29 +490,49 @@ typedef struct MGScanParams {
 // After K levels host waits, reads control.done / next_count, re-encodes if
 // needed. dist/parent are canonical-id indexed; host translates at boundary.
 //
-// ======================= k-hop (frontier.metal) =============================
-// mg_khop_count — grid ceil(n_vertices / MG_TG_SIZE), thread per reached vtx
-//   b0 MGKhopParams; b1 reached_list (const uint32); b2 row_off; b3 col_idx;
-//   b4 reached_bitmap (const uint32, ceil(V/32));  b5 counts (uint32, n_vertices)
-//   counts[i] = # edges (v -> u) with u's bit set, v = reached_list[i].
-// mg_khop_emit — same grid
-//   b0 MGKhopParams; b1 reached_list; b2 row_off; b3 col_idx; b4 reached_bitmap;
-//   b5 offsets (const uint32, exclusive scan of counts); b6 edge_orig (const
-//   uint32, E — CSR slot -> original input edge index); b7 out_edges (uint32)
-//   deterministic: edges of reached_list[i] written at offsets[i..], in CSR order.
+// k-hop has no kernels: vertex discovery reuses the BFS protocol above
+// (max_levels = k) and induced-edge extraction is a host bitmap pass over
+// original edge ids (src/algos/khop.cpp).
 //
 // ======================= WCC (wcc.metal) ====================================
-// mg_wcc_hook_{tg,sg,thread} — gridding like the gather variants, worklists
-// are the OUT orientation bins.
-//   b0 MGWccParams (count = worklist len); b1 worklist; b2 row_off; b3 col_idx;
-//   b4 labels (atomic_uint, V); b5 changed (atomic_uint, 1)
-//   For each edge (v,u): lv = load(labels[v]), lu = load(labels[u]),
-//   m = min(lv, lu); atomic_min(labels[u], m); atomic_min(labels[v], m);
-//   set *changed = 1 if either min actually lowered a label.
-// mg_wcc_jump — grid ceil(V / MG_TG_SIZE)
-//   b0 MGWccParams (count = V); b1 labels (atomic_uint, V); b2 changed
-//   l = load(labels[v]); gp = load(labels[l]); if gp < l:
-//   atomic_min(labels[v], gp); *changed = 1.
+// One batch, a single pass each (no rounds): mg_iota_u32 (labels[i] = i),
+// mg_wcc_sample, mg_wcc_snapshot, mg_wcc_link, mg_wcc_compress. labels is
+// a union-find parent array with labels[x] <= x at all times, so each tree
+// is rooted at its component's minimum canonical id, and vertex 0's tree
+// (the "giant set") at 0. labels is accessed only atomically (relaxed) by
+// sample and link, which write it, and with plain loads by snapshot and
+// compress, which only read it. roots ends holding the final labels.
+// mg_wcc_sample — grid ceil(count / MG_TG_SIZE)
+//   b0 MGWccParams (count = V - n_zero: canonical ids with out-degree >= 1)
+//   b1 row_off; b2 col_idx; b3 labels (atomic_uint, V)
+//   thread v links v with its first MG_WCC_SAMPLE_EDGES OUT neighbors.
+// mg_wcc_snapshot — grid ceil(V / MG_TG_SIZE); SIMD width a multiple of 32
+//   b0 MGWccParams (count = V); b1 labels (const uint, V);
+//   b2 roots (uint, V); b3 giant (uint, ceil(V/32))
+//   r = root(v) (plain walk); roots[v] = r unless r == 0; giant bit v =
+//   (r == 0), each word written whole from one simd_ballot.
+// mg_wcc_link — grid MGWccLinkParams ranges of MG_TG_SIZE threads; per bin
+// the gather variants' mapping (huge tile / high vertex: one threadgroup,
+// mid: one simdgroup, low: one thread).
+//   b0 MGWccLinkParams (flags MG_WCC_SKIP_TWINS | MG_WCC_SKIP_GIANT for
+//   undirected graphs); b1 tile_owner; b2 tile_first_edge; b3 wl_huge;
+//   b4 wl_high; b5 wl_mid; b6 wl_low; b7 row_off; b8 col_idx;
+//   b9 roots (const uint, V); b10 giant (const uint); b11 labels
+//   (atomic_uint, V). roots and giant are the read-only snapshot here.
+//   For each edge (v,u): skip when both are in the giant set (bitmap
+//   probes) or roots[u] == roots[v] (already one set). Otherwise rv =
+//   find(rv), ru = find(snapshot root of u) (relaxed atomic parent loads;
+//   path halving atomically stores a grandparent into non-roots); if
+//   ru != rv: CAS(labels[max], expected = max, desired = min) — succeeds
+//   only while max is still a root; on failure re-find and retry.
+//   Undirected: giant-set vertices are not scanned (their edges to other
+//   sets are linked from the other endpoint), and an edge between two
+//   scanned vertices only from its (v, u > v) copy.
+// mg_wcc_compress — grid ceil(V / MG_TG_SIZE)
+//   b0 MGWccParams (count = V); b1 labels (const uint, V);
+//   b2 giant (const uint); b3 roots (uint, V)
+//   roots[v] = 0 for the giant set, else the root of roots[v] (plain
+//   walk); each thread reads and writes only roots[v].
 //
 // ======================= top-k select (select.metal) ========================
 // GPU radix-select (plan M3, behind the same API as the CPU oracle): per
@@ -485,10 +545,19 @@ typedef struct MGScanParams {
 // selection oracle wholesale. The candidate SET is deterministic (append
 // order is not; the host sort restores full output determinism).
 //
-// mg_topk_threshold_b — grid: exactly MG_PPR_TILE tgs of MG_TG_SIZE
-//   b0 MGTopkParams (k <= v_count required)
-//   b1 rank_b     (const float, V*TILE)  final tile state
-//   b2 thresholds (uint32, TILE)  raw bit pattern of the k-th largest score
+// Threshold = 4 passes (pass = 0..3) of mg_topk_hist_b then mg_topk_digit_b
+// in one encoder; the host zeroes hist and thresholds and sets
+// select_state = {remaining[TILE] = k, class_size[TILE] = V} first.
+// mg_topk_hist_b — grid: any number of tgs of MG_TG_SIZE (grid-stride)
+//   b0 MGTopkParams (pass); b1 rank_b (const float4, V*TILE/4)
+//   b2 thresholds (const uint32, TILE)  prefix decided by earlier passes
+//   b3 hist (atomic_uint, TILE*256)  += per-lane counts of digits 1..255
+// mg_topk_digit_b — grid: exactly 1 tg of MG_TG_SIZE
+//   b0 MGTopkParams (k <= v_count required; pass)
+//   b1 hist (atomic_uint, TILE*256)  read, then zeroed for the next pass
+//   b2 thresholds (uint32, TILE)  |= the selected digit of this pass;
+//      after pass 3 the raw bit pattern of the k-th largest score
+//   b3 select_state (uint32, 2*TILE)  remaining rank, then class size
 // mg_topk_compact_b — grid: ceil(V / MG_TG_SIZE), thread per vertex
 //   b0 MGTopkParams
 //   b1 rank_b; b2 thresholds (const uint32)

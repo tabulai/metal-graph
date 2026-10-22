@@ -9,21 +9,20 @@
 #include <vector>
 
 #include "../algos.hpp"
+#include "cpu_gather.hpp"
 
 namespace mg::cpu {
 namespace {
 
-void gather(const Orientation& o, const double* input, double* output,
-            uint32_t v_count) {
+// output[v] = sum of input over v's stored edges (unweighted), on the
+// orientation's edge-balanced plan (dynamically claimed items; huge rows as
+// fixed tiles summed in slot order). tile_part: scratch of n_slots doubles.
+void gather(const Orientation& o, const CpuGatherPlan& plan,
+            const double* input, double* output, double* tile_part) {
   const uint32_t* row = o.row_offsets->as<uint32_t>();
   const uint32_t* col = o.col_indices->as<uint32_t>();
-  parallel_for(v_count, [&](std::size_t begin, std::size_t end) {
-    for (std::size_t v = begin; v < end; ++v) {
-      double sum = 0.0;
-      for (uint32_t e = row[v]; e < row[v + 1]; ++e) sum += input[col[e]];
-      output[v] = sum;
-    }
-  });
+  plan_gather(plan, row, col, nullptr, input, tile_part, true,
+              [&](uint32_t v, double sum) { output[v] = sum; });
 }
 
 double normalize_l1(double* values, uint32_t count) {
@@ -60,6 +59,10 @@ HitsResult hits(Graph& g, double tol, int max_iter, int audit_interval,
 
   const Orientation& in_o = g.orientation(Dir::in);
   const Orientation& out_o = g.orientation(Dir::out);
+  const CpuGatherPlan& in_plan = g.cpu_gather_plan(Dir::in);
+  const CpuGatherPlan& out_plan = g.cpu_gather_plan(Dir::out);
+  std::vector<double> tile_part(
+      std::max(in_plan.n_slots, out_plan.n_slots));
   std::vector<double> hubs[2] = {
       std::vector<double>(V, 1.0 / static_cast<double>(V)),
       std::vector<double>(V, 0.0)};
@@ -70,9 +73,11 @@ HitsResult hits(Graph& g, double tol, int max_iter, int audit_interval,
   HitsResult result;
   result.stop_reason = StopReason::max_iter;
   while (done < max_iter) {
-    gather(in_o, hubs[cur].data(), authorities.data(), V);
+    gather(in_o, in_plan, hubs[cur].data(), authorities.data(),
+           tile_part.data());
     normalize_l1(authorities.data(), V);
-    gather(out_o, authorities.data(), hubs[cur ^ 1].data(), V);
+    gather(out_o, out_plan, authorities.data(), hubs[cur ^ 1].data(),
+           tile_part.data());
     normalize_l1(hubs[cur ^ 1].data(), V);
     ++done;
 

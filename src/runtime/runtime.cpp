@@ -86,10 +86,12 @@ struct Runtime::Impl {
   std::mutex pso_mutex;
   std::unordered_map<std::string, MTL::ComputePipelineState*> psos;
   std::atomic<int> mode{static_cast<int>(ExecMode::autom)};
+  bool poison_scratch = false;  // MG_DEBUG_POISON_SCRATCH
 };
 
 Runtime::Runtime() : impl_(std::make_unique<Impl>()) {
   Pool pool;
+  impl_->poison_scratch = env_flag("MG_DEBUG_POISON_SCRATCH");
   if (!env_flag("MG_FORCE_CPU"))
     impl_->device = MTL::CreateSystemDefaultDevice();
   if (!impl_->device) {
@@ -189,7 +191,19 @@ uint32_t Runtime::exec_width(MTL::ComputePipelineState* p) const {
 }
 
 BufferPtr Runtime::alloc(std::size_t bytes, const char* label) {
+  return make_buffer(bytes, label, /*zero=*/true);
+}
+
+BufferPtr Runtime::alloc_scratch(std::size_t bytes, const char* label) {
+  return make_buffer(bytes, label, /*zero=*/false);
+}
+
+BufferPtr Runtime::make_buffer(std::size_t bytes, const char* label,
+                               bool zero) {
   const std::size_t n = bytes < 4 ? 4 : bytes;  // Metal rejects 0-byte buffers
+  // Debug: all-ones scratch (NaN as floats) exposes reads of unwritten
+  // elements, which fresh, almost always zeroed pages would hide.
+  const bool poison = !zero && impl_->poison_scratch;
   if (impl_->device) {
     Pool pool;
     MTL::Buffer* b =
@@ -200,14 +214,16 @@ BufferPtr Runtime::alloc(std::size_t bytes, const char* label) {
                       (label ? label : "(unlabeled)"));
     if (label)
       b->setLabel(NS::String::string(label, NS::UTF8StringEncoding));
-    std::memset(b->contents(), 0, n);  // zero-init is contractual
+    if (zero) std::memset(b->contents(), 0, n);  // alloc(): contractual
+    if (poison) std::memset(b->contents(), 0xFF, n);
     return std::make_shared<MetalBuffer>(b, n);
   }
-  void* p = std::calloc(1, n);
+  void* p = zero ? std::calloc(1, n) : std::malloc(n);
   if (!p)
     throw Error(ErrorCode::out_of_memory,
                 std::string("host allocation failed: ") +
                     (label ? label : "(unlabeled)"));
+  if (poison) std::memset(p, 0xFF, n);
   return std::make_shared<HeapBuffer>(p, n);
 }
 
@@ -221,7 +237,7 @@ ExecMode Runtime::mode() const {
   return static_cast<ExecMode>(impl_->mode.load(std::memory_order_relaxed));
 }
 
-ExecPath Runtime::plan(uint64_t stored_edges) const {
+ExecPath Runtime::plan(uint64_t stored_edges, PlanOp op) const {
   const ExecMode m = mode();
   if (m == ExecMode::gpu) {
     if (!has_gpu())
@@ -230,13 +246,48 @@ ExecPath Runtime::plan(uint64_t stored_edges) const {
     return ExecPath::gpu;
   }
   if (m == ExecMode::cpu) return ExecPath::cpu;
-  return (has_gpu() && stored_edges >= e_gpu_min()) ? ExecPath::gpu
-                                                    : ExecPath::cpu;
+  return (has_gpu() && stored_edges >= e_gpu_min(op)) ? ExecPath::gpu
+                                                      : ExecPath::cpu;
 }
 
-uint64_t Runtime::e_gpu_min() const {
-  long v = env_long("MG_E_GPU_MIN", 1000000);
-  return v < 0 ? 0 : static_cast<uint64_t>(v);
+namespace {
+
+// Set-and-parsable integer env var -> true (negative clamps to 0).
+bool env_threshold(const char* name, uint64_t& out) {
+  const char* v = std::getenv(name);
+  if (!v || !*v) return false;
+  char* end = nullptr;
+  const long long r = std::strtoll(v, &end, 10);
+  if (!end || *end != '\0') return false;
+  out = r < 0 ? 0 : static_cast<uint64_t>(r);
+  return true;
+}
+
+}  // namespace
+
+uint64_t Runtime::e_gpu_min(PlanOp op) const {
+  constexpr uint64_t kNever = std::numeric_limits<uint64_t>::max();
+  const char* op_env = nullptr;
+  uint64_t def = 1000000;
+  switch (op) {
+    // Keep the existing CPU fp64 range in auto mode. Lower thresholds
+    // are an explicit opt-in to the GPU's fp32 arithmetic, not a default
+    // optimization with equivalent precision. On the persistent CPU pool,
+    // fp64 PageRank/HITS calls at default tolerance also beat the GPU's
+    // per-call latency below 1M stored edges (M4 Max); the GPU only pulls
+    // ahead under sustained load with tight tolerances.
+    case PlanOp::pagerank: op_env = "MG_E_GPU_MIN_PAGERANK"; break;
+    case PlanOp::hits:     op_env = "MG_E_GPU_MIN_HITS";     break;
+    case PlanOp::ppr:      op_env = "MG_E_GPU_MIN_PPR";      break;
+    case PlanOp::bfs:      op_env = "MG_E_GPU_MIN_BFS";      break;
+    case PlanOp::wcc:      op_env = "MG_E_GPU_MIN_WCC";      break;
+    case PlanOp::khop:     op_env = "MG_E_GPU_MIN_KHOP";     def = kNever; break;
+    case PlanOp::generic:  break;
+  }
+  uint64_t v = 0;
+  if (op_env && env_threshold(op_env, v)) return v;  // per-op override
+  if (env_threshold("MG_E_GPU_MIN", v)) return v;    // global override
+  return def;
 }
 
 void Runtime::record_run(const RunInfo& info) { t_last_run = info; }

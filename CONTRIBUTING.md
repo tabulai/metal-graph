@@ -100,7 +100,8 @@ cmake --install build/c-api --prefix build/prefix
 ```
 
 This installs `include/mg.h`, `lib/libmetalgraph.dylib`, and license notices.
-The C smoke test and exported-symbol allowlist run through CTest.
+The C smoke test, the CPU worker-pool stress test, and the exported-symbol
+allowlist run through CTest.
 
 HITS keeps its existing output arrays and return status: reaching `max_iter`
 still returns `MG_OK` with the current scores. Read its convergence metadata

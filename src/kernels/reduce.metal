@@ -34,6 +34,24 @@ kernel void mg_pr_dangling_partials(
   if (tid == 0u) partials[tg_id] = total;
 }
 
+// partials[tg] = sum of values[gid] over this threadgroup: the list sum
+// above over the identity list, without reading a list (HITS norms).
+kernel void mg_sum_partials(
+    constant MGPrParams& p     [[buffer(0)]],
+    device const float* values [[buffer(1)]],
+    device float* partials     [[buffer(2)]],
+    uint gid        [[thread_position_in_grid]],
+    uint tg_id      [[threadgroup_position_in_grid]],
+    uint tid        [[thread_index_in_threadgroup]],
+    ushort sg_in_tg [[simdgroup_index_in_threadgroup]],
+    ushort lane     [[thread_index_in_simdgroup]],
+    ushort sgs_per_tg [[simdgroups_per_threadgroup]]) {
+  const float x = (gid < p.count) ? values[gid] : 0.0f;
+  threadgroup float scratch[MG_TG_SCRATCH];
+  const float total = mg_tg_reduce_sum(x, scratch, sg_in_tg, lane, sgs_per_tg);
+  if (tid == 0u) partials[tg_id] = total;
+}
+
 // partials[tg] = sum of |rank_a - rank_b| over this threadgroup.
 kernel void mg_pr_residual_partials(
     constant MGPrParams& p     [[buffer(0)]],

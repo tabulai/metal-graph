@@ -25,6 +25,11 @@
 //   converged lanes at audit boundaries. Selection: top-k by score, ties
 //   broken by ascending USER index; if k > V, rows are padded with
 //   id = -1 / score = 0.
+//   Latency path (auto/CPU modes, per query; MG_PPR_SPARSE_MAX_VERTICES /
+//   _EDGES, 0 disables): when the seeds' OUT-reach fits the caps, the
+//   query is solved exactly on that set by cpu::ppr_topk_sparse
+//   (bit-identical to the dense CPU path); other rows take the planned
+//   path. Telemetry path is cpu iff every row took the latency path.
 //
 // BFS: multi-source, unit depth. direction: out = follow edges as stored,
 //   in = reverse orientation, both = treat edges as undirected (union of
@@ -42,7 +47,7 @@
 //   sorting. Outputs sorted ascending: vs by user index, es by input edge id.
 //
 // WCC: undirected connected components over the stored edges (directed
-//   edges treated as undirected by hooking both endpoints). Output:
+//   edges treated as undirected by uniting both endpoints). Output:
 //   comp[user_idx] = component id; components numbered by first occurrence
 //   in USER index order (canonical-partition semantics).
 //
@@ -159,8 +164,8 @@ int hits(Graph& g, const HitsOpts& o, float* out_hubs,
 // ---------------------------------------------------------------------------
 // CPU implementations (threaded; oracles + planner fallback).
 // They operate in CANONICAL space and entry points translate, except the
-// explicitly named bfs_sparse_user latency path, which writes USER order
-// directly to avoid a dense boundary scatter.
+// explicitly named bfs_user and bfs_sparse_user paths, which write USER
+// order directly to avoid a separate dense boundary scatter.
 // pvec_canon: normalized teleport vector in canonical order (always dense
 // here; length V). rank_canon out is canonical order.
 // ---------------------------------------------------------------------------
@@ -179,13 +184,43 @@ int pagerank(Graph& g, const double* pvec_canon, double alpha, double tol,
 // duration of the call. Queries run in parallel, so the sink may be called
 // CONCURRENTLY for DISTINCT q (never twice for the same q); it must be safe
 // under that concurrency. Never called when V == 0 or n_queries == 0.
+// Optional pre(q) runs in q's worker before its dense solve (same
+// concurrency rules as sink); a result >= 0 means q was answered elsewhere
+// with that many iterations, so neither the dense solve nor sink runs for q.
 int ppr(Graph& g, const uint32_t* seeds_canon, const float* seed_w,
         const uint64_t* offsets, uint32_t n_queries, double alpha, double tol,
         int max_iter, int audit_interval,
-        const std::function<void(uint32_t, const double*)>& sink);
+        const std::function<void(uint32_t, const double*)>& sink,
+        const std::function<int(uint32_t)>& pre = nullptr);
+
+// Bounded-reach exact PPR + top-k for ONE query (auto/CPU latency path of
+// ppr_topk). First collects the seeds' OUT-reach R (closed under out-edges,
+// so every vertex outside R has rank exactly 0 at every iteration); if R
+// fits max_vertices / max_edges (scanned out-edges), runs the cpu::ppr fp64
+// iteration restricted to R with the same audit rule, then writes the top-k
+// row (score desc, ties by ascending USER index; zero-score vertices inside
+// and outside R form one ascending-user pool; -1/0 padding when k > V).
+// Summation orders reproduce cpu::ppr, including its fixed tiles of huge
+// IN rows (located via g.cpu_in_tile_keys()), so the row and the iteration
+// count are bit-identical to the dense CPU path. Seeds as passed to
+// cpu::ppr (canonical, deduped). Returns iterations, or -1 (outputs
+// untouched) when the reach exceeds a cap. Serial and non-throwing once
+// g.cpu_in_tile_keys() is built: safe to run one query per worker thread.
+// Limits must be positive.
+int ppr_topk_sparse(Graph& g, const uint32_t* seeds_canon,
+                    const float* seed_w, uint32_t n_seeds, double alpha,
+                    double tol, int max_iter, int audit_interval,
+                    uint32_t max_vertices, uint64_t max_edges, uint32_t k,
+                    int32_t* out_ids, float* out_scores);
 
 int bfs(Graph& g, const uint32_t* sources_canon, uint32_t n_sources,
         BfsDir dir, int32_t* dist_canon, int32_t* parent_canon);
+
+// Same threaded traversal with USER-order outputs. The final gather reads
+// atomic distances and canonical parents directly, without a dense
+// canonical distance intermediate. Sources remain canonical indices.
+int bfs_user(Graph& g, const uint32_t* sources_canon, uint32_t n_sources,
+             BfsDir dir, int32_t* dist_user, int32_t* parent_user);
 
 // Serial, sparse-collecting BFS for the sparse-output API: appends each
 // reached vertex (USER index, incl. sources) with its dist/parent to the
@@ -213,13 +248,18 @@ int bfs_sparse_user(Graph& g, const uint32_t* sources_canon,
                     int32_t* parent_user);
 
 // Truncated multi-source BFS honoring caps; returns reached canonical ids
-// in discovery order (deterministic: level by level; when max_vertices
-// binds mid-level, candidates are admitted in ascending USER index order).
+// level by level (the reached SET is deterministic; order within a level is
+// unspecified); when max_vertices binds mid-level, candidates are admitted
+// in ascending USER index order.
 std::vector<uint32_t> khop_vertices(Graph& g, const uint32_t* seeds_canon,
                                     uint32_t n_seeds, uint32_t k, BfsDir dir,
                                     uint32_t max_vertices);
 
-int wcc(Graph& g, uint32_t* labels_canon);  // labels = canonical min-id per comp
+// labels = canonical min-id per comp; returns the component count. Lock-free
+// parallel union-find (Afforest skip on undirected storage only); the serial
+// oracle runs for MG_THREADS=1 or stored edges < MG_WCC_CPU_PAR_MIN_EDGES.
+// Both produce identical labels.
+int wcc(Graph& g, uint32_t* labels_canon);
 
 HitsResult hits(Graph& g, double tol, int max_iter, int audit_interval,
                 double* hubs_canon, double* authorities_canon);
@@ -233,6 +273,8 @@ namespace gpu {
 int pagerank(Graph& g, const double* pvec_canon, double alpha, double tol,
              int max_iter, int audit_interval, double* rank_canon);
 
+// Seeds as for cpu::ppr: canonical and DEDUPED per query (the GPU seed
+// init and scatter write each seed's slot with plain stores).
 // sink(q, rank_canon) is invoked exactly once per query with that query's
 // FINAL fp32 dense rank vector (canonical order, length V), deinterleaved
 // from tile state as each tile completes. Calls are SEQUENTIAL (driver
@@ -250,12 +292,9 @@ int bfs(Graph& g, const uint32_t* sources_canon, uint32_t n_sources,
         BfsDir dir, int32_t* dist_canon, int32_t* parent_canon,
         uint32_t max_levels = 0);
 
-// Induced-edge extraction on GPU given the reached set (bitmap built by
-// caller); returns original input edge ids, unsorted.
-std::vector<uint32_t> khop_edges(Graph& g,
-                                 const std::vector<uint32_t>& reached_canon);
-
-int wcc(Graph& g, uint32_t* labels_canon);
+// Same labels as cpu::wcc (requires V > 0), returned in the shared buffer
+// the GPU wrote (uint32, V) so the caller reads them without a host copy.
+BufferPtr wcc(Graph& g);
 
 HitsResult hits(Graph& g, double tol, int max_iter, int audit_interval,
                 double* hubs_canon, double* authorities_canon);

@@ -1,5 +1,5 @@
 // frontier.metal — GPU-resident BFS machinery (level protocol of
-// mg_params.h) and k-hop induced-edge extraction.
+// mg_params.h); k-hop reuses it for vertex discovery.
 // Binding tables and level protocol: src/kernels/mg_params.h (authoritative).
 // SPDX-License-Identifier: Apache-2.0
 
@@ -43,6 +43,7 @@ kernel void mg_bfs_prepare_level(
   atomic_store_explicit(&ctl.next_count, 0u, memory_order_relaxed);
   if (fc == 0u) ctl.done = 1u;
   ctl.level += 1u;
+  atomic_store_explicit(&ctl.max_high_deg, 0u, memory_order_relaxed);
   atomic_store_explicit(&ctl.bin_count_high, 0u, memory_order_relaxed);
   atomic_store_explicit(&ctl.bin_count_mid, 0u, memory_order_relaxed);
   atomic_store_explicit(&ctl.bin_count_low, 0u, memory_order_relaxed);
@@ -55,7 +56,8 @@ kernel void mg_bfs_prepare_level(
 }
 
 // Indirect ARG_BIN. Thread i < frontier_count bins frontier[i] by degree
-// and accumulates frontier_edges. Must no-op entirely when done == 1.
+// and accumulates frontier_edges (and max_high_deg over the high bin).
+// Must no-op entirely when done == 1.
 // Degree-0 frontier vertices have nothing to expand and are not binned.
 kernel void mg_bfs_frontier_bin(
     MG_BFS_BUFFERS,
@@ -68,6 +70,7 @@ kernel void mg_bfs_frontier_bin(
     const uint i =
         atomic_fetch_add_explicit(&ctl.bin_count_high, 1u, memory_order_relaxed);
     bins[i] = v;
+    atomic_fetch_max_explicit(&ctl.max_high_deg, d, memory_order_relaxed);
   } else if (d >= MG_BIN_MID_MIN) {
     const uint i =
         atomic_fetch_add_explicit(&ctl.bin_count_mid, 1u, memory_order_relaxed);
@@ -83,7 +86,8 @@ kernel void mg_bfs_frontier_bin(
 
 // One threadgroup; thread 0 picks the traversal mode and writes the
 // expand/bottom-up indirect args ({tgX, 1, 1}; tgX = 0 for unused paths
-// and for everything when done).
+// and for everything when done). The top-down high-bin slot is 2D:
+// {bin_count_high, high_split, 1} (see mg_bfs_expand_tg).
 kernel void mg_bfs_decide(
     MG_BFS_BUFFERS,
     uint tid [[thread_index_in_threadgroup]]) {
@@ -120,8 +124,20 @@ kernel void mg_bfs_decide(
   const uint bl =
       atomic_load_explicit(&ctl.bin_count_low, memory_order_relaxed);
   const bool td = (mode == MG_BFS_MODE_TOPDOWN);
+  // High-bin split: each high vertex's edge range is cut into K slices,
+  // one threadgroup each, so a lone mega-hub frontier vertex no longer
+  // serializes on one threadgroup. K = min(ceil(max_high_deg / 1024),
+  // max(1, MG_BFS_HIGH_SPLIT_TARGET_TGS / bin_count_high), high_split_max):
+  // slices of >= ~1024 edges, and wide high bins (which already fill the
+  // GPU) stay at K = 1.
+  const uint md =
+      atomic_load_explicit(&ctl.max_high_deg, memory_order_relaxed);
+  uint ks = min((md + MG_BIN_HIGH_MIN - 1u) / MG_BIN_HIGH_MIN,
+                max(1u, MG_BFS_HIGH_SPLIT_TARGET_TGS / max(1u, bh)));
+  ks = max(1u, min(ks, max(1u, prm.high_split_max)));
+  ctl.high_split = ks;
   args[MG_BFS_ARG_EXPAND_TG * 3u + 0u] = td ? bh : 0u;
-  args[MG_BFS_ARG_EXPAND_TG * 3u + 1u] = 1u;
+  args[MG_BFS_ARG_EXPAND_TG * 3u + 1u] = td ? ks : 1u;
   args[MG_BFS_ARG_EXPAND_TG * 3u + 2u] = 1u;
   args[MG_BFS_ARG_EXPAND_SG * 3u + 0u] =
       td ? (bm + prm.sgs_per_tg - 1u) / prm.sgs_per_tg : 0u;
@@ -141,20 +157,31 @@ kernel void mg_bfs_decide(
 // Top-down expansion (claim via visited bitmap, append via simd compaction)
 // ---------------------------------------------------------------------------
 
-// High bin: one threadgroup per vertex; edge loop strided by
+// High bin: 2D grid {bin_count_high, high_split}. Threadgroup (x, y)
+// expands slice y of vertex bins[x]'s edge range (slices of
+// ceil(deg / high_split) edges rounded up to a tg_size multiple; trailing
+// slices of lower-degree vertices are empty); edge loop strided by
 // threads_per_threadgroup; each simdgroup compacts its own discoveries.
 kernel void mg_bfs_expand_tg(
     MG_BFS_BUFFERS,
-    uint tg_id   [[threadgroup_position_in_grid]],
+    uint2 tg_pos [[threadgroup_position_in_grid]],
     uint tid     [[thread_index_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]],
+    uint2 tg_dim [[threads_per_threadgroup]],
     ushort lane  [[thread_index_in_simdgroup]]) {
+  const uint tg_size = tg_dim.x;
   const uint n =
       atomic_load_explicit(&ctl.bin_count_high, memory_order_relaxed);
-  if (tg_id >= n) return;  // threadgroup-uniform
-  const uint v = bins[tg_id];
+  if (tg_pos.x >= n) return;  // threadgroup-uniform
+  const uint v = bins[tg_pos.x];
   const mg_i32 lvl = (mg_i32)ctl.level;
-  const uint start = row_off[v], end = row_off[v + 1u];
+  const uint row_start = row_off[v];
+  const uint deg = row_off[v + 1u] - row_start;
+  const uint ks = max(1u, ctl.high_split);
+  const uint per = ((deg + ks - 1u) / ks + tg_size - 1u) / tg_size * tg_size;
+  const uint off = tg_pos.y * per;
+  if (off >= deg) return;  // threadgroup-uniform (empty slice)
+  const uint start = row_start + off;
+  const uint end = row_start + min(deg, off + per);
   for (uint base_e = start; base_e < end; base_e += tg_size) {
     const uint e = base_e + tid;
     bool discovered = false;
@@ -267,46 +294,4 @@ kernel void mg_bfs_bottomup_probe(
       return;
     }
   }
-}
-
-// ---------------------------------------------------------------------------
-// k-hop induced-edge extraction
-// ---------------------------------------------------------------------------
-
-// counts[i] = #edges (v -> u) with u's reached bit set, v = reached_list[i].
-kernel void mg_khop_count(
-    constant MGKhopParams& p           [[buffer(0)]],
-    device const uint* reached_list    [[buffer(1)]],
-    device const uint* row_off         [[buffer(2)]],
-    device const uint* col_idx         [[buffer(3)]],
-    device const uint* reached_bitmap  [[buffer(4)]],
-    device uint* counts                [[buffer(5)]],
-    uint gid [[thread_position_in_grid]]) {
-  if (gid >= p.n_vertices) return;
-  const uint v = reached_list[gid];
-  const uint end = row_off[v + 1u];
-  uint c = 0u;
-  for (uint e = row_off[v]; e < end; ++e)
-    if (mg_bitmap_test(reached_bitmap, col_idx[e])) ++c;
-  counts[gid] = c;
-}
-
-// Deterministic emit: edges of reached_list[i] land at offsets[i..] in CSR
-// order, reported as original input edge ids via edge_orig.
-kernel void mg_khop_emit(
-    constant MGKhopParams& p          [[buffer(0)]],
-    device const uint* reached_list   [[buffer(1)]],
-    device const uint* row_off        [[buffer(2)]],
-    device const uint* col_idx        [[buffer(3)]],
-    device const uint* reached_bitmap [[buffer(4)]],
-    device const uint* offsets        [[buffer(5)]],
-    device const uint* edge_orig      [[buffer(6)]],
-    device uint* out_edges            [[buffer(7)]],
-    uint gid [[thread_position_in_grid]]) {
-  if (gid >= p.n_vertices) return;
-  const uint v = reached_list[gid];
-  const uint end = row_off[v + 1u];
-  uint o = offsets[gid];
-  for (uint e = row_off[v]; e < end; ++e)
-    if (mg_bitmap_test(reached_bitmap, col_idx[e])) out_edges[o++] = edge_orig[e];
 }

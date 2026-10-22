@@ -9,6 +9,19 @@ from conftest import (ALL_CASES, build_mg, nx_pagerank_array, pr_tolerance,
 
 PPR_KW = dict(alpha=0.85, tol=1e-10, max_iter=500)
 
+# Every CPU-mode fixture query fits the default bounded-reach caps, so the
+# accuracy tests also run with that latency path disabled to keep covering
+# the dense cpu::ppr solve.
+SPARSE_MODES = ["default", "nosparse"]
+
+
+def _apply_sparse_mode(monkeypatch, mode):
+    for name in ("MG_PPR_SPARSE_MAX_VERTICES", "MG_PPR_SPARSE_MAX_EDGES"):
+        if mode == "default":
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, "0")
+
 
 def _pack(queries):
     """queries: list of (seeds, weights) -> (seeds, weights, offsets)."""
@@ -61,9 +74,12 @@ def _check_row(case, nx_scores, mg_ids, mg_scores, k, atol):
                 f"(unambiguous at 10x tolerance)")
 
 
+@pytest.mark.parametrize("sparse_mode", SPARSE_MODES)
 @pytest.mark.parametrize("case_name", ["gnp_dir", "dangling", "adversarial",
                                        "gnp_undir"])
-def test_ppr_topk_matches_networkx(case_name, exec_path, assert_path):
+def test_ppr_topk_matches_networkx(case_name, exec_path, assert_path,
+                                   sparse_mode, monkeypatch):
+    _apply_sparse_mode(monkeypatch, sparse_mode)
     case = ALL_CASES[case_name]
     g = build_mg(case)
     rng = np.random.default_rng(21)
@@ -82,9 +98,12 @@ def test_ppr_topk_matches_networkx(case_name, exec_path, assert_path):
         _check_row(case, nx_scores, ids[q], scores[q], k, atol)
 
 
+@pytest.mark.parametrize("sparse_mode", SPARSE_MODES)
 @pytest.mark.parametrize("batch", [1, 4, 16, 64])
-def test_ppr_topk_batched_equals_sequential(batch, exec_path, assert_path):
+def test_ppr_topk_batched_equals_sequential(batch, exec_path, assert_path,
+                                            sparse_mode, monkeypatch):
     # Batched results are bit-identical to per-query calls on the same path.
+    _apply_sparse_mode(monkeypatch, sparse_mode)
     case = ALL_CASES["gnp_dir"]
     g = build_mg(case)
     rng = np.random.default_rng(batch)

@@ -9,6 +9,74 @@ All notable changes to metal-graph are documented here.
   Callers can distinguish convergence (including on the final allowed
   iteration), an exhausted iteration budget, and empty/edgeless graphs;
   existing score returns and C function signatures are unchanged.
+- Performance: `k_hop` extracts induced edges through a bitmap over input
+  edge ids instead of sorting them, and splits hub rows across CPU threads;
+  `k_hop(as_graph=True)` remaps the subgraph through a dense index. Graph
+  construction and the lazy IN transpose use per-chunk degree histograms,
+  and `Graph.from_edges` factorizes dense integer ids without `np.unique`.
+  CPU PageRank, personalized PageRank and HITS gather over edge-balanced,
+  dynamically scheduled work items. GPU BFS splits high-degree frontier rows
+  across threadgroups (`MG_BFS_HIGH_SPLIT_MAX`), and sparse-output BFS
+  compacts its dense fallback in parallel.
+- Host loops run on a persistent worker pool (spin, then park) instead of
+  starting threads on every call, and size their fan-out by work rather
+  than item count, so small graphs on the CPU path are no longer slower
+  with all threads than with `MG_THREADS=1`. CPU BFS and `k_hop` split
+  large levels into several chunks per thread, claimed one at a time, so
+  efficiency cores no longer hold up a level. CPU WCC uses a lock-free
+  union-find on the pool (with the Afforest giant-component skip on
+  undirected graphs) at or above `MG_WCC_CPU_PAR_MIN_EDGES` stored edges
+  (default 65,536), and the serial oracle below it. Results are unchanged
+  and independent of `MG_THREADS`.
+- GPU WCC replaces its hook/jump rounds with one fixed sequence of
+  concurrent union-find passes in a single command buffer, and accesses
+  union-find parents atomically whenever another thread may write them. A
+  sample pass that links two out-edges per vertex and a snapshot of the
+  resulting roots filter the full link pass: edges inside one snapshot set
+  are skipped with plain loads of the read-only snapshot, undirected graphs
+  skip the giant set's vertices entirely (Afforest), and all degree bins
+  link in one dispatch. Numbering components in user order runs threaded
+  from 131,072 vertices on both the CPU and GPU paths and gives the same ids
+  for every thread count. GPU WCC reports `iterations == 1` in
+  `last_run_info()`, and `MG_WCC_ROUNDS_PER_BATCH` is ignored.
+- GPU PageRank, HITS and `ppr_topk` do less host work per call, with
+  bit-identical scores, iteration counts and convergence telemetry. Scratch
+  buffers the GPU fully overwrites skip the host zero-fill
+  (`MG_DEBUG_POISON_SCRATCH=1` fills them with 0xFF bytes instead, to expose
+  reads of unwritten elements), uniform PageRank, HITS and PPR tile state
+  are initialized on the GPU, results go from the fp32 device buffers
+  straight to user order without fp64 copies, and the per-lane PPR audit
+  vectorizes. The `ppr_topk` GPU top-k threshold is a multi-threadgroup
+  radix select over all lanes of a tile.
+- `ppr_topk` answers each query whose seeds' out-reach fits
+  `MG_PPR_SPARSE_MAX_VERTICES` / `MG_PPR_SPARSE_MAX_EDGES` with an exact fp64
+  solve on that reach, bit-identical to the CPU path: rows with 16,384 or
+  more incoming edges are summed in the dense CPU path's fixed tiles, so
+  both paths keep the same top-k IDs, score bits, and audit iterations even
+  when incoming edges from unreachable vertices cross tile boundaries. In a
+  batch planned for the GPU only the remaining rows run there, so one batch
+  can mix fp64 and fp32 rows; `last_run_info()` reports `path="cpu"` only
+  when every row took the latency path.
+- The auto planner supports per-operation GPU thresholds
+  (`MG_E_GPU_MIN_<OP>` takes precedence over `MG_E_GPU_MIN`, which still
+  applies to every operation). PageRank and HITS retain the original
+  one-million-edge threshold and fp64 CPU arithmetic below it; lower
+  thresholds remain explicit opt-ins to fp32 GPU arithmetic. `k_hop` no
+  longer uses the GPU in auto mode.
+- BFS's serial preflight now defaults to 8,192 vertices / 524,288 scanned
+  edges when an overflowing query would run on the GPU (1,024 / 8,192 when it
+  would run on the threaded CPU), rejects a reach that cannot fit as soon as
+  it is discovered, and rejects oversized seed degrees before initializing
+  dense outputs. CPU BFS gathers dense distances and parents directly into
+  user order, and large directed `direction="both"` frontiers are
+  partitioned by edge count, including individual hub rows.
+- CPU PageRank and PPR, weighted or not, can differ from 0.1.1 in the last
+  float32 bit, and `ppr_topk` can order fp64 near-ties differently on any
+  graph: cpu_pagerank.cpp now has no compiler-chosen fused multiply-adds
+  (including the teleport/dangling term), so the dense and bounded-reach
+  paths round identically. CPU PageRank, PPR and HITS on graphs with rows
+  of 16,384 or more edges also change through tiled fp64 summation.
+  Results remain deterministic for every thread count.
 
 ## 0.1.1 — 2026-09-04
 

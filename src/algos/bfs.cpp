@@ -47,25 +47,58 @@ int bfs(Graph& g, const uint32_t* sources_canon, uint32_t n_sources,
 
 namespace {
 
-// Full (threaded CPU or GPU) traversal in canonical space, translated to
-// dense USER-order outputs — the shared fallback behind both the dense
-// entry and the sparse-output entry.
+// Caps of the bounded serial BFS preflight (auto/CPU modes), shared by the
+// dense and sparse-output entries. The attempt competes with whatever runs
+// when it overflows, so the defaults depend on that fallback:
+//  * GPU: reach, not graph size, decides whether the GPU's fixed launch
+//    floor (~0.7 ms) pays off, so mid-size reaches (a few thousand
+//    vertices, e.g. behind a heavily duplicated hub adjacency) finish
+//    serially: 8192 vertices / 524288 scanned edges.
+//  * threaded CPU: that path has no launch floor and beats the serial walk
+//    on mid-size dense reaches (10-60% on 4k-8k-vertex graphs), so the
+//    tight 1024 / 8192 caps stay.
+// MG_BFS_SPARSE_MAX_VERTICES / MG_BFS_SPARSE_MAX_EDGES override both
+// (0 disables). Returns false when the preflight is disabled.
+bool sparse_caps(ExecPath fallback, uint32_t& max_vertices,
+                 uint64_t& max_edges) {
+  const bool gpu = fallback == ExecPath::gpu;
+  const long v = env_long("MG_BFS_SPARSE_MAX_VERTICES", gpu ? 8192 : 1024);
+  const long e = env_long("MG_BFS_SPARSE_MAX_EDGES", gpu ? 524288 : 8192);
+  if (v <= 0 || e <= 0) return false;
+  max_vertices = static_cast<uint32_t>(
+      std::min<long>(v, std::numeric_limits<uint32_t>::max()));
+  max_edges = static_cast<uint64_t>(e);
+  return true;
+}
+
+// Full (threaded CPU or GPU) traversal in canonical space — the shared
+// fallback behind both the dense entry and the sparse-output entry.
+int run_dense_canon(Graph& g, const std::vector<uint32_t>& src_canon,
+                    BfsDir dir, ExecPath path, std::vector<int32_t>& dist_c,
+                    std::vector<int32_t>& parent_c) {
+  const uint32_t V = g.V;
+  dist_c.assign(V, -1);
+  parent_c.assign(V, -1);
+  if (V == 0) return 0;
+  if (path == ExecPath::gpu)
+    return gpu::bfs(g, src_canon.data(),
+                    static_cast<uint32_t>(src_canon.size()), dir,
+                    dist_c.data(), parent_c.data(), 0);
+  return cpu::bfs(g, src_canon.data(), static_cast<uint32_t>(src_canon.size()),
+                  dir, dist_c.data(), parent_c.data());
+}
+
+// Dense traversal translated to dense USER-order outputs.
 int run_dense_user(Graph& g, const std::vector<uint32_t>& src_canon,
                    BfsDir dir, ExecPath path, int32_t* out_dist,
                    int32_t* out_parent) {
+  if (path == ExecPath::cpu)
+    return cpu::bfs_user(g, src_canon.data(),
+                         static_cast<uint32_t>(src_canon.size()), dir,
+                         out_dist, out_parent);
   const uint32_t V = g.V;
-  int levels = 0;
-  std::vector<int32_t> dist_c(V, -1), parent_c(V, -1);
-  if (V > 0) {
-    if (path == ExecPath::gpu)
-      levels = gpu::bfs(g, src_canon.data(),
-                        static_cast<uint32_t>(src_canon.size()), dir,
-                        dist_c.data(), parent_c.data(), 0);
-    else
-      levels = cpu::bfs(g, src_canon.data(),
-                        static_cast<uint32_t>(src_canon.size()), dir,
-                        dist_c.data(), parent_c.data());
-  }
+  std::vector<int32_t> dist_c, parent_c;
+  const int levels = run_dense_canon(g, src_canon, dir, path, dist_c, parent_c);
   parallel_for(V, [&](std::size_t b, std::size_t e) {
     for (std::size_t u = b; u < e; ++u) {
       const uint32_t c = g.canon_of_user[u];
@@ -87,7 +120,7 @@ int bfs(Graph& g, const uint32_t* sources, uint32_t n_sources, BfsDir dir,
   std::vector<uint32_t> src_canon =
       boundary::to_canon(g, sources, n_sources, "bfs sources");
 
-  ExecPath path = rt.plan(g.stored_edges());
+  ExecPath path = rt.plan(g.stored_edges(), PlanOp::bfs);
   if (dir == BfsDir::both && g.directed)
     path = ExecPath::cpu;  // documented v0.1 routing (see gpu::bfs)
 
@@ -100,15 +133,10 @@ int bfs(Graph& g, const uint32_t* sources, uint32_t n_sources, BfsDir dir,
   // try a tightly bounded serial traversal that writes USER-order outputs
   // directly. Dense outputs still preserve the public BFS contract. Forced
   // GPU mode remains an exact opt-out for testing and benchmarking kernels.
-  const long sparse_vertices =
-      env_long("MG_BFS_SPARSE_MAX_VERTICES", 1024);
-  const long sparse_edges = env_long("MG_BFS_SPARSE_MAX_EDGES", 8192);
-  if (V > 0 && rt.mode() != ExecMode::gpu && sparse_vertices > 0 &&
-      sparse_edges > 0) {
-    const uint32_t vertex_cap = static_cast<uint32_t>(
-        std::min<long>(sparse_vertices,
-                       static_cast<long>(std::numeric_limits<uint32_t>::max())));
-    const uint64_t edge_cap = static_cast<uint64_t>(sparse_edges);
+  uint32_t vertex_cap = 0;
+  uint64_t edge_cap = 0;
+  if (V > 0 && rt.mode() != ExecMode::gpu &&
+      sparse_caps(path, vertex_cap, edge_cap)) {
     const int sparse_levels = cpu::bfs_sparse_user(
         g, src_canon.data(), static_cast<uint32_t>(src_canon.size()), dir,
         vertex_cap, edge_cap, out_dist, out_parent);
@@ -142,7 +170,7 @@ int bfs_sparse(Graph& g, const uint32_t* sources, uint32_t n_sources,
   std::vector<uint32_t> src_canon =
       boundary::to_canon(g, sources, n_sources, "bfs sources");
 
-  ExecPath path = rt.plan(g.stored_edges());
+  ExecPath path = rt.plan(g.stored_edges(), PlanOp::bfs);
   if (dir == BfsDir::both && g.directed)
     path = ExecPath::cpu;  // documented v0.1 routing (see gpu::bfs)
 
@@ -156,17 +184,13 @@ int bfs_sparse(Graph& g, const uint32_t* sources, uint32_t n_sources,
   // Same bounded serial attempt (and the same opt-outs) as the dense
   // preflight — but collecting O(|reached|) output directly, which is the
   // entire point of this API: a tiny traversal never touches O(V) memory.
-  const long sparse_vertices = env_long("MG_BFS_SPARSE_MAX_VERTICES", 1024);
-  const long sparse_edges = env_long("MG_BFS_SPARSE_MAX_EDGES", 8192);
-  if (V > 0 && rt.mode() != ExecMode::gpu && sparse_vertices > 0 &&
-      sparse_edges > 0) {
-    const uint32_t vertex_cap = static_cast<uint32_t>(std::min<long>(
-        sparse_vertices,
-        static_cast<long>(std::numeric_limits<uint32_t>::max())));
+  uint32_t vertex_cap = 0;
+  uint64_t edge_cap = 0;
+  if (V > 0 && rt.mode() != ExecMode::gpu &&
+      sparse_caps(path, vertex_cap, edge_cap)) {
     const int r = cpu::bfs_sparse_collect(
         g, src_canon.data(), static_cast<uint32_t>(src_canon.size()), dir,
-        vertex_cap, static_cast<uint64_t>(sparse_edges), out.vertices,
-        out.dist, out.parent);
+        vertex_cap, edge_cap, out.vertices, out.dist, out.parent);
     if (r >= 0) {
       levels = r;
       path = ExecPath::cpu;
@@ -197,23 +221,66 @@ int bfs_sparse(Graph& g, const uint32_t* sources, uint32_t n_sources,
   }
 
   if (!collected && V > 0) {
-    // Cap overflow or forced GPU: run the full machinery densely, then
-    // compact — naturally ascending in user order.
-    std::vector<int32_t> dist_u(V), parent_u(V);
-    levels = run_dense_user(g, src_canon, dir, path, dist_u.data(),
-                            parent_u.data());
-    std::size_t reached = 0;
-    for (uint32_t u = 0; u < V; ++u) reached += (dist_u[u] >= 0);
-    out.vertices.reserve(reached);
-    out.dist.reserve(reached);
-    out.parent.reserve(reached);
-    for (uint32_t u = 0; u < V; ++u) {
-      if (dist_u[u] >= 0) {
-        out.vertices.push_back(u);
-        out.dist.push_back(dist_u[u]);
-        out.parent.push_back(parent_u[u]);
-      }
-    }
+    // Cap overflow or forced GPU: run the full machinery densely in
+    // canonical space, then compact straight into USER order (no dense
+    // USER-order intermediate). Two passes over fixed USER-index chunks —
+    // per-chunk reached counts, an exclusive prefix, one resize, then each
+    // chunk fills its own slice — so the output is ascending in user order
+    // and independent of the thread count (chunking depends only on V).
+    std::vector<int32_t> dist_c, parent_c;
+    levels = run_dense_canon(g, src_canon, dir, path, dist_c, parent_c);
+    const uint32_t* cou = g.canon_of_user.data();
+    const int32_t* dc = dist_c.data();
+    const int32_t* pc = parent_c.data();
+    constexpr std::size_t kChunk = 16384;  // user indices per chunk
+    const std::size_t nchunks =
+        (static_cast<std::size_t>(V) + kChunk - 1) / kChunk;
+    // Handing chunks to other threads only pays off once the two O(V)
+    // gathers are large; below the threshold run both inline (measured on
+    // the persistent pool: serial wins at V=2^15, parallel from V=2^16).
+    constexpr std::size_t kParMinV = std::size_t{1} << 16;
+    const std::size_t pgrain = V >= kParMinV ? 1 : nchunks;
+    std::vector<std::size_t> off(nchunks + 1, 0);
+    parallel_for(
+        nchunks,
+        [&](std::size_t b, std::size_t e) {
+          for (std::size_t c = b; c < e; ++c) {
+            const std::size_t lo = c * kChunk;
+            const std::size_t hi = std::min<std::size_t>(V, lo + kChunk);
+            std::size_t n = 0;
+            for (std::size_t u = lo; u < hi; ++u) n += (dc[cou[u]] >= 0);
+            off[c + 1] = n;
+          }
+        },
+        pgrain);
+    for (std::size_t c = 0; c < nchunks; ++c) off[c + 1] += off[c];
+    const std::size_t reached = off[nchunks];
+    out.vertices.resize(reached);
+    out.dist.resize(reached);
+    out.parent.resize(reached);
+    uint32_t* ov = out.vertices.data();
+    int32_t* od = out.dist.data();
+    int32_t* op = out.parent.data();
+    parallel_for(
+        nchunks,
+        [&](std::size_t b, std::size_t e) {
+          for (std::size_t c = b; c < e; ++c) {
+            const std::size_t lo = c * kChunk;
+            const std::size_t hi = std::min<std::size_t>(V, lo + kChunk);
+            std::size_t w = off[c];
+            for (std::size_t u = lo; u < hi; ++u) {
+              const uint32_t cv = cou[u];
+              const int32_t d = dc[cv];
+              if (d >= 0) {
+                ov[w] = static_cast<uint32_t>(u);
+                od[w] = d;
+                op[w] = boundary::canon_value_to_user(g, pc[cv]);
+                ++w;
+              }
+            }
+          }
+        },
+        pgrain);
   }
 
   const double ms = std::chrono::duration<double, std::milli>(
