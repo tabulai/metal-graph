@@ -1,5 +1,5 @@
-// spmv_engine.cpp — encode PageRank / batched-PPR iterations per the
-// mg_params.h binding tables.
+// spmv_engine.cpp — encode fused single-dispatch PageRank / HITS / batched-PPR
+// iterations (spmv.metal).
 // SPDX-License-Identifier: Apache-2.0
 #include "spmv_engine.hpp"
 
@@ -14,8 +14,37 @@ inline uint32_t tg_count(uint32_t items) {
 }
 
 inline uint32_t sgs_per_tg_of(Runtime& rt, MTL::ComputePipelineState* pso) {
-  uint32_t ew = rt.exec_width(pso);
+  const uint32_t ew = rt.exec_width(pso);
   return ew ? std::max(1u, MG_TG_SIZE / ew) : 8u;
+}
+
+template <class Params>
+uint32_t fill_bin_layout(Params& p, const GpuGatherPlan& plan,
+                         uint32_t sgs_per_tg, bool include_iso) {
+  p.n_tiles = plan.n_tiles;
+  p.n_tiled = plan.n_tiled;
+  p.off_tg = plan.off_tg;
+  p.n_tg = plan.n_tg;
+  p.off_sg32 = plan.off_sg32;
+  p.n_sg32 = plan.n_sg32;
+  p.sg32_tgs = ceil_div_u32(plan.n_sg32, sgs_per_tg);
+  p.off_sg16 = plan.off_sg16;
+  p.n_sg16 = plan.n_sg16;
+  p.sg16_tgs = ceil_div_u32(plan.n_sg16, MG_TG_SIZE / 16u);
+  p.off_sg8 = plan.off_sg8;
+  p.n_sg8 = plan.n_sg8;
+  p.sg8_tgs = ceil_div_u32(plan.n_sg8, MG_TG_SIZE / 8u);
+  p.off_sg4 = plan.off_sg4;
+  p.n_sg4 = plan.n_sg4;
+  p.sg4_tgs = ceil_div_u32(plan.n_sg4, MG_TG_SIZE / 4u);
+  p.off_th = plan.off_th;
+  p.n_th = plan.n_th;
+  p.th_tgs = tg_count(plan.n_th);
+  p.off_zero = plan.off_zact;
+  p.n_zero = plan.n_zact + (include_iso ? plan.n_iso : 0u);
+  p.zero_tgs = tg_count(p.n_zero);
+  return p.n_tiles + p.n_tg + p.sg32_tgs + p.sg16_tgs + p.sg8_tgs + p.sg4_tgs +
+         p.th_tgs + p.zero_tgs;
 }
 
 }  // namespace
@@ -25,154 +54,146 @@ SpmvEngine::SpmvEngine(Runtime& rt, bool weighted, bool uniform_p,
     : rt_(rt) {
   if (!batched) {
     prepare_ = rt.pipeline("mg_pr_prepare");
-    gather_tg_ = rt.pipeline("mg_pr_gather_tg", weighted, uniform_p);
-    gather_sg_ = rt.pipeline("mg_pr_gather_sg", weighted, uniform_p);
-    gather_th_ = rt.pipeline("mg_pr_gather_thread", weighted, uniform_p);
-    zero_fill_ = rt.pipeline("mg_pr_zero_fill", false, uniform_p);
-    huge_partials_ = rt.pipeline("mg_pr_gather_huge_partials", weighted);
-    huge_finalize_ = rt.pipeline("mg_pr_gather_huge_finalize", false,
-                                 uniform_p);
-    sgs_per_tg_ = sgs_per_tg_of(rt, gather_sg_);
+    gather_fused_ = rt.pipeline("mg_pr_gather_fused", weighted, uniform_p);
+    tiled_finalize_ = rt.pipeline("mg_pr_tiled_finalize", false, uniform_p);
+    sgs_per_tg_ = sgs_per_tg_of(rt, gather_fused_);
   } else {
     prepare_b_ = rt.pipeline("mg_pr_prepare_b");
-    gather_tg_b_ = rt.pipeline("mg_pr_gather_tg_b", weighted);
-    gather_sg_b_ = rt.pipeline("mg_pr_gather_sg_b", weighted);
-    gather_th_b_ = rt.pipeline("mg_pr_gather_thread_b", weighted);
-    zero_fill_b_ = rt.pipeline("mg_pr_zero_fill_b");
+    gather_fused_b_ = rt.pipeline("mg_pr_gather_fused_b", weighted);
+    tiled_finalize_b_ = rt.pipeline("mg_pr_tiled_finalize_b");
     seed_scatter_b_ = rt.pipeline("mg_pr_seed_scatter_b");
-    huge_partials_b_ = rt.pipeline("mg_pr_gather_huge_partials_b", weighted);
-    huge_finalize_b_ = rt.pipeline("mg_pr_gather_huge_finalize_b");
-    sgs_per_tg_b_ = sgs_per_tg_of(rt, gather_sg_b_);
+    sgs_per_tg_b_ = sgs_per_tg_of(rt, gather_fused_b_);
   }
 }
 
-Buffer* SpmvEngine::huge_scratch(const Orientation& o, bool batched) {
-  if (!huge_scratch_) {
-    const std::size_t n = std::size_t{o.n_tiles} *
+Buffer* SpmvEngine::tile_scratch(const GpuGatherPlan& plan, bool batched) {
+  if (plan.n_tiles == 0) return rt_.dummy().get();
+  if (!tile_scratch_) {
+    const std::size_t n = std::size_t{plan.n_tiles} *
                           (batched ? MG_PPR_TILE : 1u) * sizeof(float);
-    huge_scratch_ = rt_.alloc(n, "pr.huge_tile_partials");
+    tile_scratch_ = rt_.alloc_scratch(n, "pr.tile_partials");
   }
-  return huge_scratch_.get();
+  return tile_scratch_.get();
 }
 
 void SpmvEngine::encode_iteration(CommandBatch& cb, const Orientation& in_o,
-                                  MGPrParams base, Buffer* rank_cur,
-                                  Buffer* contrib, Buffer* rank_next,
-                                  Buffer* iter_scalars, Buffer* pvec,
-                                  Buffer* out_weight_sum, Buffer* weights) {
-  MGPrParams p = base;
+                                  const GpuGatherPlan& plan, MGPrParams base,
+                                  Buffer* in_buf, Buffer* contrib_scratch,
+                                  Buffer* out_buf, Buffer* iter_scalars,
+                                  Buffer* pvec, Buffer* out_weight_sum,
+                                  Buffer* weights, bool rescale_ows,
+                                  bool include_iso) {
+  Buffer* gather_in = in_buf;
+  if (!rescale_ows) {
+    MGPrParams pp = base;
+    pp.count = base.v_count;
+    cb.dispatch(prepare_, &pp, sizeof(pp),
+                {in_buf, out_weight_sum, contrib_scratch}, tg_count(pp.count),
+                MG_TG_SIZE);
+    gather_in = contrib_scratch;
+  }
 
-  // contrib[v] = ows[v] > 0 ? rank[v] / ows[v] : 0  (over all V)
-  p.count = base.v_count;
-  cb.dispatch(prepare_, &p, sizeof(p), {rank_cur, out_weight_sum, contrib},
-              tg_count(p.count), MG_TG_SIZE);
+  MGFusedPrParams fp{};
+  fp.alpha = base.alpha;
+  fp.one_minus_alpha = base.one_minus_alpha;
+  fp.p_uniform = base.p_uniform;
+  fp.flags = rescale_ows ? MG_PR_FLAG_RESCALE_OWS : 0u;
+  const uint32_t total_tgs =
+      fill_bin_layout(fp, plan, sgs_per_tg_, include_iso);
+  Buffer* partials = tile_scratch(plan, /*batched=*/false);
 
-  encode_prepared_gather(cb, in_o, base, contrib, rank_next, iter_scalars,
-                         pvec, weights);
+  if (total_tgs > 0) {
+    cb.dispatch(gather_fused_, &fp, sizeof(fp),
+                {plan.vertices.get(), plan.tile_owner.get(),
+                 plan.tile_first_edge.get(), in_o.row_offsets.get(),
+                 in_o.col_indices.get(), gather_in, out_buf, out_weight_sum,
+                 iter_scalars, pvec, weights, partials},
+                total_tgs, MG_TG_SIZE);
+  }
+  if (plan.n_tiled > 0) {
+    cb.dispatch(tiled_finalize_, &fp, sizeof(fp),
+                {plan.vertices.get(), plan.tiled_tile_off.get(), partials,
+                 out_buf, out_weight_sum, iter_scalars, pvec},
+                ceil_div_u32(plan.n_tiled, sgs_per_tg_), MG_TG_SIZE);
+  }
 }
 
 void SpmvEngine::encode_prepared_gather(
-    CommandBatch& cb, const Orientation& orientation, MGPrParams base,
-    Buffer* contrib, Buffer* output, Buffer* iter_scalars, Buffer* pvec,
-    Buffer* weights) {
-  MGPrParams p = base;
+    CommandBatch& cb, const Orientation& orientation, const GpuGatherPlan& plan,
+    MGPrParams base, Buffer* input, Buffer* output, Buffer* weights) {
+  Buffer* dummy = rt_.dummy().get();
+  MGFusedPrParams fp{};
+  fp.alpha = base.alpha;
+  fp.one_minus_alpha = base.one_minus_alpha;
+  fp.p_uniform = base.p_uniform;
+  fp.flags = MG_PR_FLAG_RAW_GATHER;
+  const uint32_t total_tgs =
+      fill_bin_layout(fp, plan, sgs_per_tg_, /*include_iso=*/true);
+  Buffer* partials = tile_scratch(plan, /*batched=*/false);
 
-  auto gather = [&](MTL::ComputePipelineState* pso, Buffer* wl, uint32_t n,
-                    uint32_t tgs) {
-    if (n == 0) return;
-    p.count = n;
-    cb.dispatch(pso, &p, sizeof(p),
-                {wl, orientation.row_offsets.get(),
-                 orientation.col_indices.get(), contrib, output, iter_scalars,
-                 pvec, weights},
-                tgs, MG_TG_SIZE);
-  };
-  gather(gather_tg_, orientation.wl_high.get(), orientation.n_high,
-         orientation.n_high);
-  gather(gather_sg_, orientation.wl_mid.get(), orientation.n_mid,
-         ceil_div_u32(orientation.n_mid, sgs_per_tg_));
-  gather(gather_th_, orientation.wl_low.get(), orientation.n_low,
-         tg_count(orientation.n_low));
-
-  if (orientation.n_huge) {
-    Buffer* partials = huge_scratch(orientation, /*batched=*/false);
-    p.count = orientation.n_tiles;
-    cb.dispatch(huge_partials_, &p, sizeof(p),
-                {orientation.tile_owner.get(),
-                 orientation.tile_first_edge.get(),
-                 orientation.wl_huge.get(), orientation.row_offsets.get(),
-                 orientation.col_indices.get(), contrib, weights, partials},
-                orientation.n_tiles, MG_TG_SIZE);
-    p.count = orientation.n_huge;
-    cb.dispatch(huge_finalize_, &p, sizeof(p),
-                {orientation.wl_huge.get(), orientation.huge_tile_off.get(),
-                 partials, output, iter_scalars, pvec},
-                tg_count(orientation.n_huge), MG_TG_SIZE);
+  if (total_tgs > 0) {
+    cb.dispatch(gather_fused_, &fp, sizeof(fp),
+                {plan.vertices.get(), plan.tile_owner.get(),
+                 plan.tile_first_edge.get(), orientation.row_offsets.get(),
+                 orientation.col_indices.get(), input, output, dummy, dummy,
+                 dummy, weights, partials},
+                total_tgs, MG_TG_SIZE);
   }
-
-  if (orientation.n_zero) {
-    p.count = orientation.n_zero;
-    cb.dispatch(zero_fill_, &p, sizeof(p),
-                {orientation.zero_list.get(), output, iter_scalars, pvec},
-                tg_count(orientation.n_zero), MG_TG_SIZE);
+  if (plan.n_tiled > 0) {
+    cb.dispatch(tiled_finalize_, &fp, sizeof(fp),
+                {plan.vertices.get(), plan.tiled_tile_off.get(), partials,
+                 output, dummy, dummy, dummy},
+                ceil_div_u32(plan.n_tiled, sgs_per_tg_), MG_TG_SIZE);
   }
 }
 
 void SpmvEngine::encode_iteration_b(CommandBatch& cb, const Orientation& in_o,
-                                    MGPprParams base, Buffer* rank_cur_b,
-                                    Buffer* contrib_b, Buffer* rank_next_b,
-                                    Buffer* iter_scalars_b,
+                                    const GpuGatherPlan& plan, MGPprParams base,
+                                    Buffer* in_buf_b, Buffer* contrib_scratch_b,
+                                    Buffer* out_buf_b, Buffer* iter_scalars_b,
                                     Buffer* out_weight_sum, Buffer* weights,
                                     Buffer* seed_vertex, Buffer* seed_lane,
-                                    Buffer* seed_weight) {
-  MGPprParams p = base;
-
-  p.count = base.v_count;
-  cb.dispatch(prepare_b_, &p, sizeof(p),
-              {rank_cur_b, out_weight_sum, contrib_b}, tg_count(p.count),
-              MG_TG_SIZE);
-
-  auto gather = [&](MTL::ComputePipelineState* pso, Buffer* wl, uint32_t n,
-                    uint32_t tgs) {
-    if (n == 0) return;
-    p.count = n;
-    cb.dispatch(pso, &p, sizeof(p),
-                {wl, in_o.row_offsets.get(), in_o.col_indices.get(),
-                 contrib_b, rank_next_b, rank_cur_b, weights},
-                tgs, MG_TG_SIZE);
-  };
-  gather(gather_tg_b_, in_o.wl_high.get(), in_o.n_high, in_o.n_high);
-  gather(gather_sg_b_, in_o.wl_mid.get(), in_o.n_mid,
-         ceil_div_u32(in_o.n_mid, sgs_per_tg_b_));
-  gather(gather_th_b_, in_o.wl_low.get(), in_o.n_low, tg_count(in_o.n_low));
-
-  if (in_o.n_huge) {
-    Buffer* partials = huge_scratch(in_o, /*batched=*/true);
-    p.count = in_o.n_tiles;
-    cb.dispatch(huge_partials_b_, &p, sizeof(p),
-                {in_o.tile_owner.get(), in_o.tile_first_edge.get(),
-                 in_o.wl_huge.get(), in_o.row_offsets.get(),
-                 in_o.col_indices.get(), contrib_b, weights, partials},
-                in_o.n_tiles, MG_TG_SIZE);
-    p.count = in_o.n_huge;
-    cb.dispatch(huge_finalize_b_, &p, sizeof(p),
-                {in_o.wl_huge.get(), in_o.huge_tile_off.get(), partials,
-                 rank_next_b, rank_cur_b},
-                tg_count(in_o.n_huge), MG_TG_SIZE);
+                                    Buffer* seed_weight, bool rescale_ows) {
+  Buffer* gather_in = in_buf_b;
+  if (!rescale_ows) {
+    MGPprParams pp = base;
+    pp.count = base.v_count;
+    cb.dispatch(prepare_b_, &pp, sizeof(pp),
+                {in_buf_b, out_weight_sum, contrib_scratch_b},
+                tg_count(pp.count), MG_TG_SIZE);
+    gather_in = contrib_scratch_b;
   }
 
-  if (in_o.n_zero) {
-    p.count = in_o.n_zero;
-    cb.dispatch(zero_fill_b_, &p, sizeof(p),
-                {in_o.zero_list.get(), rank_next_b, rank_cur_b},
-                tg_count(in_o.n_zero), MG_TG_SIZE);
-  }
+  MGFusedPprParams fp{};
+  fp.alpha = base.alpha;
+  fp.one_minus_alpha = base.one_minus_alpha;
+  fp.active_mask = base.active_mask;
+  fp.flags = rescale_ows ? MG_PR_FLAG_RESCALE_OWS : 0u;
+  const uint32_t total_tgs =
+      fill_bin_layout(fp, plan, sgs_per_tg_b_, /*include_iso=*/false);
+  Buffer* partials = tile_scratch(plan, /*batched=*/true);
 
-  if (base.seed_total) {
-    p.count = base.seed_total;
-    cb.dispatch(seed_scatter_b_, &p, sizeof(p),
+  if (total_tgs > 0) {
+    cb.dispatch(gather_fused_b_, &fp, sizeof(fp),
+                {plan.vertices.get(), plan.tile_owner.get(),
+                 plan.tile_first_edge.get(), in_o.row_offsets.get(),
+                 in_o.col_indices.get(), gather_in, out_buf_b, in_buf_b,
+                 out_weight_sum, weights, partials},
+                total_tgs, MG_TG_SIZE);
+  }
+  if (plan.n_tiled > 0) {
+    cb.dispatch(tiled_finalize_b_, &fp, sizeof(fp),
+                {plan.vertices.get(), plan.tiled_tile_off.get(), partials,
+                 out_buf_b, in_buf_b, out_weight_sum},
+                ceil_div_u32(plan.n_tiled, sgs_per_tg_b_), MG_TG_SIZE);
+  }
+  if (base.seed_total > 0) {
+    MGPprParams sp = base;
+    sp.count = base.seed_total;
+    sp.pad0 = rescale_ows ? MG_PR_FLAG_RESCALE_OWS : 0u;
+    cb.dispatch(seed_scatter_b_, &sp, sizeof(sp),
                 {seed_vertex, seed_lane, seed_weight, iter_scalars_b,
-                 rank_next_b},
+                 out_weight_sum, out_buf_b, in_buf_b},
                 tg_count(base.seed_total), MG_TG_SIZE);
   }
 }

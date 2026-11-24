@@ -78,6 +78,8 @@ HitsResult gpu_hits_impl(
 
   const Orientation& in_o = g.orientation(Dir::in);
   const Orientation& out_o = g.orientation(Dir::out);
+  const GpuGatherPlan& in_plan = g.gpu_gather_plan(Dir::in);
+  const GpuGatherPlan& out_plan = g.gpu_gather_plan(Dir::out);
   SpmvEngine spmv_in(rt, /*weighted=*/false, /*uniform_p=*/true,
                      /*batched=*/false);
   SpmvEngine spmv_out(rt, /*weighted=*/false, /*uniform_p=*/true,
@@ -94,10 +96,10 @@ HitsResult gpu_hits_impl(
       rt.alloc_scratch(std::size_t{V} * sizeof(float), "hits.hubs1")};
   BufferPtr authorities =
       rt.alloc_scratch(std::size_t{V} * sizeof(float), "hits.authorities");
-  BufferPtr norm = rt.alloc(sizeof(float), "hits.norm");
+  BufferPtr norm = rt.alloc_scratch(sizeof(float), "hits.norm");
   BufferPtr partials =
-      rt.alloc(std::size_t{ReduceEngine::n_blocks(V)} * sizeof(float),
-               "hits.norm_partials");
+      rt.alloc_scratch(std::size_t{ReduceEngine::n_blocks(V)} * sizeof(float),
+                       "hits.norm_partials");
 
   const MGFillParams init{1.0f / static_cast<float>(V), 0u, V, 0u};
 
@@ -109,10 +111,11 @@ HitsResult gpu_hits_impl(
   MGFillParams scale_params{0.0f, 0u, V, 0u};
 
   auto encode_raw = [&](SpmvEngine& engine, CommandBatch& cb,
-                        const Orientation& orientation, Buffer* input,
+                        const Orientation& orientation,
+                        const GpuGatherPlan& plan, Buffer* input,
                         Buffer* output) {
-    engine.encode_prepared_gather(cb, orientation, raw, input, output,
-                                  dummy.get(), dummy.get(), dummy.get());
+    engine.encode_prepared_gather(cb, orientation, plan, raw, input, output,
+                                  dummy.get());
   };
   auto encode_normalize = [&](CommandBatch& cb, Buffer* values) {
     reduce.encode_sum(cb, raw, V, values, partials.get(), norm.get(), 0u);
@@ -133,9 +136,11 @@ HitsResult gpu_hits_impl(
                   {hubs[0].get()}, ceil_div_u32(V, MG_TG_SIZE), MG_TG_SIZE);
     }
     for (int i = 0; i < batch; ++i) {
-      encode_raw(spmv_in, cb, in_o, hubs[cur].get(), authorities.get());
+      encode_raw(spmv_in, cb, in_o, in_plan, hubs[cur].get(),
+                 authorities.get());
       encode_normalize(cb, authorities.get());
-      encode_raw(spmv_out, cb, out_o, authorities.get(), hubs[cur ^ 1].get());
+      encode_raw(spmv_out, cb, out_o, out_plan, authorities.get(),
+                 hubs[cur ^ 1].get());
       encode_normalize(cb, hubs[cur ^ 1].get());
       cur ^= 1;
     }

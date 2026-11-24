@@ -437,6 +437,147 @@ const CpuGatherPlan& Graph::cpu_gather_plan(Dir d) {
   return *cpu_plan_[i];
 }
 
+namespace {
+
+GpuGatherPlan build_gpu_gather_plan(const Orientation& o,
+                                    const uint32_t* out_row, const float* ows,
+                                    uint32_t V, bool split_isolated) {
+  Runtime& rt = Runtime::instance();
+  GpuGatherPlan p;
+  const uint32_t* row = o.row_offsets->as<uint32_t>();
+
+  uint32_t n_tiled = 0, n_tg = 0, n_sg32 = 0, n_sg16 = 0, n_sg8 = 0, n_sg4 = 0,
+           n_th = 0, n_zact = 0, n_iso = 0, n_ad = 0;
+  uint64_t n_tiles64 = 0;
+  bool safe_rescale = true;
+  for (uint32_t v = 0; v < V; ++v) {
+    const uint32_t d = row[v + 1] - row[v];
+    const bool iso = split_isolated && d == 0 && (out_row[v + 1] == out_row[v]);
+    const float w = ows[v];
+    if (w > 0.0f && (w < 1e-12f || w > 1e12f)) safe_rescale = false;
+    if (w == 0.0f && !iso) ++n_ad;
+    if (d >= MG_PR_TILED_MIN) {
+      ++n_tiled;
+      n_tiles64 += (uint64_t(d) + MG_PR_TILE_EDGES - 1) / MG_PR_TILE_EDGES;
+    } else if (d >= MG_PR_TG_MIN)
+      ++n_tg;
+    else if (d >= MG_PR_SG32_MIN)
+      ++n_sg32;
+    else if (d >= MG_PR_SG16_MIN)
+      ++n_sg16;
+    else if (d >= MG_PR_SG8_MIN)
+      ++n_sg8;
+    else if (d >= MG_PR_SG4_MIN)
+      ++n_sg4;
+    else if (d >= 1u)
+      ++n_th;
+    else if (!iso)
+      ++n_zact;
+    else
+      ++n_iso;
+  }
+
+  p.n_tiled = n_tiled;
+  p.n_tiles = static_cast<uint32_t>(n_tiles64);
+  p.off_tg = n_tiled;
+  p.n_tg = n_tg;
+  p.off_sg32 = p.off_tg + n_tg;
+  p.n_sg32 = n_sg32;
+  p.off_sg16 = p.off_sg32 + n_sg32;
+  p.n_sg16 = n_sg16;
+  p.off_sg8 = p.off_sg16 + n_sg16;
+  p.n_sg8 = n_sg8;
+  p.off_sg4 = p.off_sg8 + n_sg8;
+  p.n_sg4 = n_sg4;
+  p.off_th = p.off_sg4 + n_sg4;
+  p.n_th = n_th;
+  p.off_zact = p.off_th + n_th;
+  p.n_zact = n_zact;
+  p.off_iso = p.off_zact + n_zact;
+  p.n_iso = n_iso;
+  p.n_active_dangling = n_ad;
+  p.ows_safe_rescale = safe_rescale;
+
+  BufferPtr dummy = rt.dummy();
+  p.vertices = V ? rt.alloc(sizeof(uint32_t) * uint64_t(V), "mg_gpu_wl") : dummy;
+  p.tile_owner = p.n_tiles
+                     ? rt.alloc(sizeof(uint32_t) * p.n_tiles, "mg_gpu_towner")
+                     : dummy;
+  p.tile_first_edge =
+      p.n_tiles ? rt.alloc(sizeof(uint32_t) * p.n_tiles, "mg_gpu_tfirst")
+                : dummy;
+  p.tiled_tile_off =
+      n_tiled ? rt.alloc(sizeof(uint32_t) * (uint64_t(n_tiled) + 1),
+                         "mg_gpu_toff")
+              : dummy;
+  p.active_dangling =
+      n_ad ? rt.alloc(sizeof(uint32_t) * n_ad, "mg_gpu_adangling") : dummy;
+
+  uint32_t* wl = V ? p.vertices->as<uint32_t>() : nullptr;
+  uint32_t* pt_tiled = wl;
+  uint32_t* pt_tg = wl + p.off_tg;
+  uint32_t* pt_32 = wl + p.off_sg32;
+  uint32_t* pt_16 = wl + p.off_sg16;
+  uint32_t* pt_8 = wl + p.off_sg8;
+  uint32_t* pt_4 = wl + p.off_sg4;
+  uint32_t* pt_th = wl + p.off_th;
+  uint32_t* pt_za = wl + p.off_zact;
+  uint32_t* pt_iso = wl + p.off_iso;
+  uint32_t* pto = p.n_tiles ? p.tile_owner->as<uint32_t>() : nullptr;
+  uint32_t* ptf = p.n_tiles ? p.tile_first_edge->as<uint32_t>() : nullptr;
+  uint32_t* pgo = n_tiled ? p.tiled_tile_off->as<uint32_t>() : nullptr;
+  uint32_t* pad = n_ad ? p.active_dangling->as<uint32_t>() : nullptr;
+
+  uint32_t gi = 0, ti = 0;
+  for (uint32_t v = 0; v < V; ++v) {
+    const uint32_t d = row[v + 1] - row[v];
+    const bool iso = split_isolated && d == 0 && (out_row[v + 1] == out_row[v]);
+    if (ows[v] == 0.0f && !iso) *pad++ = v;
+    if (d >= MG_PR_TILED_MIN) {
+      pgo[gi] = ti;
+      *pt_tiled++ = v;
+      for (uint32_t e = row[v]; e < row[v + 1]; e += MG_PR_TILE_EDGES) {
+        pto[ti] = gi;
+        ptf[ti] = e;
+        ++ti;
+      }
+      ++gi;
+    } else if (d >= MG_PR_TG_MIN)
+      *pt_tg++ = v;
+    else if (d >= MG_PR_SG32_MIN)
+      *pt_32++ = v;
+    else if (d >= MG_PR_SG16_MIN)
+      *pt_16++ = v;
+    else if (d >= MG_PR_SG8_MIN)
+      *pt_8++ = v;
+    else if (d >= MG_PR_SG4_MIN)
+      *pt_4++ = v;
+    else if (d >= 1u)
+      *pt_th++ = v;
+    else if (!iso)
+      *pt_za++ = v;
+    else
+      *pt_iso++ = v;
+  }
+  if (n_tiled) pgo[gi] = ti;
+  return p;
+}
+
+}  // namespace
+
+const GpuGatherPlan& Graph::gpu_gather_plan(Dir d) {
+  const Dir key = directed ? d : Dir::out;
+  const int i = static_cast<int>(key);
+  std::call_once(gpu_plan_once_[i], [this, key, i] {
+    const Orientation& o = orientation(key);
+    const bool split_iso = (!directed || key == Dir::in);
+    gpu_plan_[i] = std::make_unique<GpuGatherPlan>(build_gpu_gather_plan(
+        o, out_.row_offsets->as<uint32_t>(), out_weight_sum->as<float>(), V,
+        split_iso));
+  });
+  return *gpu_plan_[i];
+}
+
 const CpuInTileKeys& Graph::cpu_in_tile_keys() {
   std::call_once(in_tile_keys_once_, [this] {
     in_tile_keys_ = std::make_unique<CpuInTileKeys>(make_cpu_in_tile_keys());

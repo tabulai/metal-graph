@@ -177,3 +177,25 @@ def test_pagerank_max_iter_is_budget_not_error(exec_path, assert_path):
     assert pr.shape == (case.num_vertices,)
     assert np.isfinite(pr).all()
     assert mg.last_run_info()["iterations"] <= 3
+
+
+@pytest.mark.parametrize("scale", [1e-20, 1e20], ids=["tiny_weights", "huge_weights"])
+def test_pagerank_extreme_weights_match_cpu(exec_path, assert_path, scale):
+    # Exercises the !ows_safe_rescale fallback path (separate contrib buffer,
+    # no inline r/ows ping-pong) on GPU and checks parity against CPU fp64.
+    rng = np.random.default_rng(77)
+    v, e = 600, 3_600
+    src = rng.integers(0, v, e, dtype=np.uint32)
+    dst = rng.integers(0, v, e, dtype=np.uint32)
+    w = (rng.uniform(0.5, 2.0, e) * scale).astype(np.float32)
+    g = mg.Graph.from_edges(src, dst, weights=w, directed=True, num_vertices=v)
+    pr = np.asarray(mg.pagerank(g, alpha=0.85, tol=1e-7, max_iter=100))
+    assert_path(exec_path)
+    assert np.isfinite(pr).all()
+    assert abs(float(pr.sum()) - 1.0) < 1e-4
+
+    saved = exec_path
+    mg.set_execution("cpu")
+    ref = np.asarray(mg.pagerank(g, alpha=0.85, tol=1e-7, max_iter=100))
+    mg.set_execution(saved)
+    np.testing.assert_allclose(pr, ref, atol=5e-5, rtol=1e-3)

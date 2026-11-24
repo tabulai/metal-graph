@@ -57,6 +57,88 @@ class MetalBuffer final : public Buffer {
   std::size_t bytes_;
 };
 
+// Bounded, thread-safe pool of shared-storage MTLBuffers backing
+// Runtime::alloc_scratch(). Reusing warm Metal buffers eliminates per-call
+// VM allocation and GPU/CPU first-touch page faults on iterative algorithms
+// (PageRank, PPR, HITS, WCC). Bypassed when MG_DEBUG_POISON_SCRATCH=1.
+struct ScratchPool {
+  struct Entry {
+    MTL::Buffer* buf;
+    std::size_t bytes;
+  };
+  std::mutex mtx;
+  std::vector<Entry> free_list;
+  std::size_t cached_bytes = 0;
+  std::size_t max_cached_bytes = 0;
+  bool closed = false;
+
+  explicit ScratchPool(std::size_t cap) : max_cached_bytes(cap) {}
+
+  MTL::Buffer* acquire(std::size_t need, std::size_t& actual_bytes) {
+    std::lock_guard<std::mutex> lk(mtx);
+    if (closed || free_list.empty()) return nullptr;
+    const std::size_t max_ok = need + (need >> 2) + 4096;
+    std::size_t best = free_list.size();
+    for (std::size_t i = 0; i < free_list.size(); ++i) {
+      const std::size_t sz = free_list[i].bytes;
+      if (sz >= need && sz <= max_ok) {
+        if (best == free_list.size() || sz < free_list[best].bytes) best = i;
+      }
+    }
+    if (best == free_list.size()) return nullptr;
+    Entry e = free_list[best];
+    free_list[best] = free_list.back();
+    free_list.pop_back();
+    cached_bytes -= e.bytes;
+    actual_bytes = e.bytes;
+    return e.buf;
+  }
+
+  void release(MTL::Buffer* buf, std::size_t bytes) {
+    std::lock_guard<std::mutex> lk(mtx);
+    if (closed || bytes > max_cached_bytes) {
+      buf->release();
+      return;
+    }
+    while (!free_list.empty() && cached_bytes + bytes > max_cached_bytes) {
+      Entry old = free_list.front();
+      free_list.erase(free_list.begin());
+      cached_bytes -= old.bytes;
+      old.buf->release();
+    }
+    free_list.push_back({buf, bytes});
+    cached_bytes += bytes;
+  }
+
+  void shutdown() {
+    std::lock_guard<std::mutex> lk(mtx);
+    closed = true;
+    for (const Entry& e : free_list) e.buf->release();
+    free_list.clear();
+    cached_bytes = 0;
+  }
+};
+
+class PooledMetalBuffer final : public Buffer {
+ public:
+  PooledMetalBuffer(MTL::Buffer* b, std::size_t req_bytes,
+                    std::size_t alloc_bytes, std::shared_ptr<ScratchPool> pool)
+      : b_(b),
+        req_bytes_(req_bytes),
+        alloc_bytes_(alloc_bytes),
+        pool_(std::move(pool)) {}
+  ~PooledMetalBuffer() override { pool_->release(b_, alloc_bytes_); }
+  void* data() override { return b_->contents(); }
+  std::size_t byte_size() const override { return req_bytes_; }
+  MTL::Buffer* mtl() override { return b_; }
+
+ private:
+  MTL::Buffer* b_;
+  std::size_t req_bytes_;
+  std::size_t alloc_bytes_;
+  std::shared_ptr<ScratchPool> pool_;
+};
+
 class HeapBuffer final : public Buffer {
  public:
   HeapBuffer(void* p, std::size_t bytes) : p_(p), bytes_(bytes) {}
@@ -83,6 +165,7 @@ struct Runtime::Impl {
   MTL::CommandQueue* queue = nullptr;   // owned
   MTL::Library* library = nullptr;     // owned
   BufferPtr dummy;
+  std::shared_ptr<ScratchPool> scratch_pool;
   std::mutex pso_mutex;
   std::unordered_map<std::string, MTL::ComputePipelineState*> psos;
   std::atomic<int> mode{static_cast<int>(ExecMode::autom)};
@@ -99,6 +182,12 @@ Runtime::Runtime() : impl_(std::make_unique<Impl>()) {
       throw Error(ErrorCode::no_gpu,
                   "MG_REQUIRE_GPU=1 but no Metal device is available");
   } else {
+    const uint64_t budget = impl_->device->recommendedMaxWorkingSetSize();
+    const std::size_t pool_cap =
+        budget ? std::min<std::size_t>(static_cast<std::size_t>(budget / 8),
+                                       std::size_t{1024} << 20)
+               : (std::size_t{256} << 20);
+    impl_->scratch_pool = std::make_shared<ScratchPool>(pool_cap);
     impl_->queue = impl_->device->newCommandQueue();
     if (!impl_->queue)
       throw Error(ErrorCode::internal, "failed to create MTLCommandQueue");
@@ -127,6 +216,7 @@ Runtime::~Runtime() {
   for (auto& kv : impl_->psos)
     if (kv.second) kv.second->release();
   impl_->dummy.reset();
+  if (impl_->scratch_pool) impl_->scratch_pool->shutdown();
   if (impl_->library) impl_->library->release();
   if (impl_->queue) impl_->queue->release();
   if (impl_->device) impl_->device->release();
@@ -205,6 +295,23 @@ BufferPtr Runtime::make_buffer(std::size_t bytes, const char* label,
   // elements, which fresh, almost always zeroed pages would hide.
   const bool poison = !zero && impl_->poison_scratch;
   if (impl_->device) {
+    if (!zero && !poison && impl_->scratch_pool) {
+      std::size_t alloc_n = 0;
+      if (MTL::Buffer* reused = impl_->scratch_pool->acquire(n, alloc_n)) {
+        return std::make_shared<PooledMetalBuffer>(reused, n, alloc_n,
+                                                   impl_->scratch_pool);
+      }
+      Pool pool;
+      MTL::Buffer* b =
+          impl_->device->newBuffer(n, MTL::ResourceStorageModeShared);
+      if (!b)
+        throw Error(ErrorCode::out_of_memory,
+                    std::string("buffer allocation failed: ") +
+                        (label ? label : "(unlabeled)"));
+      if (label)
+        b->setLabel(NS::String::string(label, NS::UTF8StringEncoding));
+      return std::make_shared<PooledMetalBuffer>(b, n, n, impl_->scratch_pool);
+    }
     Pool pool;
     MTL::Buffer* b =
         impl_->device->newBuffer(n, MTL::ResourceStorageModeShared);

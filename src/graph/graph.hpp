@@ -77,6 +77,44 @@ struct CpuGatherPlan {
   uint32_t n_slots = 0;
 };
 
+// Finer sub-SIMD + 2048-edge tiled gather plan for fused single-dispatch GPU
+// PageRank / batched PPR / HITS (cached lazily per orientation; undirected
+// graphs share one plan). Keeps Orientation's existing worklists untouched.
+struct GpuGatherPlan {
+  // Single packed vertex list (uint32, V) partitioned into ascending canonical
+  // bins:
+  //   [0, off_tg)          : tiled rows (deg >= MG_PR_TILED_MIN)
+  //   [off_tg, off_sg32)   : 1 threadgroup / vertex (deg >= MG_PR_TG_MIN)
+  //   [off_sg32, off_sg16) : 32 lanes / vertex (deg >= MG_PR_SG32_MIN)
+  //   [off_sg16, off_sg8)  : 16 lanes / vertex (deg >= MG_PR_SG16_MIN)
+  //   [off_sg8, off_sg4)   : 8 lanes / vertex (deg >= MG_PR_SG8_MIN)
+  //   [off_sg4, off_th)    : 4 lanes / vertex (deg >= MG_PR_SG4_MIN)
+  //   [off_th, off_zact)   : 1 thread / vertex (deg >= 1)
+  //   [off_zact, off_iso)  : deg == 0 in this orientation, has out-edges
+  //   [off_iso, V)         : isolated (in_deg == 0 && out_deg == 0)
+  BufferPtr vertices;
+  BufferPtr tile_owner;       // uint32, n_tiles (index into [0, n_tiled))
+  BufferPtr tile_first_edge;  // uint32, n_tiles
+  BufferPtr tiled_tile_off;   // uint32, n_tiled + 1
+  // Non-isolated dangling vertices (ows == 0 && !isolated); disjoint with
+  // vertices[off_iso..V) and together partitioning g.dangling_list.
+  BufferPtr active_dangling;
+  uint32_t n_tiled = 0, n_tiles = 0;
+  uint32_t off_tg = 0, n_tg = 0;
+  uint32_t off_sg32 = 0, n_sg32 = 0;
+  uint32_t off_sg16 = 0, n_sg16 = 0;
+  uint32_t off_sg8 = 0, n_sg8 = 0;
+  uint32_t off_sg4 = 0, n_sg4 = 0;
+  uint32_t off_th = 0, n_th = 0;
+  uint32_t off_zact = 0, n_zact = 0;
+  uint32_t off_iso = 0, n_iso = 0;
+  uint32_t n_active_dangling = 0;
+  // True when every positive out_weight_sum lies in [1e-12, 1e12], so storing
+  // contrib = rank / ows in place and multiplying back by ows at the end
+  // cannot overflow or flush normal ranks to zero.
+  bool ows_safe_rescale = true;
+};
+
 // The tiles of cpu_gather_plan(Dir::in)'s huge rows, keyed by ORIGINAL
 // input-edge id, for the bounded-reach PPR path: it sees in-edges only as
 // OUT-orientation edges (edge_orig), and needs each one's global tile to
@@ -111,6 +149,9 @@ class Graph {
   // CPU gather plan of orientation(d), built lazily (O(V) scan) and cached;
   // undirected graphs share one plan for both directions.
   const CpuGatherPlan& cpu_gather_plan(Dir d);
+  // Fused sub-SIMD GPU gather plan of orientation(d), built lazily and cached;
+  // undirected graphs share one plan for both directions.
+  const GpuGatherPlan& gpu_gather_plan(Dir d);
   // Tile keys of the IN plan's huge rows, built lazily and cached from the
   // stored edge list (parallel O(E) degree count; no IN transpose) and
   // kept in O(n_huge + n_tiles) memory.
@@ -152,6 +193,8 @@ class Graph {
   std::once_flag in_once_;
   std::unique_ptr<CpuGatherPlan> cpu_plan_[2];  // indexed by Dir
   std::once_flag cpu_plan_once_[2];
+  std::unique_ptr<GpuGatherPlan> gpu_plan_[2];  // indexed by Dir
+  std::once_flag gpu_plan_once_[2];
   std::unique_ptr<CpuInTileKeys> in_tile_keys_;
   std::once_flag in_tile_keys_once_;
   // Original input edges in canonical ids (kept to build the transpose
