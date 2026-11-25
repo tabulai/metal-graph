@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -130,6 +131,55 @@ class LocalIndex {
   int shift_ = 60;
 };
 
+// Deterministic fixed-chunk parallel dangling mass for cpu::pagerank.
+double dangling_mass_par(Graph& g, const double* r) {
+  if (g.n_dangling == 0 || !g.dangling_list) return 0.0;
+  const uint32_t* dl = g.dangling_list->as<uint32_t>();
+  constexpr std::size_t kChunk = std::size_t{1} << 16;
+  const std::size_t chunks =
+      (std::size_t{g.n_dangling} + kChunk - 1) / kChunk;
+  if (chunks <= 1) return dangling_mass(g, r);
+  std::vector<double> part(chunks, 0.0);
+  parallel_for(
+      chunks,
+      [&](std::size_t cb, std::size_t ce) {
+        for (std::size_t c = cb; c < ce; ++c) {
+          const std::size_t lo = c * kChunk;
+          const std::size_t hi =
+              std::min<std::size_t>(g.n_dangling, lo + kChunk);
+          double s = 0.0;
+          for (std::size_t i = lo; i < hi; ++i) s += r[dl[i]];
+          part[c] = s;
+        }
+      },
+      1);
+  double total = 0.0;
+  for (double x : part) total += x;
+  return total;
+}
+
+double l1_diff_par(uint32_t V, const double* a, const double* b) {
+  constexpr std::size_t kChunk = std::size_t{1} << 16;
+  const std::size_t chunks = (std::size_t{V} + kChunk - 1) / kChunk;
+  if (chunks <= 1) return l1_diff(V, a, b);
+  std::vector<double> part(chunks, 0.0);
+  parallel_for(
+      chunks,
+      [&](std::size_t cb, std::size_t ce) {
+        for (std::size_t c = cb; c < ce; ++c) {
+          const std::size_t lo = c * kChunk;
+          const std::size_t hi = std::min<std::size_t>(V, lo + kChunk);
+          double s = 0.0;
+          for (std::size_t v = lo; v < hi; ++v) s += std::fabs(a[v] - b[v]);
+          part[c] = s;
+        }
+      },
+      1);
+  double total = 0.0;
+  for (double x : part) total += x;
+  return total;
+}
+
 }  // namespace
 
 int pagerank(Graph& g, const double* pvec_canon, double alpha, double tol,
@@ -142,9 +192,12 @@ int pagerank(Graph& g, const double* pvec_canon, double alpha, double tol,
   const float* ows = g.out_weight_sum->as<float>();
   const double one_minus_a = 1.0 - alpha;
 
-  std::vector<double> r(pvec_canon, pvec_canon + V);  // r0 = pvec
-  std::vector<double> r_prev(V, 0.0);
-  std::vector<double> contrib(V, 0.0);
+  std::unique_ptr<double[]> r(new double[V]);
+  std::unique_ptr<double[]> r_prev(new double[V]);
+  std::unique_ptr<double[]> contrib(new double[V]);
+  parallel_for(V, [&](std::size_t b, std::size_t e) {
+    std::copy(pvec_canon + b, pvec_canon + e, r.get() + b);
+  });
   std::vector<double> tile_part(c.plan->n_slots);
   int done = 0;
   while (true) {
@@ -152,17 +205,25 @@ int pagerank(Graph& g, const double* pvec_canon, double alpha, double tol,
                                                  audit_interval);
     if (batch <= 0) break;
     for (int it = 0; it < batch; ++it) {
-      contrib_pass(V, ows, r.data(), contrib.data(), true);
-      const double dmass = dangling_mass(g, r.data());
-      gather_pass(c, contrib.data(), pvec_canon, alpha, one_minus_a, dmass,
-                  r_prev.data(), tile_part.data(), true);
+      contrib_pass(V, ows, r.get(), contrib.get(), true);
+      const double dmass = dangling_mass_par(g, r.get());
+      const double base_mul = one_minus_a + alpha * dmass;
+      double* next = r_prev.get();
+      plan_gather_fast(*c.plan, c.row, c.col, c.w, contrib.get(),
+                       tile_part.data(), true,
+                       [alpha, base_mul, pvec_canon, next](uint32_t v,
+                                                           double acc) {
+                         next[v] = alpha * acc + base_mul * pvec_canon[v];
+                       });
       r.swap(r_prev);  // r = new iterate; r_prev = previous
     }
     done += batch;
-    const double err = l1_diff(V, r.data(), r_prev.data());
+    const double err = l1_diff_par(V, r.get(), r_prev.get());
     if (err < static_cast<double>(V) * tol) break;
   }
-  std::copy(r.begin(), r.end(), rank_canon);
+  parallel_for(V, [&](std::size_t b, std::size_t e) {
+    std::copy(r.get() + b, r.get() + e, rank_canon + b);
+  });
   return done;
 }
 

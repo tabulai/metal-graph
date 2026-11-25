@@ -8,8 +8,10 @@
 #include "mg_params.h"
 
 // Scratch slots for cross-simdgroup reductions. MG_TG_SIZE (256) threads
-// with SIMD width >= 8 gives at most 32 simdgroups per threadgroup.
-#define MG_TG_SCRATCH 32u
+// with SIMD width >= 16 (32 on Apple Silicon, 32/64 on AMD, 16/32 on Intel)
+// gives at most 16 simdgroups per threadgroup — keeps batched 8-lane
+// threadgroup memory at 512 B (vs 2048 B), maximizing GPU occupancy.
+#define MG_TG_SCRATCH 16u
 
 // Threadgroup-wide float sum over MG_TG_SIZE threads: simd_sum per
 // simdgroup, then across simdgroups via threadgroup memory. Every thread
@@ -33,6 +35,52 @@ static inline float mg_tg_reduce_sum(float x, threadgroup float* scratch,
   const float total = scratch[0];
   threadgroup_barrier(mem_flags::mem_threadgroup);
   return total;
+}
+
+// 1-barrier threadgroup float sum: ONLY tid == 0 (sg_in_tg == 0 && lane == 0)
+// receives the valid total. Saves two threadgroup barriers over mg_tg_reduce_sum
+// whenever only thread 0 writes the reduced result.
+static inline float mg_tg_reduce_sum_tid0(float x, threadgroup float* scratch,
+                                          ushort sg_in_tg, ushort lane,
+                                          ushort sgs_per_tg) {
+  x = simd_sum(x);
+  if (lane == 0u) scratch[sg_in_tg] = x;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg_in_tg == 0u) {
+    const float y = (lane < sgs_per_tg) ? scratch[lane] : 0.0f;
+    return simd_sum(y);
+  }
+  return 0.0f;
+}
+
+// 1-barrier threadgroup reduction for all MG_PPR_TILE (8) lanes at once.
+// `scratch` must hold at least MG_PPR_TILE * MG_TG_SCRATCH floats.
+// After return, ONLY threads with (sg_in_tg == 0 && lane < MG_PPR_TILE)
+// receive the reduced total for PPR query lane == `lane`.
+static inline float mg_tg_reduce_sum_b_lane(float4 lo, float4 hi,
+                                            threadgroup float* scratch,
+                                            ushort sg_in_tg, ushort lane,
+                                            ushort sgs_per_tg) {
+  const float4 slo = simd_sum(lo);
+  const float4 shi = simd_sum(hi);
+  if (lane == 0u) {
+    scratch[0u * MG_TG_SCRATCH + sg_in_tg] = slo.x;
+    scratch[1u * MG_TG_SCRATCH + sg_in_tg] = slo.y;
+    scratch[2u * MG_TG_SCRATCH + sg_in_tg] = slo.z;
+    scratch[3u * MG_TG_SCRATCH + sg_in_tg] = slo.w;
+    scratch[4u * MG_TG_SCRATCH + sg_in_tg] = shi.x;
+    scratch[5u * MG_TG_SCRATCH + sg_in_tg] = shi.y;
+    scratch[6u * MG_TG_SCRATCH + sg_in_tg] = shi.z;
+    scratch[7u * MG_TG_SCRATCH + sg_in_tg] = shi.w;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg_in_tg == 0u && lane < MG_PPR_TILE) {
+    float s = 0.0f;
+    for (ushort k = 0u; k < sgs_per_tg; ++k)
+      s += scratch[lane * MG_TG_SCRATCH + k];
+    return s;
+  }
+  return 0.0f;
 }
 
 // Exactly-once visited-bitmap claim (plan §6 sketch): cheap atomic peek,

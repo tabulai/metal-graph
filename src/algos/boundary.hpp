@@ -26,15 +26,49 @@ inline std::vector<uint32_t> to_canon(const Graph& g, const uint32_t* user,
 }
 
 // Validate a dense USER-order personalization and return its fp64 sum
-// (sequential, USER order). Rejects non-finite/negative and all-zero vectors.
+// (deterministic fixed chunks, independent of MG_THREADS). Rejects
+// non-finite/negative and all-zero vectors.
 inline double personalization_sum(const Graph& g, const float* p_user) {
-  double s = 0.0;
-  for (uint32_t u = 0; u < g.V; ++u) {
-    double v = p_user[u];
-    if (!std::isfinite(v) || v < 0.0)
-      throw_invalid("personalization: entries must be finite and >= 0");
-    s += v;
+  const uint32_t V = g.V;
+  constexpr std::size_t kChunk = std::size_t{1} << 16;
+  const std::size_t chunks = (std::size_t{V} + kChunk - 1) / kChunk;
+  if (chunks <= 1) {
+    double s = 0.0;
+    for (uint32_t u = 0; u < V; ++u) {
+      const double v = p_user[u];
+      if (!std::isfinite(v) || v < 0.0)
+        throw_invalid("personalization: entries must be finite and >= 0");
+      s += v;
+    }
+    if (!(s > 0.0) || !std::isfinite(s))
+      throw_invalid("personalization: sum must be finite and > 0");
+    return s;
   }
+  std::vector<double> part(chunks, 0.0);
+  std::atomic<bool> bad{false};
+  parallel_for(
+      chunks,
+      [&](std::size_t cb, std::size_t ce) {
+        for (std::size_t c = cb; c < ce; ++c) {
+          const std::size_t lo = c * kChunk;
+          const std::size_t hi = std::min<std::size_t>(V, lo + kChunk);
+          double s = 0.0;
+          for (std::size_t u = lo; u < hi; ++u) {
+            const double v = p_user[u];
+            if (!std::isfinite(v) || v < 0.0) {
+              bad.store(true, std::memory_order_relaxed);
+              return;
+            }
+            s += v;
+          }
+          part[c] = s;
+        }
+      },
+      1);
+  if (bad.load(std::memory_order_relaxed))
+    throw_invalid("personalization: entries must be finite and >= 0");
+  double s = 0.0;
+  for (double x : part) s += x;
   if (!(s > 0.0) || !std::isfinite(s))
     throw_invalid("personalization: sum must be finite and > 0");
   return s;
@@ -47,19 +81,28 @@ inline std::vector<double> pvec_to_canon(const Graph& g, const float* p_user,
                                          double p_sum) {
   std::vector<double> p(g.V);
   if (!p_user) {
-    std::fill(p.begin(), p.end(), 1.0 / static_cast<double>(g.V));
+    const double u_val = 1.0 / static_cast<double>(g.V);
+    parallel_for(g.V, [&](std::size_t b, std::size_t e) {
+      std::fill(p.data() + b, p.data() + e, u_val);
+    });
     return p;
   }
-  for (uint32_t u = 0; u < g.V; ++u)
-    p[g.canon_of_user[u]] = static_cast<double>(p_user[u]) / p_sum;
+  const uint32_t* user_of = g.user_of_canon.data();
+  parallel_for(g.V, [&](std::size_t b, std::size_t e) {
+    for (std::size_t c = b; c < e; ++c)
+      p[c] = static_cast<double>(p_user[user_of[c]]) / p_sum;
+  });
   return p;
 }
 
 // Scatter a canonical-order vector into a USER-order output array.
 template <typename TSrc, typename TDst>
 inline void canon_to_user(const Graph& g, const TSrc* canon, TDst* user_out) {
-  for (uint32_t u = 0; u < g.V; ++u)
-    user_out[u] = static_cast<TDst>(canon[g.canon_of_user[u]]);
+  const uint32_t* canon_of = g.canon_of_user.data();
+  parallel_for(g.V, [&](std::size_t b, std::size_t e) {
+    for (std::size_t u = b; u < e; ++u)
+      user_out[u] = static_cast<TDst>(canon[canon_of[u]]);
+  });
 }
 
 // Translate a canonical parent/id VALUE array (already in USER row order)

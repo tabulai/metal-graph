@@ -62,6 +62,17 @@ typedef int32_t mg_i32;
 #define MG_BIN_HUGE_MIN 16384u
 #define MG_HUGE_TILE_EDGES 16384u
 
+// Fused sub-SIMD GPU gather plan thresholds (PageRank / PPR / HITS): finer
+// 2048-edge tiling saturates high-core-count GPUs on hub-heavy graphs, while
+// 16/8/4-lane sub-SIMD bins coalesce col_indices on low-degree rows.
+#define MG_PR_TILE_EDGES 2048u
+#define MG_PR_TILED_MIN  4096u
+#define MG_PR_TG_MIN     1024u
+#define MG_PR_SG32_MIN   64u
+#define MG_PR_SG16_MIN   16u
+#define MG_PR_SG8_MIN    8u
+#define MG_PR_SG4_MIN    4u
+
 // Batched PPR tile width: the batch gather streams col_indices once for
 // MG_PPR_TILE query lanes. Rank/contrib state is interleaved vertex-major:
 //   state[v * MG_PPR_TILE + lane]
@@ -73,9 +84,18 @@ typedef int32_t mg_i32;
 #define MG_SCAN_BLOCK 256u
 
 // iter_scalars slot indices (single-query PageRank; float[MG_SCALARS_LEN])
-#define MG_SCALAR_DANGLING 0u
-#define MG_SCALARS_LEN 4u
+#define MG_SCALAR_DANGLING       0u
+#define MG_SCALAR_ISO_SCALE      1u  // (1-a) + a*D_{iter-1} for isolated rows
+#define MG_SCALAR_ISO_SCALE_PREV 2u  // previous iteration's isolated scale
+#define MG_SCALARS_LEN           4u
 // Batched variant uses float[MG_PPR_TILE]: dangling mass per query lane.
+
+// Fused gather flags
+#define MG_PR_FLAG_RESCALE_OWS 1u  // write contrib = rank / ows (for ows > 0)
+#define MG_PR_FLAG_RAW_GATHER  2u  // HITS: write acc directly (no alpha/pvec)
+
+// Batched seed_lane bit marking an isolated (in_deg == 0 && out_deg == 0) seed
+#define MG_PPR_SEED_ISO_BIT 0x100u
 
 // BFS traversal mode written by mg_bfs_decide into MGBfsControl.mode
 #define MG_BFS_MODE_TOPDOWN 0u
@@ -139,6 +159,68 @@ typedef struct MGReduceParams {
   mg_u32 pad0;
   mg_u32 pad1;
 } MGReduceParams;
+
+// --- Fused single-dispatch PageRank / HITS gather (spmv.metal) ---
+typedef struct MGFusedPrParams {
+  float alpha;
+  float one_minus_alpha;
+  float p_uniform;
+  mg_u32 flags;  // MG_PR_FLAG_*
+  mg_u32 n_tiles;
+  mg_u32 n_tiled;
+  mg_u32 off_tg;   mg_u32 n_tg;
+  mg_u32 off_sg32; mg_u32 n_sg32; mg_u32 sg32_tgs;
+  mg_u32 off_sg16; mg_u32 n_sg16; mg_u32 sg16_tgs;
+  mg_u32 off_sg8;  mg_u32 n_sg8;  mg_u32 sg8_tgs;
+  mg_u32 off_sg4;  mg_u32 n_sg4;  mg_u32 sg4_tgs;
+  mg_u32 off_th;   mg_u32 n_th;   mg_u32 th_tgs;
+  mg_u32 off_zero; mg_u32 n_zero; mg_u32 zero_tgs;
+} MGFusedPrParams;
+
+// --- Fused single-dispatch Batched PPR gather (spmv.metal) ---
+typedef struct MGFusedPprParams {
+  float alpha;
+  float one_minus_alpha;
+  mg_u32 active_mask;  // bits [0, MG_PPR_TILE)
+  mg_u32 flags;        // MG_PR_FLAG_RESCALE_OWS
+  mg_u32 n_tiles;
+  mg_u32 n_tiled;
+  mg_u32 off_tg;   mg_u32 n_tg;
+  mg_u32 off_sg32; mg_u32 n_sg32; mg_u32 sg32_tgs;
+  mg_u32 off_sg16; mg_u32 n_sg16; mg_u32 sg16_tgs;
+  mg_u32 off_sg8;  mg_u32 n_sg8;  mg_u32 sg8_tgs;
+  mg_u32 off_sg4;  mg_u32 n_sg4;  mg_u32 sg4_tgs;
+  mg_u32 off_th;   mg_u32 n_th;   mg_u32 th_tgs;
+  mg_u32 off_zero; mg_u32 n_zero; mg_u32 zero_tgs;
+} MGFusedPprParams;
+
+// --- Single-query PageRank dangling finalize (with isolated-mass term) ---
+typedef struct MGPrDangFinParams {
+  float alpha;
+  float one_minus_alpha;
+  float iso_p_sum;    // sum_{v isolated} p[v] (n_iso/V when uniform)
+  mg_u32 n_partials;  // 0 when active_dangling empty or single-TG direct
+  mg_u32 n_active;    // used by single-TG direct reduce
+  mg_u32 pad0;
+  mg_u32 pad1;
+  mg_u32 pad2;
+} MGPrDangFinParams;
+
+// --- Batched PPR dangling finalize (with isolated seeds) ---
+typedef struct MGPprDangFinParams {
+  mg_u32 n_partials;   // 0 when active_dangling empty or single-TG direct
+  mg_u32 n_active;     // used by single-TG direct reduce
+  mg_u32 seed_total;   // total tile seeds (only MG_PPR_SEED_ISO_BIT added)
+  mg_u32 active_mask;  // bits [0, MG_PPR_TILE)
+} MGPprDangFinParams;
+
+// --- Residual audit partials (single + batched) ---
+typedef struct MGPrResParams {
+  mg_u32 count;        // #vertices in worklist[0..count)
+  mg_u32 flags;        // MG_PR_FLAG_RESCALE_OWS (multiply diff by ows>0?ows:1)
+  mg_u32 active_mask;  // batched only: bits [0, MG_PPR_TILE)
+  mg_u32 pad0;
+} MGPrResParams;
 
 // --- Fill / iota ---
 typedef struct MGFillParams {
@@ -222,16 +304,24 @@ typedef struct MGWccLinkParams {
 } MGWccLinkParams;
 
 // --- GPU top-k select (batched PPR tiles) ---
-// cap = k + MG_TOPK_TIE_SLACK candidate slots per lane; a lane whose
-// >=-threshold class exceeds cap is finished on the CPU oracle instead.
+// cap = k + MG_TOPK_TIE_SLACK candidate slots per lane. When a lane's
+// >=-threshold class still exceeds cap after pass 3, thresholds[lane] gets
+// MG_TOPK_STRICT_GT_BIT set so compact collects only strictly-greater items
+// (< k <= cap) and the host fills the exact tie tail in O(k) ascending user
+// order.
 #define MG_TOPK_TIE_SLACK 2048u
+#define MG_TOPK_FLAG_UNSCALE_OWS 1u        // pass 0: unscale rank_b by ows > 0
+#define MG_TOPK_STRICT_GT_BIT 0x80000000u  // high bit in thresholds[lane]
+// select_state layout: [0..7] remaining, [8..15] class_size, [16] pending_mask
+#define MG_TOPK_STATE_PENDING (2u * MG_PPR_TILE)
+#define MG_TOPK_STATE_LEN     (2u * MG_PPR_TILE + 4u)
 typedef struct MGTopkParams {
   mg_u32 v_count;
   mg_u32 k;
   mg_u32 cap;
   mg_u32 active_mask;  // lanes carrying queries in this tile
   mg_u32 pass;         // radix pass 0..3 (hist / digit kernels)
-  mg_u32 pad0;
+  mg_u32 flags;        // MG_TOPK_FLAG_*
   mg_u32 pad1;
   mg_u32 pad2;
 } MGTopkParams;
@@ -257,165 +347,120 @@ typedef struct MGScanParams {
 //
 // ======================= pagerank single (spmv.metal, reduce.metal) ========
 // mg_pr_prepare  — grid: ceil(V / MG_TG_SIZE) tgs, 1 thread/vertex
+//   Fallback only when !ows_safe_rescale (extreme weights).
 //   b0 MGPrParams (count = V)
 //   b1 rank_cur        (const float, V)
 //   b2 out_weight_sum  (const float, V)
 //   b3 contrib         (float, V)   contrib[v] = ows[v] > 0 ? rank[v]/ows[v] : 0
 //
-// mg_pr_gather_tg — grid: n_high tgs of MG_TG_SIZE  [fc: WEIGHTED, UNIFORM_P]
-// mg_pr_gather_sg — grid: ceil(n_mid / sgs_per_tg) tgs [same fcs]
-// mg_pr_gather_thread — grid: ceil(n_low / MG_TG_SIZE) tgs [same fcs]
-//   b0 MGPrParams (count = worklist length)
-//   b1 worklist        (const uint32)   in-orientation degree bin
-//   b2 row_offsets     (const uint32, V+1)   IN-orientation CSR
-//   b3 col_indices     (const uint32, E)
-//   b4 contrib         (const float, V)
-//   b5 rank_next       (float, V)
-//   b6 iter_scalars    (const float, MG_SCALARS_LEN) [MG_SCALAR_DANGLING]
-//   b7 pvec            (const float, V; dummy when UNIFORM_P)
-//   b8 weights         (const float, E; dummy when !WEIGHTED)
-//   writes: rank_next[v] = (1-a)*p[v] + a*(acc + D*p[v])
+// mg_pr_init_uniform_contrib — grid: ceil(V / MG_TG_SIZE)
+//   b0 MGPrParams (count = V; pad0 = 1 rescale else 0 raw)
+//   b1 out_weight_sum  (const float, V)
+//   b2 dst             (float, V)
 //
-// mg_pr_zero_fill — grid: ceil(n_zero_in / MG_TG_SIZE) [fc: UNIFORM_P]
-//   b0 MGPrParams (count = zero-in-degree list length)
-//   b1 zero_list       (const uint32)   zero IN-degree vertices
-//   b2 rank_next       (float, V)
-//   b3 iter_scalars    (const float)
-//   b4 pvec            (const float, V; dummy when UNIFORM_P)
-//   writes the same formula with acc = 0.
-//
-// mg_pr_dangling_partials — grid: ceil(n_dangling / MG_TG_SIZE)
-//   b0 MGPrParams (count = dangling list length)
-//   b1 dangling_list   (const uint32)   zero OUT-weight vertices
-//   b2 rank            (const float, V) rank_next of the iteration just done
-//   b3 partials        (float, #tgs)    per-threadgroup sums
-//
-// mg_sum_partials — grid: ceil(count / MG_TG_SIZE)
-//   b0 MGPrParams (count); b1 values (const float, count)
-//   b2 partials (float, #tgs)  per-tg sums; equal to mg_pr_dangling_partials
-//   over the identity list 0..count-1
-//
-// mg_pr_residual_partials — grid: ceil(V / MG_TG_SIZE)
+// mg_pr_init_pvec_contrib — grid: ceil(V / MG_TG_SIZE)
 //   b0 MGPrParams (count = V)
-//   b1 rank_a (const float, V)
-//   b2 rank_b (const float, V)
-//   b3 partials (float, #tgs)           per-tg sums of |a - b|
+//   b1 pvec            (const float, V)
+//   b2 out_weight_sum  (const float, V)
+//   b3 dst             (float, V)   dst[v] = ows[v] > 0 ? pvec[v]/ows[v] : pvec[v]
+//
+// mg_pr_gather_fused — single-dispatch fused gather across all GpuGatherPlan
+//   bins [n_tiles | n_tg | sg32_tgs | sg16_tgs | sg8_tgs | sg4_tgs | th_tgs |
+//   zero_tgs] [fc: WEIGHTED, UNIFORM_P]
+//   b0 MGFusedPrParams
+//   b1 vertices        (const uint32, V)    packed by bin (tiled..zact, iso)
+//   b2 tile_owner      (const uint32, n_tiles)  index into vertices[0..n_tiled)
+//   b3 tile_first      (const uint32, n_tiles)  CSR edge start of each 2048-tile
+//   b4 row_offsets     (const uint32, V+1)  IN-orientation CSR (or OUT for HITS)
+//   b5 col_indices     (const uint32, E)
+//   b6 contrib         (const float, V)
+//   b7 out_buf         (float, V)           next contrib/rank (or raw acc for HITS)
+//   b8 out_weight_sum  (const float, V; dummy for HITS)
+//   b9 iter_scalars    (const float, MG_SCALARS_LEN; dummy for HITS)
+//   b10 pvec           (const float, V; dummy when UNIFORM_P or HITS)
+//   b11 weights        (const float, E; dummy when !WEIGHTED)
+//   b12 tile_partials  (float, n_tiles)     per-tile partial sums
+//
+// mg_pr_tiled_finalize — grid: ceil(n_tiled / sgs_per_tg) [fc: UNIFORM_P]
+//   One simdgroup per tiled vertex; sums tile_partials in fixed stride order.
+//   b0 MGFusedPrParams; b1 vertices; b2 tiled_tile_off; b3 tile_partials;
+//   b4 out_buf; b5 out_weight_sum; b6 iter_scalars; b7 pvec
+//
+// mg_pr_dangling_partials — grid-stride over active_dangling (n_blocks tgs)
+//   b0 MGPrParams (count = n_active_dangling)
+//   b1 active_dangling (const uint32)       non-isolated zero-out-weight vertices
+//   b2 rank            (const float, V)
+//   b3 partials        (float, #tgs)
+//
+// mg_pr_dangling_finalize — grid: exactly 1 tg of MG_TG_SIZE
+//   Sums partials (n_partials > 0) or active_list directly (n_partials == 0 &&
+//   n_active > 0), updates MG_SCALAR_ISO_SCALE/_PREV and MG_SCALAR_DANGLING.
+//   b0 MGPrDangFinParams; b1 partials; b2 active_list; b3 values; b4 scalars
+//
+// mg_sum_partials — grid-stride over values[0..count) (HITS L1 norm)
+//   b0 MGPrParams (count); b1 values (const float, count); b2 partials
+//
+// mg_pr_residual_partials — grid-stride L1 diff over vertices[0..count)
+//   b0 MGPrResParams (count, flags = MG_PR_FLAG_RESCALE_OWS?)
+//   b1 vertices; b2 buf_a; b3 buf_b; b4 out_weight_sum; b5 partials
 //
 // mg_reduce_finalize — grid: exactly 1 tg of MG_TG_SIZE
-//   b0 MGReduceParams
-//   b1 partials (const float)
-//   b2 dst      (float)                 dst[dst_index] = sum(partials[0..n))
+//   b0 MGReduceParams; b1 partials (const float); b2 dst (float)
 //
 // ======================= batched PPR (spmv.metal, reduce.metal) ============
 // State layout: rank/contrib are float[V * MG_PPR_TILE], vertex-major
-// interleaved. iter_scalars_b is float[MG_PPR_TILE].
+// interleaved (two float4s per vertex). iter_scalars_b is float[MG_PPR_TILE].
 //
-// mg_pr_prepare_b — grid: ceil(V / MG_TG_SIZE), thread/vertex
-//   b0 MGPprParams (count = V)
-//   b1 rank_cur_b   (const float, V*TILE)
-//   b2 out_weight_sum (const float, V)
-//   b3 contrib_b    (float, V*TILE)
+// mg_pr_prepare_b — fallback only when !ows_safe_rescale, grid: ceil(V/TG)
+//   b0 MGPprParams (count = V); b1 rank4_cur_b; b2 out_weight_sum; b3 contrib4_b
 //
-// mg_pr_gather_tg_b / mg_pr_gather_sg_b / mg_pr_gather_thread_b
-//   [fc: WEIGHTED] — same gridding as single variants
-//   b0 MGPprParams (count = worklist length)
-//   b1 worklist     (const uint32)      IN-orientation bins
-//   b2 row_offsets  (const uint32)
-//   b3 col_indices  (const uint32)
-//   b4 contrib_b    (const float, V*TILE)
-//   b5 rank_next_b  (float, V*TILE)
-//   b6 rank_cur_b   (const float, V*TILE)  // copy-through for inactive lanes
-//   b7 weights      (const float; dummy when !WEIGHTED)
-//   writes per active lane t: rank_next_b[v*TILE+t] = alpha * acc_t
-//   (teleport & dangling added by seed_scatter; inactive lanes copy rank_cur)
+// mg_pr_tile_zero_b — tile init step 1, grid: ceil(V / MG_TG_SIZE)
+//   Zeroes all of buf0 and isolated vertices (pad0=n_iso, pad1=off_iso) of buf1.
+//   b0 MGPprParams; b1 buf0_4; b2 buf1_4; b3 vertices
 //
-// Batched write contract (final): gather kernels ASSIGN alpha*acc for
-// worklist vertices on active lanes and COPY rank_cur on inactive lanes;
-// mg_pr_zero_fill_b covers zero-in-degree vertices (assign 0 on active
-// lanes, copy on inactive); mg_pr_seed_scatter_b then ADDS teleport +
-// dangling for active lanes only. Together every (v, lane) slot is written
-// exactly once per iteration before seed_scatter adds on top.
+// mg_pr_seed_init_b — tile init step 2, grid: ceil(seed_total / MG_TG_SIZE)
+//   b0 MGPprParams (count = seed_total, pad0 = MG_PR_FLAG_RESCALE_OWS?)
+//   b1 seed_vertex; b2 seed_lane; b3 seed_weight; b4 out_weight_sum; b5 buf0
 //
-// mg_pr_zero_fill_b — grid: ceil(n_zero_in / MG_TG_SIZE)
-//   b0 MGPprParams (count = zero-in list length)
-//   b1 zero_list    (const uint32)
-//   b2 rank_next_b  (float, V*TILE)
-//   b3 rank_cur_b   (const float, V*TILE)
-//   active lanes: rank_next = 0; inactive: rank_next = rank_cur.
+// mg_pr_gather_fused_b — single-dispatch fused batched gather [fc: WEIGHTED]
+//   Covers all non-isolated vertices (include_iso = false); active lanes assign
+//   alpha*acc (/ ows when RESCALE_OWS), inactive lanes copy cur4_b.
+//   b0 MGFusedPprParams
+//   b1 vertices; b2 tile_owner; b3 tile_first; b4 row_offsets; b5 col_indices;
+//   b6 contrib4_b; b7 out4_b; b8 cur4_b; b9 out_weight_sum;
+//   b10 weights (dummy when !WEIGHTED); b11 tile_partials_b (n_tiles * TILE)
+//
+// mg_pr_tiled_finalize_b — grid: ceil(n_tiled / sgs_per_tg)
+//   b0 MGFusedPprParams; b1 vertices; b2 tiled_tile_off; b3 partials4_b;
+//   b4 out4_b; b5 cur4_b; b6 out_weight_sum
 //
 // mg_pr_seed_scatter_b — grid: ceil(seed_total / MG_TG_SIZE), thread/seed
-//   b0 MGPprParams (count = seed_total)
-//   b1 seed_vertex  (const uint32, seed_total)  canonical vertex per seed
-//   b2 seed_lane    (const uint32, seed_total)  query lane in [0, TILE)
-//   b3 seed_weight  (const float,  seed_total)  normalized within each query
-//   b4 iter_scalars_b (const float, TILE)       dangling mass per lane
-//   b5 rank_next_b  (float, V*TILE)
-//   active lane t: rank_next_b[v*TILE+t] += (1-a)*w + a*D_t*w
-//   (seeds pre-deduplicated per (v,lane) on host => no write conflicts)
-//   inactive lanes: skip.
+//   b0 MGPprParams (count = seed_total, pad0 = MG_PR_FLAG_RESCALE_OWS?)
+//   b1 seed_vertex; b2 seed_lane (bits 0..7 lane, bit 8 MG_PPR_SEED_ISO_BIT);
+//   b3 seed_weight; b4 iter_scalars_b; b5 out_weight_sum; b6 out_b; b7 cur_b
+//   Non-isolated active: out_b += add (/ ows if rescaled); isolated active:
+//   out_b = add; isolated inactive: out_b = cur_b.
 //
-// Tile init (head of a tile's first batch): mg_pr_tile_zero_b then
-// mg_pr_seed_init_b set rank_cur_b = the per-lane seed vectors.
-// mg_pr_tile_zero_b — grid: ceil(V / MG_TG_SIZE), thread/vertex
-//   b0 MGPprParams (count = V); b1 rank_b (float4, V*TILE/4) = 0
-// mg_pr_seed_init_b — grid: ceil(seed_total / MG_TG_SIZE), thread/seed
-//   b0 MGPprParams (count = seed_total); b1 seed_vertex; b2 seed_lane;
-//   b3 seed_weight (as mg_pr_seed_scatter_b); b4 rank_b (float, V*TILE)
-//   rank_b[v*TILE+lane] = w (deduplicated seeds => single writer).
+// mg_pr_dangling_partials_b — grid-stride over active_dangling
+//   b0 MGPprParams (count = n_active_dangling); b1 dangling_list; b2 buf4_b;
+//   b3 partials (float, #tgs * TILE)
 //
-// mg_pr_dangling_partials_b — grid: ceil(n_dangling / MG_TG_SIZE)
-//   b0 MGPprParams (count = dangling list length)
-//   b1 dangling_list (const uint32)
-//   b2 rank_b        (const float, V*TILE)
-//   b3 partials      (float, #tgs * TILE)  partials[tg*TILE + lane]
+// mg_reduce_finalize_b — grid: exactly 1 tg of MG_TG_SIZE
+//   Sums partials4 (n_partials > 0) or active_list directly (n_partials == 0 &&
+//   n_active > 0), then adds isolated seeds (MG_PPR_SEED_ISO_BIT) per active lane.
+//   b0 MGPprDangFinParams; b1 partials4; b2 active_list; b3 seed_vertex;
+//   b4 seed_lane; b5 buf4_b; b6 dst (float, TILE)
 //
-// mg_reduce_finalize_b — grid: exactly 1 tg
-//   b0 MGReduceParams (n_partials = #tgs of the partials pass)
-//   b1 partials (const float, n_partials * TILE)
-//   b2 dst      (float, TILE)            dst[lane] = sum over blocks
+// mg_pr_residual_partials_b — grid-stride L1 diff over vertices[0..count)
+//   b0 MGPrResParams (count, flags, active_mask); b1 vertices; b2 buf4_a;
+//   b3 buf4_b; b4 out_weight_sum; b5 partials (float, #tgs * TILE)
 //
-// mg_pr_residual_partials_b — grid: ceil(V / MG_TG_SIZE)
-//   b0 MGPprParams (count = V)
-//   b1 rank_a_b (const float, V*TILE)
-//   b2 rank_b_b (const float, V*TILE)
-//   b3 partials (float, #tgs * TILE)     per-lane |a-b| block sums
-//
-// ======================= huge-bin tiling (spmv.metal, wcc.metal) ===========
-// Tile arrays live on the Orientation (built once, deterministic):
-//   wl_huge         uint32 n_huge      huge vertices, ascending canonical
+// ======================= huge-bin tiling (wcc.metal) =======================
+// Orientation huge-tile arrays (built once, deterministic, exposed via debug):
+//   wl_huge         uint32 n_huge      huge vertices (deg >= MG_BIN_HUGE_MIN)
 //   tile_owner      uint32 n_tiles     index INTO wl_huge per tile
 //   tile_first_edge uint32 n_tiles     absolute CSR edge index of tile start
 //   huge_tile_off   uint32 n_huge+1    contiguous tile range per huge vertex
-// Tile t covers edges [tile_first_edge[t],
-//                      min(row_off[v+1], tile_first_edge[t] +
-//                          MG_HUGE_TILE_EDGES)) of v = wl_huge[tile_owner[t]].
-//
-// mg_pr_gather_huge_partials — grid: n_tiles tgs of MG_TG_SIZE [fc: WEIGHTED]
-//   b0 MGPrParams (count = n_tiles)
-//   b1 tile_owner; b2 tile_first_edge; b3 wl_huge; b4 row_offsets;
-//   b5 col_indices; b6 contrib (const float, V);
-//   b7 weights (dummy when !WEIGHTED); b8 partials (float, n_tiles)
-//   partials[t] = tile's (weighted) contrib sum, tg-reduced.
-//
-// mg_pr_gather_huge_finalize — grid: ceil(n_huge/MG_TG_SIZE) [fc: UNIFORM_P]
-//   b0 MGPrParams (count = n_huge)
-//   b1 wl_huge; b2 huge_tile_off; b3 partials (const float);
-//   b4 rank_next; b5 iter_scalars; b6 pvec (dummy when UNIFORM_P)
-//   thread per huge vertex: acc = sum of its tile partials IN TILE ORDER,
-//   then the standard mg_pr_write formula.
-//
-// mg_pr_gather_huge_partials_b — same grid as _partials [fc: WEIGHTED]
-//   b0 MGPprParams (count = n_tiles)
-//   b1 tile_owner; b2 tile_first_edge; b3 wl_huge; b4 row_offsets;
-//   b5 col_indices; b6 contrib_b (V*TILE); b7 weights (dummy);
-//   b8 partials_b (float, n_tiles*TILE)  partials_b[t*TILE + lane]
-//
-// mg_pr_gather_huge_finalize_b — grid: ceil(n_huge/MG_TG_SIZE)
-//   b0 MGPprParams (count = n_huge)
-//   b1 wl_huge; b2 huge_tile_off; b3 partials_b; b4 rank_next_b;
-//   b5 rank_cur_b
-//   batched write contract: active lanes ASSIGN alpha*acc, inactive COPY.
-//
 // mg_wcc_link takes huge tiles in the first n_tiles threadgroups of its
 //   grid: per-edge filtered union-find link over the tile (see WCC section).
 //
@@ -545,23 +590,28 @@ typedef struct MGScanParams {
 // selection oracle wholesale. The candidate SET is deterministic (append
 // order is not; the host sort restores full output determinism).
 //
-// Threshold = 4 passes (pass = 0..3) of mg_topk_hist_b then mg_topk_digit_b
-// in one encoder; the host zeroes hist and thresholds and sets
-// select_state = {remaining[TILE] = k, class_size[TILE] = V} first.
+// Threshold = up to 4 passes (pass = 0..3) of mg_topk_hist_b then
+// mg_topk_digit_b in one encoder; the host zeroes hist and thresholds and sets
+// select_state = {remaining[TILE]=k, class_size[TILE]=V, pending=active_mask}.
+// Lanes finish early as soon as (k - rem) + class_size <= cap; lanes still
+// exceeding cap at pass 3 set MG_TOPK_STRICT_GT_BIT on thresholds[lane].
 // mg_topk_hist_b — grid: any number of tgs of MG_TG_SIZE (grid-stride)
-//   b0 MGTopkParams (pass); b1 rank_b (const float4, V*TILE/4)
-//   b2 thresholds (const uint32, TILE)  prefix decided by earlier passes
-//   b3 hist (atomic_uint, TILE*256)  += per-lane counts of digits 1..255
+//   b0 MGTopkParams (pass, flags = MG_TOPK_FLAG_UNSCALE_OWS?)
+//   b1 rank_b (float4, V*TILE/4; unscaled in place on pass 0 when flagged)
+//   b2 out_weight_sum (const float, V)
+//   b3 thresholds (const uint32, TILE)  prefix decided by earlier passes
+//   b4 select_state (const uint32, MG_TOPK_STATE_LEN)  reads pending_mask
+//   b5 hist (atomic_uint, TILE*256)  += per-lane counts of digits 1..255
 // mg_topk_digit_b — grid: exactly 1 tg of MG_TG_SIZE
 //   b0 MGTopkParams (k <= v_count required; pass)
 //   b1 hist (atomic_uint, TILE*256)  read, then zeroed for the next pass
-//   b2 thresholds (uint32, TILE)  |= the selected digit of this pass;
-//      after pass 3 the raw bit pattern of the k-th largest score
-//   b3 select_state (uint32, 2*TILE)  remaining rank, then class size
+//   b2 thresholds (uint32, TILE)  |= selected digit (| STRICT_GT_BIT on pass 3
+//      if total_ge > cap)
+//   b3 select_state (uint32, MG_TOPK_STATE_LEN)  remaining, class_size, pending
 // mg_topk_compact_b — grid: ceil(V / MG_TG_SIZE), thread per vertex
 //   b0 MGTopkParams
-//   b1 rank_b; b2 thresholds (const uint32)
-//   b3 counters   (atomic_uint, TILE)  zeroed by host; may exceed cap
+//   b1 rank_b (const float4); b2 thresholds (const uint32)
+//   b3 counters   (atomic_uint, TILE)  zeroed by host; guaranteed <= cap
 //   b4 candidates (uint32, TILE*cap, lane-major: candidates[lane*cap + i])
 //
 // ======================= scan (scan.metal) ==================================

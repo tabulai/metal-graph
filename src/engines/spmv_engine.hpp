@@ -1,10 +1,5 @@
-// spmv_engine.hpp — host dispatch driver for the PageRank / batched-PPR
-// gather pipelines (spmv.metal). Encodes either a full PageRank power
-// iteration (prepare -> degree-binned gather -> zero-fill), a prepared raw
-// gather for HITS, or the corresponding batched-PPR path. The dangling
-// reduce is ReduceEngine's job. Internal engine layer: algo entry points own
-// buffers, ping-pong, and iteration/audit policy. Bindings follow the tables
-// in src/kernels/mg_params.h (params at buffer 0, listed buffers from 1).
+// spmv_engine.hpp — host dispatch driver for the fused single-dispatch
+// PageRank / HITS / batched-PPR gather pipelines (spmv.metal).
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
@@ -19,63 +14,54 @@ namespace mg {
 class SpmvEngine {
  public:
   // Caches the pipelines for one configuration. batched=false builds the
-  // single-query set (gather uses MG_FC_WEIGHTED + MG_FC_UNIFORM_P),
-  // batched=true the _b set (MG_FC_WEIGHTED only; teleport and dangling
-  // mass go through mg_pr_seed_scatter_b). Requires a live GPU.
+  // single-query set (MG_FC_WEIGHTED + MG_FC_UNIFORM_P), batched=true the _b
+  // set (MG_FC_WEIGHTED only). Requires a live GPU.
   SpmvEngine(Runtime& rt, bool weighted, bool uniform_p, bool batched);
 
-  // One single-query iteration: mg_pr_prepare -> mg_pr_gather_{tg,sg,thread}
-  // (zero-count bins skipped) -> mg_pr_zero_fill. `base` carries
-  // alpha/one_minus_alpha/p_uniform/v_count; count is set per dispatch.
-  // pvec must be Runtime::dummy() when uniform_p, weights when unweighted.
+  // One fused single-query PageRank iteration.
+  // When rescale_ows == true: `in_buf` already holds contrib (rank/ows for
+  // ows>0, rank for dangling), no prepare runs, and `out_buf` receives the
+  // next contrib. When rescale_ows == false (extreme weights): runs
+  // mg_pr_prepare into `contrib_scratch` and writes raw rank to `out_buf`.
+  // `include_iso`: when true, writes isolated vertices too (audit boundary).
   void encode_iteration(CommandBatch& cb, const Orientation& in_o,
-                        MGPrParams base, Buffer* rank_cur, Buffer* contrib,
-                        Buffer* rank_next, Buffer* iter_scalars, Buffer* pvec,
-                        Buffer* out_weight_sum, Buffer* weights);
+                        const GpuGatherPlan& plan, MGPrParams base,
+                        Buffer* in_buf, Buffer* contrib_scratch,
+                        Buffer* out_buf, Buffer* iter_scalars, Buffer* pvec,
+                        Buffer* out_weight_sum, Buffer* weights,
+                        bool rescale_ows, bool include_iso);
 
-  // Degree-binned single-query gather without mg_pr_prepare. `contrib` is
-  // already the per-source value to sum. This is the raw adjacency-vector
-  // primitive used by HITS; the engine must be constructed non-batched.
+  // Raw prepared adjacency-vector multiply for HITS (writes acc directly for
+  // every vertex including zero-degree vertices, no alpha/pvec/rescale).
   void encode_prepared_gather(CommandBatch& cb, const Orientation& orientation,
-                              MGPrParams base, Buffer* contrib,
-                              Buffer* output, Buffer* iter_scalars,
-                              Buffer* pvec, Buffer* weights);
+                              const GpuGatherPlan& plan, MGPrParams base,
+                              Buffer* input, Buffer* output, Buffer* weights);
 
-  // One batched tile iteration: mg_pr_prepare_b -> gather _b bins ->
-  // mg_pr_zero_fill_b -> mg_pr_seed_scatter_b. `base` carries alpha/
-  // one_minus_alpha/v_count/active_mask/seed_total. Seeds must be
-  // pre-deduplicated per (vertex, lane) — single writer per slot.
+  // One fused batched PPR tile iteration (8 lanes).
+  // When rescale_ows == true: `in_buf_b` holds contrib_b, `contrib_scratch_b`
+  // is unused, and `out_buf_b` receives next contrib_b.
   void encode_iteration_b(CommandBatch& cb, const Orientation& in_o,
-                          MGPprParams base, Buffer* rank_cur_b,
-                          Buffer* contrib_b, Buffer* rank_next_b,
-                          Buffer* iter_scalars_b, Buffer* out_weight_sum,
-                          Buffer* weights, Buffer* seed_vertex,
-                          Buffer* seed_lane, Buffer* seed_weight);
+                          const GpuGatherPlan& plan, MGPprParams base,
+                          Buffer* in_buf_b, Buffer* contrib_scratch_b,
+                          Buffer* out_buf_b, Buffer* iter_scalars_b,
+                          Buffer* out_weight_sum, Buffer* weights,
+                          Buffer* seed_vertex, Buffer* seed_lane,
+                          Buffer* seed_weight, bool rescale_ows);
 
  private:
-  // Huge-bin tile partials scratch, sized on first encode for the
-  // orientation in use (engines are per-call; orientation is fixed).
-  Buffer* huge_scratch(const Orientation& o, bool batched);
+  Buffer* tile_scratch(const GpuGatherPlan& plan, bool batched);
 
   Runtime& rt_;
   MTL::ComputePipelineState* prepare_ = nullptr;
-  MTL::ComputePipelineState* gather_tg_ = nullptr;
-  MTL::ComputePipelineState* gather_sg_ = nullptr;
-  MTL::ComputePipelineState* gather_th_ = nullptr;
-  MTL::ComputePipelineState* zero_fill_ = nullptr;
-  MTL::ComputePipelineState* huge_partials_ = nullptr;
-  MTL::ComputePipelineState* huge_finalize_ = nullptr;
+  MTL::ComputePipelineState* gather_fused_ = nullptr;
+  MTL::ComputePipelineState* tiled_finalize_ = nullptr;
   MTL::ComputePipelineState* prepare_b_ = nullptr;
-  MTL::ComputePipelineState* gather_tg_b_ = nullptr;
-  MTL::ComputePipelineState* gather_sg_b_ = nullptr;
-  MTL::ComputePipelineState* gather_th_b_ = nullptr;
-  MTL::ComputePipelineState* zero_fill_b_ = nullptr;
+  MTL::ComputePipelineState* gather_fused_b_ = nullptr;
+  MTL::ComputePipelineState* tiled_finalize_b_ = nullptr;
   MTL::ComputePipelineState* seed_scatter_b_ = nullptr;
-  MTL::ComputePipelineState* huge_partials_b_ = nullptr;
-  MTL::ComputePipelineState* huge_finalize_b_ = nullptr;
-  BufferPtr huge_scratch_;
-  uint32_t sgs_per_tg_ = 8;    // MG_TG_SIZE / exec_width(gather_sg)
-  uint32_t sgs_per_tg_b_ = 8;  // MG_TG_SIZE / exec_width(gather_sg_b)
+  BufferPtr tile_scratch_;
+  uint32_t sgs_per_tg_ = 8;
+  uint32_t sgs_per_tg_b_ = 8;
 };
 
 }  // namespace mg

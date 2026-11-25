@@ -12,7 +12,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
-#include <array>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -52,9 +51,22 @@ double elapsed_ms(std::chrono::steady_clock::time_point t0) {
       .count();
 }
 
-// Deterministic fp64 L1 distance of two float vectors.
-double l1_diff(const float* a, const float* b, uint32_t n) {
-  const std::size_t chunks = (n + kAuditChunk - 1) / kAuditChunk;
+// Deterministic fp64 sum of p over a vertex list `list[0..n)`.
+double p_list_sum(const Graph& g, const uint32_t* list, uint32_t n,
+                  const double* p_canon, const float* p_user, double p_sum) {
+  if (n == 0) return 0.0;
+  const uint32_t* user_of = g.user_of_canon.data();
+  const std::size_t chunks = (std::size_t{n} + kAuditChunk - 1) / kAuditChunk;
+  if (chunks <= 1) {
+    double d = 0.0;
+    if (p_canon) {
+      for (uint32_t i = 0; i < n; ++i) d += p_canon[list[i]];
+    } else {
+      for (uint32_t i = 0; i < n; ++i)
+        d += static_cast<double>(p_user[user_of[list[i]]]) / p_sum;
+    }
+    return d;
+  }
   std::vector<double> part(chunks, 0.0);
   parallel_for(
       chunks,
@@ -63,52 +75,19 @@ double l1_diff(const float* a, const float* b, uint32_t n) {
           const std::size_t lo = c * kAuditChunk;
           const std::size_t hi = std::min<std::size_t>(n, lo + kAuditChunk);
           double s = 0.0;
-          for (std::size_t i = lo; i < hi; ++i)
-            s += std::fabs(static_cast<double>(a[i]) -
-                           static_cast<double>(b[i]));
-          part[c] = s;
-        }
-      },
-      1);
-  double total = 0.0;
-  for (double v : part) total += v;
-  return total;
-}
-
-// Per-lane deterministic fp64 L1 over vertex-major interleaved tile state
-// (state[v * MG_PPR_TILE + lane]); only lanes in `mask` are reported (others
-// are 0). Every lane is accumulated branch-free so the lane loop vectorizes;
-// each lane's sum is still its own sequential chain, so the reported values
-// do not depend on the mask.
-void l1_diff_lanes(const float* a, const float* b, uint32_t v_count,
-                   uint32_t mask, double err[MG_PPR_TILE]) {
-  const std::size_t chunks = (v_count + kAuditChunk - 1) / kAuditChunk;
-  std::vector<std::array<double, MG_PPR_TILE>> part(
-      chunks, std::array<double, MG_PPR_TILE>{});
-  parallel_for(
-      chunks,
-      [&](std::size_t cb, std::size_t ce) {
-        for (std::size_t c = cb; c < ce; ++c) {
-          const std::size_t lo = c * kAuditChunk;
-          const std::size_t hi =
-              std::min<std::size_t>(v_count, lo + kAuditChunk);
-          std::array<double, MG_PPR_TILE> s{};
-          for (std::size_t v = lo; v < hi; ++v) {
-            const float* av = a + v * MG_PPR_TILE;
-            const float* bv = b + v * MG_PPR_TILE;
-            for (uint32_t l = 0; l < MG_PPR_TILE; ++l)
-              s[l] += std::fabs(static_cast<double>(av[l]) -
-                                static_cast<double>(bv[l]));
+          if (p_canon) {
+            for (std::size_t i = lo; i < hi; ++i) s += p_canon[list[i]];
+          } else {
+            for (std::size_t i = lo; i < hi; ++i)
+              s += static_cast<double>(p_user[user_of[list[i]]]) / p_sum;
           }
           part[c] = s;
         }
       },
       1);
-  for (uint32_t l = 0; l < MG_PPR_TILE; ++l) err[l] = 0.0;
-  for (const auto& s : part)
-    for (uint32_t l = 0; l < MG_PPR_TILE; ++l) err[l] += s[l];
-  for (uint32_t l = 0; l < MG_PPR_TILE; ++l)
-    if (!((mask >> l) & 1u)) err[l] = 0.0;
+  double total = 0.0;
+  for (double x : part) total += x;
+  return total;
 }
 
 // Teleport vector p (also iterate 0) of one GPU PageRank solve, in exactly
@@ -122,48 +101,53 @@ struct PrTeleport {
   double user_sum = 0.0;          // boundary::personalization_sum(user)
 };
 
-// GPU single-query PageRank. emit(rank) receives the FINAL fp32 iterate
-// (canonical order, length V) while the device buffers are still alive.
-// Host work is kept to what the result needs: no fp64 copy of p or of the
-// result, no zero-fill of buffers that are fully written before any read.
+// GPU single-query PageRank. emit(buf, rescaled) receives the FINAL fp32
+// iterate (canonical order, length V) while device buffers are still alive;
+// when rescaled == true, non-dangling entries hold rank / out_weight_sum.
 int gpu_pagerank_impl(Graph& g, const PrTeleport& p, double alpha, double tol,
                       int max_iter, int audit_interval,
-                      const std::function<void(const float*)>& emit) {
+                      const std::function<void(const float*, bool)>& emit) {
   Runtime& rt = Runtime::instance();
   const uint32_t V = g.V;
   if (V == 0) return 0;
   if (audit_interval < 1) audit_interval = 1;
   const Orientation& in_o = g.orientation(Dir::in);
+  const GpuGatherPlan& plan = g.gpu_gather_plan(Dir::in);
+  const bool rescale = plan.ows_safe_rescale;
 
   SpmvEngine spmv(rt, g.weighted, p.uniform, /*batched=*/false);
   ReduceEngine reduce(rt, /*batched=*/false);
+  MTL::ComputePipelineState* pso_init_u =
+      p.uniform ? rt.pipeline("mg_pr_init_uniform_contrib") : nullptr;
+  MTL::ComputePipelineState* pso_init_p =
+      (!p.uniform && rescale) ? rt.pipeline("mg_pr_init_pvec_contrib")
+                              : nullptr;
 
-  // rank/contrib/pvec skip the zero-fill: every element is written before
-  // any read (iterate 0 below; mg_pr_prepare writes all of contrib; the
-  // gather bins plus the zero list partition V, so each iteration writes
-  // every rank entry).
   BufferPtr dummy = rt.dummy();
-  BufferPtr rank[2] = {rt.alloc_scratch(std::size_t{V} * 4, "pr.rank0"),
-                       rt.alloc_scratch(std::size_t{V} * 4, "pr.rank1")};
-  BufferPtr contrib = rt.alloc_scratch(std::size_t{V} * 4, "pr.contrib");
-  BufferPtr scalars = rt.alloc(MG_SCALARS_LEN * 4, "pr.iter_scalars");
+  BufferPtr buf[2] = {rt.alloc_scratch(std::size_t{V} * 4, "pr.buf0"),
+                      rt.alloc_scratch(std::size_t{V} * 4, "pr.buf1")};
+  BufferPtr contrib =
+      rescale ? dummy : rt.alloc_scratch(std::size_t{V} * 4, "pr.contrib");
+  BufferPtr scalars = rt.alloc_scratch(MG_SCALARS_LEN * 4, "pr.iter_scalars");
   BufferPtr pvec_buf = dummy;
-  BufferPtr partials = dummy;
-  if (g.n_dangling)
-    partials =
-        rt.alloc(std::size_t{ReduceEngine::n_blocks(g.n_dangling)} * 4,
-                 "pr.dangling_partials");
+  BufferPtr dang_partials =
+      (plan.n_active_dangling > ReduceEngine::kSingleTgMax)
+          ? rt.alloc_scratch(
+                std::size_t{ReduceEngine::n_blocks(plan.n_active_dangling)} * 4,
+                "pr.dangling_partials")
+          : dummy;
+  const uint32_t n_active_v = plan.off_iso;
+  BufferPtr res_partials =
+      n_active_v
+          ? rt.alloc_scratch(
+                std::size_t{ReduceEngine::n_blocks(n_active_v)} * 4,
+                "pr.residual_partials")
+          : dummy;
 
-  // Iterate 0 is p in fp32. Personalized: the host fills pvec_buf once and
-  // the first iteration reads it as its rank input (no separate rank0
-  // copy). Uniform: mg_fill_f32 writes rank[0] at the head of the first
-  // batch. iter_scalars[MG_SCALAR_DANGLING] = dangling mass of p, summed on
-  // the host in fp64 in dangling-list order; when n_dangling == 0 the slot
-  // stays 0 (alloc zero-fills) and dangling kernels never run.
   const float* p_user = p.user;
   const double p_sum = p.user_sum;
   const uint32_t* user_of = g.user_of_canon.data();
-  Buffer* cur = rank[0].get();
+  Buffer* cur = buf[0].get();
   if (!p.uniform) {
     pvec_buf = rt.alloc_scratch(std::size_t{V} * 4, "pr.pvec");
     float* pf = pvec_buf->as<float>();
@@ -177,22 +161,30 @@ int gpu_pagerank_impl(Graph& g, const PrTeleport& p, double alpha, double tol,
                                      p_sum);
       }
     });
-    cur = pvec_buf.get();
+    if (!rescale) cur = pvec_buf.get();
   }
+
+  double d0 = 0.0;
+  double iso_p_sum = 0.0;
   if (g.n_dangling) {
-    const uint32_t* dl = g.dangling_list->as<uint32_t>();
-    double d = 0.0;
     if (p.uniform) {
-      const double u = 1.0 / static_cast<double>(V);
-      for (uint32_t i = 0; i < g.n_dangling; ++i) d += u;
-    } else if (p.canon) {
-      for (uint32_t i = 0; i < g.n_dangling; ++i) d += p.canon[dl[i]];
+      d0 = static_cast<double>(g.n_dangling) / static_cast<double>(V);
+      iso_p_sum = static_cast<double>(plan.n_iso) / static_cast<double>(V);
     } else {
-      for (uint32_t i = 0; i < g.n_dangling; ++i)
-        d += static_cast<double>(p_user[user_of[dl[i]]]) / p_sum;
+      d0 = p_list_sum(g, g.dangling_list->as<uint32_t>(), g.n_dangling, p.canon,
+                      p_user, p_sum);
+      if (plan.n_iso) {
+        iso_p_sum =
+            p_list_sum(g, plan.vertices->as<uint32_t>() + plan.off_iso,
+                       plan.n_iso, p.canon, p_user, p_sum);
+      }
     }
-    scalars->as<float>()[MG_SCALAR_DANGLING] = static_cast<float>(d);
   }
+  float* sc = scalars->as<float>();
+  sc[MG_SCALAR_DANGLING] = static_cast<float>(d0);
+  sc[MG_SCALAR_ISO_SCALE] = 1.0f;
+  sc[MG_SCALAR_ISO_SCALE_PREV] = 1.0f;
+  sc[3] = 0.0f;
 
   MGPrParams base{};
   base.alpha = static_cast<float>(alpha);
@@ -203,40 +195,71 @@ int gpu_pagerank_impl(Graph& g, const PrTeleport& p, double alpha, double tol,
   Buffer* weights =
       (g.weighted && in_o.weights) ? in_o.weights.get() : dummy.get();
 
-  // Ping-pong between rank[0] and rank[1]; `prev` is the previous iterate
-  // (pvec_buf after the first personalized iteration).
   Buffer* prev = nullptr;
-  int next = cur == rank[0].get() ? 1 : 0;
+  int next = (cur == buf[0].get()) ? 1 : 0;
   int done = 0;
   while (done < max_iter) {
     const int k = boundary::next_audit_batch(done, max_iter, audit_interval);
     CommandBatch cb(rt);
-    if (done == 0 && p.uniform) {
-      const MGFillParams fill{base.p_uniform, 0u, V, 0u};
-      cb.dispatch(rt.pipeline("mg_fill_f32"), &fill, sizeof(fill), {cur},
-                  ceil_div_u32(V, MG_TG_SIZE), MG_TG_SIZE);
+    if (done == 0) {
+      if (p.uniform) {
+        MGPrParams ip = base;
+        ip.count = V;
+        ip.pad0 = rescale ? 1u : 0u;
+        cb.dispatch(pso_init_u, &ip, sizeof(ip),
+                    {g.out_weight_sum.get(), cur}, ceil_div_u32(V, MG_TG_SIZE),
+                    MG_TG_SIZE);
+      } else if (rescale) {
+        MGPrParams ip = base;
+        ip.count = V;
+        cb.dispatch(pso_init_p, &ip, sizeof(ip),
+                    {pvec_buf.get(), g.out_weight_sum.get(), cur},
+                    ceil_div_u32(V, MG_TG_SIZE), MG_TG_SIZE);
+      }
     }
     for (int i = 0; i < k; ++i) {
-      Buffer* out = rank[next].get();
-      spmv.encode_iteration(cb, in_o, base, cur, contrib.get(), out,
+      Buffer* out = buf[next].get();
+      spmv.encode_iteration(cb, in_o, plan, base, cur, contrib.get(), out,
                             scalars.get(), pvec_buf.get(),
-                            g.out_weight_sum.get(), weights);
-      reduce.encode_list_sum(cb, base, g.n_dangling, g.dangling_list.get(),
-                             out, partials.get(), scalars.get(),
-                             MG_SCALAR_DANGLING);
+                            g.out_weight_sum.get(), weights, rescale,
+                            /*include_iso=*/(i == k - 1));
+      reduce.encode_pr_dangling(cb, base.alpha, base.one_minus_alpha,
+                                static_cast<float>(iso_p_sum),
+                                plan.n_active_dangling, plan.n_iso,
+                                plan.active_dangling.get(), out,
+                                dang_partials.get(), scalars.get());
       prev = cur;
       cur = out;
       next ^= 1;
     }
+    const uint32_t res_blocks = reduce.encode_residual(
+        cb, n_active_v, rescale, plan.vertices.get(), cur, prev,
+        g.out_weight_sum.get(), res_partials.get());
     cb.commit_and_wait();
     done += k;
-    const double err = l1_diff(cur->as<float>(), prev->as<float>(), V);
+    double err = 0.0;
+    if (res_blocks > 0) {
+      const float* rp = res_partials->as<float>();
+      for (uint32_t b = 0; b < res_blocks; ++b)
+        err += static_cast<double>(rp[b]);
+    }
+    if (plan.n_iso > 0) {
+      const float* s = scalars->as<float>();
+      err += std::fabs(static_cast<double>(s[MG_SCALAR_ISO_SCALE]) -
+                       static_cast<double>(s[MG_SCALAR_ISO_SCALE_PREV])) *
+             iso_p_sum;
+    }
     if (err < static_cast<double>(V) * tol) break;
   }
-  if (done == 0 && p.uniform)  // max_iter < 1: the GPU fill never ran
-    std::fill_n(cur->as<float>(), V, base.p_uniform);
+  if (done == 0) {  // max_iter < 1: GPU init never ran
+    if (p.uniform) {
+      std::fill_n(cur->as<float>(), V, base.p_uniform);
+    } else {
+      cur = pvec_buf.get();
+    }
+  }
 
-  emit(cur->as<float>());
+  emit(cur->as<float>(), done > 0 && rescale);
   return done;
 }
 
@@ -249,11 +272,6 @@ namespace gpu {
 
 int pagerank(Graph& g, const double* pvec_canon, double alpha, double tol,
              int max_iter, int audit_interval, double* rank_canon) {
-  // The entry point passes uniformity explicitly (personalization ==
-  // nullptr). External callers of gpu::pagerank get exact-value detection:
-  // boundary::pvec_to_canon fills the uniform vector with bit-identical
-  // 1/V entries, and a personalization that equals uniform exactly is
-  // semantically identical under MG_FC_UNIFORM_P anyway.
   PrTeleport p;
   p.uniform = true;
   if (g.V) {
@@ -267,42 +285,42 @@ int pagerank(Graph& g, const double* pvec_canon, double alpha, double tol,
     }
   }
   return gpu_pagerank_impl(
-      g, p, alpha, tol, max_iter, audit_interval, [&](const float* rc) {
+      g, p, alpha, tol, max_iter, audit_interval,
+      [&](const float* rc, bool rescaled) {
+        const float* ows = g.out_weight_sum->as<float>();
         parallel_for(g.V, [&](std::size_t b, std::size_t e) {
-          for (std::size_t i = b; i < e; ++i)
-            rank_canon[i] = static_cast<double>(rc[i]);
+          for (std::size_t i = b; i < e; ++i) {
+            float v = rc[i];
+            if (rescaled && ows[i] > 0.0f) v *= ows[i];
+            rank_canon[i] = static_cast<double>(v);
+          }
         });
       });
 }
 
 // Shared tile loop: iterate every tile to convergence/budget and hand the
-// FINAL interleaved tile state to on_tile(q0, lanes, rank_final). Returns
-// the max iteration count over all queries. Callers layer their own
-// extraction (sink deinterleave, or GPU top-k select) on top.
-// Tile t holds queries [tile_q[t], tile_q[t + 1]) (at most MG_PPR_TILE
-// each); an empty tile_q means consecutive tiles of MG_PPR_TILE. Lanes
-// never interact (each freezes at its own audit boundary), so a query's
-// result does not depend on its tile; the grouping only sets the work, as
-// a tile iterates until its slowest lane freezes.
-static int ppr_tiles(Graph& g, const uint32_t* seeds_canon,
-                     const float* seed_w, const uint64_t* offsets,
-                     uint32_t n_queries, double alpha, double tol,
-                     int max_iter, int audit_interval,
-                     const std::vector<uint32_t>& tile_q,
-                     const std::function<void(uint32_t, uint32_t, Buffer*)>&
-                         on_tile) {
+// FINAL interleaved tile state to on_tile(q0, lanes, rank_final, needs_unscale).
+static int ppr_tiles(
+    Graph& g, const uint32_t* seeds_canon, const float* seed_w,
+    const uint64_t* offsets, uint32_t n_queries, double alpha, double tol,
+    int max_iter, int audit_interval, const std::vector<uint32_t>& tile_q,
+    const std::function<void(uint32_t, uint32_t, Buffer*, bool)>& on_tile) {
   Runtime& rt = Runtime::instance();
   const uint32_t V = g.V;
   if (n_queries == 0 || V == 0) return 0;
   if (audit_interval < 1) audit_interval = 1;
   const Orientation& in_o = g.orientation(Dir::in);
+  const Orientation& out_o = g.orientation(Dir::out);
+  const GpuGatherPlan& plan = g.gpu_gather_plan(Dir::in);
+  const bool rescale = plan.ows_safe_rescale;
 
-  // Working-set guard: tile state is 3 * V * MG_PPR_TILE fp32 (rank x2 +
-  // contrib) on top of the resident IN-orientation CSR.
+  // Working-set guard: tile state is 2 * V * MG_PPR_TILE fp32 (3 in the rare
+  // extreme-weight fallback) on top of the resident IN-orientation CSR.
   if (rt.has_gpu()) {
     const uint64_t budget = rt.device()->recommendedMaxWorkingSetSize();
+    const uint64_t n_tile_bufs = rescale ? 2ull : 3ull;
     const uint64_t need =
-        3ull * V * MG_PPR_TILE * sizeof(float) +
+        n_tile_bufs * V * MG_PPR_TILE * sizeof(float) +
         (uint64_t{V} + 1) * sizeof(uint32_t) +
         in_o.e_stored * sizeof(uint32_t) +
         (g.weighted ? in_o.e_stored * sizeof(float) : 0ull) +
@@ -311,7 +329,7 @@ static int ppr_tiles(Graph& g, const uint32_t* seeds_canon,
       throw Error(
           ErrorCode::invalid_argument,
           "ppr_topk: graph working set (" + std::to_string(need) +
-              " bytes: CSR + fixed 8-lane tile state, ~100 B/vertex) exceeds "
+              " bytes: CSR + fixed 8-lane tile state) exceeds "
               "the GPU budget (recommendedMaxWorkingSetSize = " +
               std::to_string(budget) +
               "). Batch size does not affect this; use "
@@ -323,20 +341,28 @@ static int ppr_tiles(Graph& g, const uint32_t* seeds_canon,
   MTL::ComputePipelineState* pso_tile_zero = rt.pipeline("mg_pr_tile_zero_b");
   MTL::ComputePipelineState* pso_seed_init = rt.pipeline("mg_pr_seed_init_b");
 
-  // Tile state skips the zero-fill: rank_b[0] is initialized per tile
-  // below, and mg_pr_prepare_b / the gather bins + zero list (copy-through
-  // on inactive lanes) write every element of contrib_b / rank_next_b.
   const std::size_t state = std::size_t{V} * MG_PPR_TILE;
   BufferPtr dummy = rt.dummy();
   BufferPtr rank_b[2] = {rt.alloc_scratch(state * 4, "ppr.rank0"),
                          rt.alloc_scratch(state * 4, "ppr.rank1")};
-  BufferPtr contrib_b = rt.alloc_scratch(state * 4, "ppr.contrib");
-  BufferPtr scalars_b = rt.alloc(MG_PPR_TILE * 4, "ppr.iter_scalars");
-  BufferPtr partials_b = dummy;
-  if (g.n_dangling)
-    partials_b = rt.alloc(std::size_t{ReduceEngine::n_blocks(g.n_dangling)} *
-                              MG_PPR_TILE * 4,
-                          "ppr.dangling_partials");
+  BufferPtr contrib_b =
+      rescale ? dummy : rt.alloc_scratch(state * 4, "ppr.contrib");
+  BufferPtr scalars_b = rt.alloc_scratch(MG_PPR_TILE * 4, "ppr.iter_scalars");
+  BufferPtr dang_partials_b =
+      (plan.n_active_dangling > ReduceEngine::kSingleTgMax)
+          ? rt.alloc_scratch(
+                std::size_t{ReduceEngine::n_blocks(plan.n_active_dangling)} *
+                    MG_PPR_TILE * 4,
+                "ppr.dangling_partials")
+          : dummy;
+  const uint32_t n_active_v = plan.off_iso;
+  BufferPtr res_partials_b =
+      n_active_v
+          ? rt.alloc_scratch(
+                std::size_t{ReduceEngine::n_blocks(n_active_v)} * MG_PPR_TILE *
+                    4,
+                "ppr.residual_partials")
+          : dummy;
 
   std::vector<uint32_t> bounds = tile_q;
   if (bounds.empty()) {
@@ -348,14 +374,19 @@ static int ppr_tiles(Graph& g, const uint32_t* seeds_canon,
   for (uint32_t t = 0; t < n_tiles; ++t)
     max_tile_seeds = std::max(max_tile_seeds,
                               offsets[bounds[t + 1]] - offsets[bounds[t]]);
-  BufferPtr seed_vertex = rt.alloc(max_tile_seeds * 4, "ppr.seed_vertex");
-  BufferPtr seed_lane = rt.alloc(max_tile_seeds * 4, "ppr.seed_lane");
-  BufferPtr seed_weight = rt.alloc(max_tile_seeds * 4, "ppr.seed_weight");
+  BufferPtr seed_vertex =
+      rt.alloc_scratch(max_tile_seeds * 4, "ppr.seed_vertex");
+  BufferPtr seed_lane = rt.alloc_scratch(max_tile_seeds * 4, "ppr.seed_lane");
+  BufferPtr seed_weight =
+      rt.alloc_scratch(max_tile_seeds * 4, "ppr.seed_weight");
 
   Buffer* weights =
       (g.weighted && in_o.weights) ? in_o.weights.get() : dummy.get();
   const float* ows = g.out_weight_sum->as<float>();
+  const uint32_t* in_row = in_o.row_offsets->as<uint32_t>();
+  const uint32_t* out_row = out_o.row_offsets->as<uint32_t>();
 
+  std::vector<std::pair<uint32_t, uint32_t>> iso_seeds;
   int max_iters = 0;
   for (uint32_t t = 0; t < n_tiles; ++t) {
     const uint32_t q0 = bounds[t];
@@ -364,27 +395,27 @@ static int ppr_tiles(Graph& g, const uint32_t* seeds_canon,
     const uint32_t seed_total =
         static_cast<uint32_t>(offsets[q0 + lanes] - s0);
 
-    // Init: rank0 = per-lane seed scatter (seeds are deduped per (vertex,
-    // lane) => plain assignment), written on the GPU at the head of the
-    // tile's first batch (no host pass over, or page faults on, the tile
-    // state); per-lane dangling seed mass in fp64 on the host. Unused lanes
-    // stay zero and are masked out.
     double dmass[MG_PPR_TILE] = {0.0};
     uint32_t* sv = seed_vertex->as<uint32_t>();
     uint32_t* sl = seed_lane->as<uint32_t>();
     float* sw = seed_weight->as<float>();
+    iso_seeds.clear();
     for (uint32_t q = q0; q < q0 + lanes; ++q) {
       const uint32_t lane = q - q0;
       for (uint64_t i = offsets[q]; i < offsets[q + 1]; ++i) {
         const uint32_t v = seeds_canon[i];
         const float w = seed_w[i];
         const uint64_t j = i - s0;
+        const bool is_iso =
+            (in_row[v] == in_row[v + 1]) && (out_row[v] == out_row[v + 1]);
         sv[j] = v;
-        sl[j] = lane;
+        sl[j] = lane | (is_iso ? MG_PPR_SEED_ISO_BIT : 0u);
         sw[j] = w;
+        if (is_iso) iso_seeds.emplace_back(v, lane);
         if (ows[v] == 0.0f) dmass[lane] += static_cast<double>(w);
       }
     }
+    const bool has_iso_seed = !iso_seeds.empty();
     float* sc = scalars_b->as<float>();
     for (uint32_t l = 0; l < MG_PPR_TILE; ++l)
       sc[l] = static_cast<float>(dmass[l]);
@@ -407,30 +438,59 @@ static int ppr_tiles(Graph& g, const uint32_t* seeds_canon,
       if (done == 0) {
         MGPprParams init = base;
         init.count = V;
-        cb.dispatch(pso_tile_zero, &init, sizeof(init), {rank_b[0].get()},
+        init.pad0 = plan.n_iso;
+        init.pad1 = plan.off_iso;
+        cb.dispatch(pso_tile_zero, &init, sizeof(init),
+                    {rank_b[0].get(), rank_b[1].get(), plan.vertices.get()},
                     ceil_div_u32(V, MG_TG_SIZE), MG_TG_SIZE);
         init.count = seed_total;
+        init.pad0 = rescale ? MG_PR_FLAG_RESCALE_OWS : 0u;
+        init.pad1 = 0u;
         cb.dispatch(pso_seed_init, &init, sizeof(init),
                     {seed_vertex.get(), seed_lane.get(), seed_weight.get(),
-                     rank_b[0].get()},
+                     g.out_weight_sum.get(), rank_b[0].get()},
                     ceil_div_u32(seed_total, MG_TG_SIZE), MG_TG_SIZE);
       }
       for (int i = 0; i < k; ++i) {
-        spmv.encode_iteration_b(cb, in_o, base, rank_b[cur].get(),
-                                contrib_b.get(), rank_b[cur ^ 1].get(),
-                                scalars_b.get(), g.out_weight_sum.get(),
-                                weights, seed_vertex.get(), seed_lane.get(),
-                                seed_weight.get());
-        reduce.encode_list_sum_b(cb, base, g.n_dangling,
-                                 g.dangling_list.get(), rank_b[cur ^ 1].get(),
-                                 partials_b.get(), scalars_b.get());
+        spmv.encode_iteration_b(
+            cb, in_o, plan, base, rank_b[cur].get(), contrib_b.get(),
+            rank_b[cur ^ 1].get(), scalars_b.get(), g.out_weight_sum.get(),
+            weights, seed_vertex.get(), seed_lane.get(), seed_weight.get(),
+            rescale);
+        reduce.encode_pr_dangling_b(
+            cb, base, plan.n_active_dangling, has_iso_seed,
+            plan.active_dangling.get(), rank_b[cur ^ 1].get(),
+            dang_partials_b.get(), seed_vertex.get(), seed_lane.get(),
+            scalars_b.get());
         cur ^= 1;
       }
+      const uint32_t res_blocks = reduce.encode_residual_b(
+          cb, n_active_v, active, rescale, plan.vertices.get(),
+          rank_b[cur].get(), rank_b[cur ^ 1].get(), g.out_weight_sum.get(),
+          res_partials_b.get());
       cb.commit_and_wait();
       done += k;
-      double err[MG_PPR_TILE];
-      l1_diff_lanes(rank_b[cur]->as<float>(), rank_b[cur ^ 1]->as<float>(),
-                    V, active, err);
+
+      double err[MG_PPR_TILE] = {0.0};
+      if (res_blocks > 0) {
+        const float* rp = res_partials_b->as<float>();
+        for (uint32_t b = 0; b < res_blocks; ++b) {
+          const float* rowp = rp + std::size_t{b} * MG_PPR_TILE;
+          for (uint32_t l = 0; l < lanes; ++l)
+            if ((active >> l) & 1u) err[l] += static_cast<double>(rowp[l]);
+        }
+      }
+      if (has_iso_seed) {
+        const float* rcur = rank_b[cur]->as<float>();
+        const float* rprv = rank_b[cur ^ 1]->as<float>();
+        for (const auto& [v, l] : iso_seeds) {
+          if ((active >> l) & 1u) {
+            const std::size_t slot = std::size_t{v} * MG_PPR_TILE + l;
+            err[l] += std::fabs(static_cast<double>(rcur[slot]) -
+                                static_cast<double>(rprv[slot]));
+          }
+        }
+      }
       for (uint32_t l = 0; l < lanes; ++l) {
         if (((active >> l) & 1u) && err[l] < static_cast<double>(V) * tol) {
           active &= ~(1u << l);
@@ -446,12 +506,10 @@ static int ppr_tiles(Graph& g, const uint32_t* seeds_canon,
       float* r0 = rank_b[0]->as<float>();
       std::memset(r0, 0, state * 4);
       for (uint32_t j = 0; j < seed_total; ++j)
-        r0[std::size_t{sv[j]} * MG_PPR_TILE + sl[j]] = sw[j];
+        r0[std::size_t{sv[j]} * MG_PPR_TILE + (sl[j] & 0xFFu)] = sw[j];
     }
 
-    // Frozen lanes survived the ping-pong via copy-through, so rank_b[cur]
-    // holds every lane's value at its freeze boundary.
-    on_tile(q0, lanes, rank_b[cur].get());
+    on_tile(q0, lanes, rank_b[cur].get(), done > 0 && rescale);
   }
   return max_iters;
 }
@@ -462,22 +520,29 @@ static int ppr_sink_tiles(
     const uint64_t* offsets, uint32_t n_queries, double alpha, double tol,
     int max_iter, int audit_interval, const std::vector<uint32_t>& tile_q,
     const std::function<void(uint32_t, const float*)>& sink) {
-  // One V-length scratch reused for every lane copy-out: each query's final
-  // vector is deinterleaved into it and handed to the sink immediately, so
-  // dense state never exceeds the tile buffers + this single vector.
   std::vector<float> lane_scratch(g.V);
+  const float* ows = g.out_weight_sum->as<float>();
   return ppr_tiles(
       g, seeds_canon, seed_w, offsets, n_queries, alpha, tol, max_iter,
       audit_interval, tile_q,
-      [&](uint32_t q0, uint32_t lanes, Buffer* rank_final) {
+      [&](uint32_t q0, uint32_t lanes, Buffer* rank_final, bool needs_unscale) {
         const float* rc = rank_final->as<float>();
         for (uint32_t l = 0; l < lanes; ++l) {
           float* dst = lane_scratch.data();
           parallel_for(g.V, [&](std::size_t b, std::size_t e) {
-            for (std::size_t v = b; v < e; ++v)
-              dst[v] = rc[v * MG_PPR_TILE + l];
+            if (needs_unscale) {
+              for (std::size_t v = b; v < e; ++v) {
+                float x = rc[v * MG_PPR_TILE + l];
+                const float w = ows[v];
+                if (w > 0.0f) x *= w;
+                dst[v] = x;
+              }
+            } else {
+              for (std::size_t v = b; v < e; ++v)
+                dst[v] = rc[v * MG_PPR_TILE + l];
+            }
           });
-          sink(q0 + l, dst);  // sequential, per the gpu::ppr contract
+          sink(q0 + l, dst);
         }
       });
 }
@@ -507,21 +572,28 @@ int ppr_topk_select(Graph& g, const uint32_t* seeds_canon, const float* seed_w,
   MTL::ComputePipelineState* pso_hist = rt.pipeline("mg_topk_hist_b");
   MTL::ComputePipelineState* pso_digit = rt.pipeline("mg_topk_digit_b");
   MTL::ComputePipelineState* pso_compact = rt.pipeline("mg_topk_compact_b");
-  BufferPtr thresholds = rt.alloc(MG_PPR_TILE * 4, "topk.thresholds");
-  BufferPtr hist = rt.alloc(MG_PPR_TILE * 256 * 4, "topk.hist");
-  BufferPtr select_state = rt.alloc(2 * MG_PPR_TILE * 4, "topk.select_state");
-  BufferPtr counters = rt.alloc(MG_PPR_TILE * 4, "topk.counters");
+  BufferPtr thresholds = rt.alloc_scratch(MG_PPR_TILE * 4, "topk.thresholds");
+  BufferPtr hist = rt.alloc_scratch(MG_PPR_TILE * 256 * 4, "topk.hist");
+  BufferPtr select_state =
+      rt.alloc_scratch(MG_TOPK_STATE_LEN * 4, "topk.select_state");
+  BufferPtr counters = rt.alloc_scratch(MG_PPR_TILE * 4, "topk.counters");
   BufferPtr cands =
-      rt.alloc(std::size_t{MG_PPR_TILE} * cap * 4, "topk.candidates");
-  // mg_topk_hist_b is grid-stride: ~8 vertices per thread, at most 1024
-  // threadgroups.
-  const uint32_t hist_tgs = std::min(1024u, ceil_div_u32(V, MG_TG_SIZE * 8u));
+      rt.alloc_scratch(std::size_t{MG_PPR_TILE} * cap * 4, "topk.candidates");
+  const uint32_t hist_tgs = std::min(1024u, ceil_div_u32(V, MG_TG_SIZE * 2u));
 
   return ppr_tiles(
       g, seeds_canon, seed_w, offsets, n_queries, alpha, tol, max_iter,
       audit_interval, tile_q,
-      [&](uint32_t q0, uint32_t lanes, Buffer* rank_final) {
-        MGTopkParams tp{V, k, cap, (1u << lanes) - 1u, 0u, 0u, 0u, 0u};
+      [&](uint32_t q0, uint32_t lanes, Buffer* rank_final, bool needs_unscale) {
+        const uint32_t active_mask = (1u << lanes) - 1u;
+        MGTopkParams tp{V,
+                        k,
+                        cap,
+                        active_mask,
+                        0u,
+                        needs_unscale ? MG_TOPK_FLAG_UNSCALE_OWS : 0u,
+                        0u,
+                        0u};
         std::memset(counters->data(), 0, MG_PPR_TILE * 4);
         std::memset(thresholds->data(), 0, MG_PPR_TILE * 4);
         std::memset(hist->data(), 0, MG_PPR_TILE * 256 * 4);
@@ -530,26 +602,28 @@ int ppr_topk_select(Graph& g, const uint32_t* seeds_canon, const float* seed_w,
           st[l] = k;                // remaining rank
           st[MG_PPR_TILE + l] = V;  // pass-0 class: every score
         }
+        st[MG_TOPK_STATE_PENDING] = active_mask;
         CommandBatch cb(rt);
         for (uint32_t pass = 0; pass < 4; ++pass) {
           tp.pass = pass;
           cb.dispatch(pso_hist, &tp, sizeof(tp),
-                      {rank_final, thresholds.get(), hist.get()}, hist_tgs,
-                      MG_TG_SIZE);
+                      {rank_final, g.out_weight_sum.get(), thresholds.get(),
+                       select_state.get(), hist.get()},
+                      hist_tgs, MG_TG_SIZE);
           cb.dispatch(pso_digit, &tp, sizeof(tp),
                       {hist.get(), thresholds.get(), select_state.get()}, 1,
                       MG_TG_SIZE);
         }
         cb.dispatch(pso_compact, &tp, sizeof(tp),
-                    {rank_final, thresholds.get(), counters.get(),
-                     cands.get()},
+                    {rank_final, thresholds.get(), counters.get(), cands.get()},
                     ceil_div_u32(V, MG_TG_SIZE), MG_TG_SIZE);
         cb.commit_and_wait();
 
         const float* rc = rank_final->as<float>();
         const uint32_t* cnt = counters->as<uint32_t>();
+        const uint32_t* thr = thresholds->as<uint32_t>();
         const uint32_t* cd = cands->as<uint32_t>();
-        // Lane work: its candidates (all V on a tie flood), partial-sorted.
+        const uint32_t* canon_of = g.canon_of_user.data();
         uint64_t lane_work = 0;
         for (uint32_t l = 0; l < lanes; ++l)
           lane_work += cnt[l] > cap ? V : cnt[l];
@@ -560,17 +634,15 @@ int ppr_topk_select(Graph& g, const uint32_t* seeds_canon, const float* seed_w,
               for (std::size_t l = lb; l < le; ++l) {
                 int32_t* row_ids = out_ids + std::size_t{q0 + l} * k;
                 float* row_sc = out_scores + std::size_t{q0 + l} * k;
+                const uint32_t raw_thr = thr[l];
+                const bool strict_gt = (raw_thr & MG_TOPK_STRICT_GT_BIT) != 0u;
                 const uint32_t n = cnt[l];
-                if (n > cap) {
-                  // Degenerate tie flood (e.g. all-equal scores): the CPU
-                  // oracle finishes this lane, reading the tile state
-                  // strided in place.
+                if (n > cap || (!strict_gt && n < k) || (strict_gt && n > k)) {
                   boundary::topk_user(g, rc, MG_PPR_TILE,
                                       static_cast<uint32_t>(l), k, row_ids,
                                       row_sc);
                   continue;
                 }
-                // n >= k by construction (count of scores >= k-th largest).
                 std::vector<std::pair<float, uint32_t>> items(n);
                 const uint32_t* lane_cd = cd + std::size_t{l} * cap;
                 for (uint32_t i = 0; i < n; ++i) {
@@ -583,11 +655,39 @@ int ppr_topk_select(Graph& g, const uint32_t* seeds_canon, const float* seed_w,
                   if (a.first != b.first) return a.first > b.first;
                   return a.second < b.second;
                 };
-                std::partial_sort(items.begin(), items.begin() + k,
-                                  items.end(), cmp);
-                for (uint32_t i = 0; i < k; ++i) {
-                  row_ids[i] = static_cast<int32_t>(items[i].second);
-                  row_sc[i] = items[i].first;
+                if (!strict_gt) {
+                  std::partial_sort(items.begin(), items.begin() + k,
+                                    items.end(), cmp);
+                  for (uint32_t i = 0; i < k; ++i) {
+                    row_ids[i] = static_cast<int32_t>(items[i].second);
+                    row_sc[i] = items[i].first;
+                  }
+                } else {
+                  std::sort(items.begin(), items.end(), cmp);
+                  uint32_t out = 0;
+                  for (; out < n; ++out) {
+                    row_ids[out] = static_cast<int32_t>(items[out].second);
+                    row_sc[out] = items[out].first;
+                  }
+                  const uint32_t thr_bits = raw_thr & 0x7FFFFFFFu;
+                  for (uint32_t u = 0; u < V && out < k; ++u) {
+                    const float s =
+                        rc[std::size_t{canon_of[u]} * MG_PPR_TILE + l];
+                    const bool eq =
+                        (thr_bits == 0u)
+                            ? (s == 0.0f)
+                            : (std::bit_cast<uint32_t>(s) == thr_bits);
+                    if (eq) {
+                      row_ids[out] = static_cast<int32_t>(u);
+                      row_sc[out] = s;
+                      ++out;
+                    }
+                  }
+                  if (out < k) {
+                    boundary::topk_user(g, rc, MG_PPR_TILE,
+                                        static_cast<uint32_t>(l), k, row_ids,
+                                        row_sc);
+                  }
                 }
               }
             },
@@ -638,7 +738,23 @@ int pagerank(Graph& g, const PagerankOpts& o, float* out_rank) {
     p.user_sum = p_sum;
     iters = gpu_pagerank_impl(
         g, p, o.alpha, o.tol, o.max_iter, aud,
-        [&](const float* rc) { boundary::canon_to_user(g, rc, out_rank); });
+        [&](const float* rc, bool rescaled) {
+          if (!rescaled) {
+            boundary::canon_to_user(g, rc, out_rank);
+          } else {
+            const float* ows = g.out_weight_sum->as<float>();
+            const uint32_t* canon_of = g.canon_of_user.data();
+            parallel_for(g.V, [&](std::size_t b, std::size_t e) {
+              for (std::size_t u = b; u < e; ++u) {
+                const uint32_t c = canon_of[u];
+                float v = rc[c];
+                const float w = ows[c];
+                if (w > 0.0f) v *= w;
+                out_rank[u] = v;
+              }
+            });
+          }
+        });
   } else {
     const std::vector<double> pvec =
         boundary::pvec_to_canon(g, o.personalization, p_sum);

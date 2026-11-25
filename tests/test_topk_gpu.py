@@ -108,3 +108,64 @@ def test_gpu_select_ineligible_shapes_use_oracle(gpu_exec):
         ids_g, sc_g, ids_c, sc_c = _run_both(g, seeds, weights, offsets, k)
         np.testing.assert_array_equal(ids_g, ids_c)
         np.testing.assert_array_equal(sc_g, sc_c)
+
+
+def test_gpu_select_zero_threshold_tie_flood_and_isolated_seeds(gpu_exec):
+    # Mix normal queries, small-reach zero-threshold queries (tie flood at 0.0
+    # with V >> cap), and isolated-vertex seeds in the same 8-lane tile so
+    # early-stop lanes, strict-greater tie-flood lanes, and isolated-seed
+    # copy-through/dangling paths all execute together and stay bit-identical
+    # to the CPU oracle.
+    rng = np.random.default_rng(SEED + 2)
+    v, core = 12_000, 1_500
+    src = rng.integers(0, core, 24_000, dtype=np.uint32)
+    dst = rng.integers(0, core, 24_000, dtype=np.uint32)
+    # Small disconnected component of 5 vertices at [core, core+5)
+    c_src = np.arange(core, core + 4, dtype=np.uint32)
+    c_dst = np.arange(core + 1, core + 5, dtype=np.uint32)
+    g = mg.Graph.from_edges(np.concatenate([src, c_src]),
+                            np.concatenate([dst, c_dst]),
+                            directed=True, num_vertices=v)
+    # Lanes: 0,1 core (normal); 2,3 tiny component (0.0 tie flood);
+    # 4,5 pure isolated seeds (in_deg==0 && out_deg==0);
+    # 6 mixed core + isolated seed; 7 core (normal)
+    queries = [
+        ([0, 1], [1.0, 2.0]),
+        ([5], [1.0]),
+        ([core], [1.0]),
+        ([core + 1, core + 2], [0.5, 1.5]),
+        ([v - 1], [1.0]),
+        ([v - 10, v - 20], [1.0, 3.0]),
+        ([10, v - 5], [2.0, 1.0]),
+        ([25], [1.0]),
+    ]
+    seeds = np.concatenate([np.asarray(s, np.uint32) for s, _ in queries])
+    weights = np.concatenate([np.asarray(w, np.float32) for _, w in queries])
+    offsets = np.zeros(len(queries) + 1, np.uint64)
+    np.cumsum([len(s) for s, _ in queries], out=offsets[1:])
+
+    ids_g, sc_g, ids_c, sc_c = _run_both(g, seeds, weights, offsets, k=64)
+    np.testing.assert_array_equal(ids_g, ids_c)
+    np.testing.assert_array_equal(sc_g, sc_c)
+    # Pure isolated seed lane must put all mass (1.0) on its seed vertex.
+    assert ids_g[4, 0] == v - 1
+    assert sc_g[4, 0] == pytest.approx(1.0, abs=1e-5)
+    assert sc_g[4, 1] == 0.0
+
+
+@pytest.mark.parametrize("scale", [1e-20, 1e20], ids=["tiny_weights", "huge_weights"])
+def test_gpu_ppr_extreme_weights_fallback(gpu_exec, scale):
+    # Exercises !ows_safe_rescale in batched GPU PPR + radix select.
+    rng = np.random.default_rng(SEED + 3)
+    v, e = 5_000, 30_000
+    src = rng.integers(0, v, e, dtype=np.uint32)
+    dst = rng.integers(0, v, e, dtype=np.uint32)
+    w = (rng.uniform(0.5, 2.0, e) * scale).astype(np.float32)
+    g = mg.Graph.from_edges(src, dst, weights=w, directed=True, num_vertices=v)
+    seeds = np.arange(0, 10, dtype=np.uint32)
+    weights = np.ones(10, np.float32)
+    offsets = np.arange(0, 11, dtype=np.uint64)
+    ids_g, sc_g, ids_c, sc_c = _run_both(g, seeds, weights, offsets, k=32)
+    np.testing.assert_array_equal(ids_g, ids_c)
+    np.testing.assert_array_equal(sc_g, sc_c)
+    assert np.isfinite(sc_g).all()
